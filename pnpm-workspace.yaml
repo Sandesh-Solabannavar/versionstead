@@ -1,0 +1,15 @@
+packages:
+  - apps/*
+  - packages/*
+
+onlyBuiltDependencies:
+  - electron
+  - esbuild
+
+overrides:
+  vite: npm:@voidzero-dev/vite-plus-core@1.0.0
+
+# Vite+ exposes Vite-compatible APIs under its own version, as in T3 Code.
+peerDependencyRules:
+  allowedVersions:
+    vite: "*"

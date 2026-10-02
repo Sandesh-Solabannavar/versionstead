@@ -1,0 +1,29 @@
+{
+  "name": "versionstead",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @versionstead/contracts build && pnpm --parallel --filter @versionstead/server --filter @versionstead/web dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @versionstead/server start",
+    "desktop": "pnpm build && pnpm --filter @versionstead/desktop start",
+    "desktop:smoke": "pnpm --filter @versionstead/desktop smoke",
+    "typecheck": "pnpm --filter @versionstead/server... build && pnpm -r typecheck",
+    "test": "pnpm --filter @versionstead/server... build && pnpm --filter @versionstead/server test",
+    "lint": "vp lint",
+    "fmt": "vp fmt",
+    "fmt:check": "vp fmt --check",
+    "check": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "typescript": "7.0.2",
+    "vite-plus": "1.0.0"
+  },
+  "engines": {
+    "node": ">=24.13.1 <25"
+  },
+  "packageManager": "pnpm@10.14.0"
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@versionstead/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    }
+  },
+  "scripts": {
+    "dev": "node --watch src/bin.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/bin.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@versionstead/contracts": "workspace:*",
+    "effect": "4.0.0"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@versionstead/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./status": {
+      "types": "./dist/status.d.ts",
+      "default": "./dist/status.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "effect": "4.0.0"
+  }
+}

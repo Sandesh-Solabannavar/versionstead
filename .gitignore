@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.pnpm-store/
+.cache/
+.env
+.env.*
+!.env.example
+.versionstead/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
