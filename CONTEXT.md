@@ -6,7 +6,7 @@ Versionstead gives its owner a trustworthy view of installed software and projec
 
 The first user is the project owner. Start locally, add explicitly paired computers over LAN or Tailscale, and then broaden platform coverage. Do not introduce accounts, organizations, billing, cloud infrastructure, or enterprise policy management without a concrete requirement.
 
-The runnable foundation contains a local coordinator, web UI, desktop shell, and shared contracts. Monitoring features remain on the [roadmap](docs/roadmap.md).
+The local implementation detects npm/Bun and checks their top-level global tools, scans selected npm/pnpm projects, performs public npm/OSV lookups, and provides SQLite evidence, live scan stages, grouped notification summaries, and an Electron tray client. Windows registry and WinGet scanning have been removed. Windows boot-task setup captures owner global roots and grants scoped metadata access; actual LocalService access and boot/sign-out behavior still require elevated installation and lifecycle verification. Wider coverage remains on the [roadmap](docs/roadmap.md).
 
 ## Domain language
 
@@ -27,7 +27,8 @@ The runnable foundation contains a local coordinator, web UI, desktop shell, and
 
 - Use TypeScript and pnpm workspaces; React, TanStack Router, Tailwind, and Electron reflect the T3 Code reference. Shared Effect schemas validate process boundaries.
 - Keep transport thin and external commands, registries, and Git hosts behind focused adapters. Introduce abstractions when there are real callers and implementations.
-- A single coordinator process and SQLite are the planned personal-scale persistence model. No message broker, distributed database, or event-sourced core is needed.
+- A single independent Node 24 coordinator and SQLite provide personal-scale persistence. A dedicated SQLite OS lock prevents duplicate writers. No message broker, distributed database, or event-sourced core is needed.
+- On Windows, monitoring must start at boot and continue after the app closes and the owner signs out. An independent background host owns the coordinator; the desktop attaches to it. Capture npm/Bun roots in the owner session; never discover the service account's global tools as the owner's. Manager availability/version is last captured in that session; signed-out scans refresh configured package metadata. Verify actual account access and lifecycle before claiming sign-out support.
 - Begin with read-only monitoring. Installation, dependency restore, scripts, upgrades, commits, and pull requests require separate explicit user actions when implemented.
 - Tailscale provides a network route. It does not replace Versionstead pairing, authentication, or revocation.
 - Use package-manager identities and ecosystem version rules. Never compare all package versions lexicographically or as generic SemVer.
@@ -37,6 +38,6 @@ The runnable foundation contains a local coordinator, web UI, desktop shell, and
 
 ## Deferred decisions
 
-Decide packaging and update distribution after the desktop workflow works. Decide credential storage before adding credentials. Select vulnerability tooling against real fixtures before claiming ecosystem coverage. Choose a distribution license before publishing releases or inviting external contributions.
+Decide packaging and update distribution after the desktop workflow works. Windows protects the local coordinator capability with machine-scope DPAPI and filesystem ACLs; external credentials remain unimplemented. Other ecosystem adapters require their own fixtures and verification. Choose a distribution license before publishing releases or inviting external contributions.
 
 Keep decisions here short. Implementation detail belongs in code or the relevant document; completed roadmap milestones should link to their implementation rather than duplicate it.

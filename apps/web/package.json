@@ -9,10 +9,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@base-ui/react": "1.5.0",
     "@tanstack/react-router": "1.170.41",
     "@versionstead/contracts": "workspace:*",
+    "class-variance-authority": "0.7.1",
+    "lucide-react": "0.564.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "tailwind-merge": "3.6.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",

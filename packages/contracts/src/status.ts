@@ -12,9 +12,9 @@ export const Status = Schema.Struct({
     nodeVersion: Schema.String,
   }),
   capabilities: Schema.Struct({
-    inventory: Schema.Literal(false),
-    updates: Schema.Literal(false),
-    vulnerabilities: Schema.Literal(false),
+    inventory: Schema.Boolean,
+    updates: Schema.Boolean,
+    vulnerabilities: Schema.Boolean,
     remoteAgents: Schema.Literal(false),
   }),
 });

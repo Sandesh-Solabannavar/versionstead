@@ -2,7 +2,7 @@
 
 ## Current capability
 
-The foundation exposes local runtime status and hosts the interface. It does **not** inspect installed applications, scan dependencies, assess vulnerabilities, enroll remote devices, or manage repository credentials. No security outcome should be inferred from its empty state.
+The local coordinator detects npm/Bun, reads configured global-tool manifests and explicitly selected npm/pnpm project manifests/lockfiles, and queries eligible public npm versions. OSV known advisory checks remain limited to supported project dependencies. Windows registry/WinGet scanning has been removed. Private/custom registries, local/Git tools, unsupported release channels, other ecosystems, remote enrollment, and repository credentials remain outside coverage. Empty, partial, failed, and unsupported checks are distinct outcomes.
 
 Keep the coordinator on loopback until the remote-access controls below are implemented. Loopback limits network reachability; it does not make hostile local processes or browser-origin requests trustworthy.
 
@@ -27,11 +27,19 @@ Some ecosystem commands have side effects. For example, `.NET package list` beha
 
 Updates, commits, and pull requests are separate future user actions. Present the concrete proposed changes and required access before performing them.
 
+PC discovery selects installed npm/Bun executables from explicit absolute PATH entries. npm's validated CLI runs through Node with fixed global root/config commands; `.cmd` shell wrappers are never executed. Bun runs only `--version`; its exact global directory is resolved from supported configuration/environment defaults without executing `bun pm ls`. That listing command can create its global directory and climb to an unrelated parent manifest when the expected manifest is absent. Commands run outside selected projects with argument arrays, timeouts, bounded output, and `NODE_OPTIONS` cleared. Package versions come from bounded installed manifests; package executables and lifecycle scripts never run. Canonical local roots and selected-file validation reject network shares, traversal, and escaping symlinks. The boot host reads owner-captured roots and Bun's single direct-dependency manifest; it grants no broad owner-profile or registry-credential access. Availability/version remains an owner-session observation after sign-out, separate from metadata access freshness.
+
+Global lookup destinations are fixed to the public npm registry with HTTPS, rejected redirects, response limits, cancellation, and a scan budget. Public registry classification, excluded configured scopes, private manifest flags, and local/Git/URL dependency requests prevent known private/local names from public queries. Unknown registry/configuration evidence is not public permission. Source configuration is authenticated, schema/path validated, and cannot change during PC work. Refresh it after changing routing; background scans cannot observe new owner settings while signed out. Credentialed registries and complex unsupported Bun configuration need explicit support before checks can become verified.
+
 ## Data and secrets
 
 Collect the minimum metadata needed to explain findings: package identities/versions, selected project/device identity, source/channel, scan provenance, and advisory references. Source code does not need to leave a device for ordinary dependency scanning. Advisory queries can reveal package names and versions to the selected provider; describe that egress when the integration is introduced.
 
-Do not log tokens, credential-bearing URLs, raw lockfiles, source files, or full local paths by default. Sanitize errors and external process output. Before implementing token features, choose OS-backed credential storage; do not put secrets in SQLite, frontend state, repository files, or command-line arguments visible to other processes.
+Do not log tokens, credential-bearing URLs, raw lockfiles, source files, or full local paths by default. Sanitize errors and external process output. The transient coordinator capability is encrypted using Windows DPAPI LocalMachine in a private runtime descriptor so the owner and LocalService can reconnect. Scoped filesystem ACLs are essential: any account able to read that encrypted file on the same machine can potentially decrypt it. It is not an external registry credential and is not stored in SQLite or process arguments. Non-Windows descriptors rely on owner-only file permissions; native desktop behavior there is unverified.
+
+`pnpm run access` deliberately prints that capability only on explicit owner request. The browser exchanges it for an HttpOnly, SameSite=Strict session cookie; Electron attaches a bearer capability in its native protocol handler. Host/origin checks, body/header limits, fixed API routes, and request/response schemas protect the loopback boundary. Restart rotates the capability and invalidates prior browser sessions. This does not protect against malicious processes already running as the owner or LocalService.
+
+Public checks send eligible npm package identities and resolved versions to `api.osv.dev`; direct package names are queried from `registry.npmjs.org`. Source code, full local paths, lockfile contents, and registry credentials are not sent. Workspace/Git/local identities and private origins identified by selected-root `.npmrc` or lockfile URLs are excluded. User/global/ancestor/environment npm routing is not inspected; configure selected-root registry identity before scanning dependencies whose privacy depends on those settings. This ceiling is also reported in scan coverage.
 
 Local database files and backups require appropriate filesystem permissions. Document retention, deletion, export, and credential revocation when persistence and enrollment ship. A remote collector must not receive the coordinator’s repository credentials.
 

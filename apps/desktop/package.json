@@ -7,10 +7,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
     "start": "install-electron && node scripts/start-electron.mjs .",
     "smoke": "install-electron && node scripts/smoke-test.mjs . --smoke-test"
   },
   "dependencies": {
+    "@versionstead/contracts": "workspace:*",
     "@versionstead/server": "workspace:*"
   },
   "devDependencies": {

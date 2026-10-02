@@ -4,6 +4,8 @@ Milestones are sequential evidence gates, not dates or promises of existing feat
 
 ## 0 — Runnable foundation
 
+Status: implemented; superseded by the local monitoring views below.
+
 Scope: monorepo, contracts, local status endpoint, web UI, Electron shell, checks, and project documents.
 
 Acceptance:
@@ -15,10 +17,14 @@ Acceptance:
 
 ## 1 — One PC and one project
 
-Scope: Windows inventory, one selected local npm project, update availability, known dependency vulnerabilities, SQLite history, and a local notification path.
+Status: npm/Bun detection and top-level global-tool checks, selected npm/pnpm scans, public npm/OSV lookups, durable evidence, live progress, grouped notifications, and tray/client separation are implemented. Windows registry/WinGet scanning has been removed. The boot-task installer captures owner global roots; elevated installation, actual LocalService metadata/project access, reboot, and sign-out verification remain open. Private registries, prerelease channels, standalone binary discovery, manager self-updates, and additional Node prefixes remain deferred.
+
+Scope: an independent Windows background host, owner npm/Bun global tools, selected local npm/pnpm projects, update availability, known project dependency vulnerabilities, SQLite history, and a local notification path. See the [monitoring implementation plan](monitoring-implementation.md) and the implemented four-view interface.
 
 Acceptance:
 
+- Monitoring starts at Windows boot and continues after closing Electron and signing out; the UI reconnects to the existing coordinator instead of starting a duplicate.
+- Verify selected-project and captured global-root access under the actual background identity. Inaccessible sources remain unknown; notifications collected while signed out are delivered when the user returns.
 - Collect installed package versions using a verified structured source; unsupported/unmatched installations remain visible as unknown.
 - Read manifests and a supported lockfile without installing, restoring, or running project scripts.
 - Distinguish installed/resolved versions, compatible upgrades, major upgrades, and advisory findings.
@@ -31,7 +37,7 @@ This is the first useful end-to-end release. Validate it on the owner’s real m
 
 ## 2 — The owner’s project ecosystems
 
-Scope: pnpm/Yarn/Bun workspaces, .NET/NuGet, Rust/Cargo, and selected CLI tools including Codex and Claude Code.
+Scope: broader npm/pnpm workspace coverage, Yarn/Bun, .NET/NuGet, Rust/Cargo, and selected CLI tools including Codex and Claude Code.
 
 Acceptance:
 

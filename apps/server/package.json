@@ -7,10 +7,14 @@
     ".": {
       "types": "./dist/server.d.ts",
       "default": "./dist/server.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
     }
   },
   "scripts": {
-    "dev": "node --watch src/bin.ts",
+    "dev": "node --watch src/bin.ts --dev-origin http://127.0.0.1:4317",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/bin.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -18,6 +22,11 @@
   },
   "dependencies": {
     "@versionstead/contracts": "workspace:*",
-    "effect": "4.0.0"
+    "effect": "4.0.0",
+    "semver": "7.8.5",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/semver": "7.8.0"
   }
 }

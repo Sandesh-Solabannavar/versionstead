@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { Monitor, Moon, Sun } from "lucide-react";
+import { Button } from "./ui";
 
 type Theme = "system" | "light" | "dark";
 const storageKey = "versionstead.theme";
@@ -26,13 +28,29 @@ export function ThemeSelect() {
   }, [theme]);
 
   return (
-    <label className="theme-control">
+    <div className="theme-control" role="group" aria-label="Appearance">
       <span>Appearance</span>
-      <select value={theme} onChange={(event) => setTheme(readTheme(event.target.value))}>
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </label>
+      <div className="theme-buttons">
+        {(
+          [
+            ["system", Monitor],
+            ["light", Sun],
+            ["dark", Moon],
+          ] as const
+        ).map(([value, Icon]) => (
+          <Button
+            key={value}
+            variant="ghost"
+            className="theme-button"
+            aria-label={`${value === "system" ? "System" : value === "light" ? "Light" : "Dark"} theme`}
+            title={`${value === "system" ? "Follow system" : value === "light" ? "Light" : "Dark"} theme`}
+            aria-pressed={theme === value}
+            onClick={() => setTheme(value)}
+          >
+            <Icon aria-hidden="true" size={16} />
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }

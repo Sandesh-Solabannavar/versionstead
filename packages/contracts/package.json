@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./monitoring": {
+      "types": "./dist/monitoring.d.ts",
+      "default": "./dist/monitoring.js"
+    },
     "./status": {
       "types": "./dist/status.d.ts",
       "default": "./dist/status.js"

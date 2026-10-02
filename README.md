@@ -6,9 +6,19 @@ The name combines **version** with **stead**: a home for the software you look a
 
 ## Current state
 
-This repository contains the runnable application foundation: a React web interface, a local Node coordinator with a status endpoint, shared validated contracts, and an Electron desktop shell. The interface reports the coordinator’s real status and explicitly shows that no scans have run.
+The Electron app has four monitoring views: Needs attention, This PC, Projects, and Background monitoring. This PC detects npm and Bun separately, reads their global tool manifests, and checks eligible stable packages against the public npm registry. Selected npm/pnpm projects retain their lockfile, version, and OSV advisory scans. Evidence, history, settings, and notification receipts are stored in SQLite. This PC starts with a Scan this PC prompt and defaults to confirmed updates; filters expose all global tools, checked-current results, unverified observations, and either package manager.
 
-**Inventory scanning, update checks, vulnerability scanning, SQLite persistence, remote collectors, repository connections, and notifications are planned—not implemented.** An empty dashboard is not a security assessment.
+Public version checks attempt every eligible unique direct package name in selected projects and npm/Bun global tools. Advisory details have no record-count cutoff. Requests run at most four at a time, with time budgets scaled to each stage's workload; individual failures remain explicit while unrelated checks continue. Private or unsupported sources remain outside verified coverage.
+
+Closing the window keeps Versionstead in the system tray. Quitting the UI leaves its independent coordinator running. A Windows boot-task installer is provided for monitoring after sign-out; installing and verifying that host requires elevated PowerShell and a real boot/sign-out check.
+
+Desktop startup gracefully replaces older session coordinators missing scan-progress or global-tool support. The one-time migration resets active Windows-app evidence for the new first PC scan while preserving projects, settings, and scan history. The tray also provides Restart monitoring for session hosts; Windows boot hosts use the background setup script's Restart action.
+
+PC coverage is top-level npm/Bun global packages from the managers available in the owner's PATH. It preserves separate manager/location identities and reads installed versions without running package scripts. Missing managers are skipped; unavailable sources retain previous evidence. Private/custom registries, copied local/Git tools, linked tools outside the selected global root, prerelease upgrade channels, other Node-manager prefixes, standalone binaries, and npm/Bun runtime self-updates remain unverified or unsupported. Windows registry and WinGet scanning have been removed. The boot host uses captured owner roots rather than its own PATH/profile; refresh source configuration in the owner session after changing managers or registry routing. Project support remains npm package-lock v2/v3 and pnpm lockfile v9; Bun global-tool support does not add Bun project-lockfile support.
+
+Scans show their real stage, known work counts, and queued targets. Notifications combine new findings into one count summary after the scan queue settles, with a persisted five-minute cooldown; unchanged scans stay quiet. Security advisories remain separate from update counts. Summary clicks open the matching Needs attention filter.
+
+The interface uses source-owned shadcn/Base UI components inspired by T3 Code. Needs attention groups findings by PC or project, and Projects defaults to folders with updates or incomplete checks. Multiple groups can stay expanded; All projects and All dependencies expose the full retained inventory. Evidence opens in a keyboard-accessible side sheet. System, Light, and Dark theme buttons have separated hit targets.
 
 ## Run locally
 
@@ -27,6 +37,8 @@ pnpm desktop
 
 The first desktop launch downloads the pinned Electron runtime through `install-electron` if it is not cached. This launches from source; native installers and signing are not ready.
 
+Electron authenticates automatically. For browser access, run `pnpm run access` in another terminal and enter the displayed session code. It is a local capability; keep it private. Select a project folder in Projects and run a scan. Scans read metadata and never install dependencies or execute project scripts.
+
 Useful checks (`pnpm check` includes the build required by the desktop smoke check):
 
 ```sh
@@ -36,7 +48,9 @@ pnpm desktop:smoke
 
 See [development](docs/development.md) for the individual commands and process boundaries.
 
-On Windows, the development server, status proxy, `pnpm check`, and native desktop smoke check were verified on October 2, 2026. The smoke check confirms Electron startup and the rendered coordinator connection, including when `ELECTRON_RUN_AS_NODE` is inherited. Native desktop behavior on macOS/Linux, installers, and signing remain unverified. GitHub Actions defines workspace checks for Windows, Linux, and macOS; these do not include native desktop smoke checks. No release has been published.
+See [Windows background setup and verification](docs/windows-background.md) for the boot host. The [implementation plan](docs/monitoring-implementation.md) records the accepted workflow and remaining acceptance gates. The mockup design has been absorbed into the real React application.
+
+Verification results and limitations are recorded in [development](docs/development.md). Native desktop behavior on macOS/Linux, boot/sign-out hosting, installers, and signing remain unverified. GitHub Actions defines workspace checks for Windows, Linux, and macOS; these do not include native desktop smoke checks. No release has been published.
 
 ## Intended coverage
 
@@ -76,4 +90,4 @@ The stack and service boundaries are inspired by the local [T3 Code](https://git
 - [Security](docs/security.md): trust boundaries, limitations, and implementation requirements.
 - [Agent instructions](AGENTS.md): repository working conventions.
 
-No distribution license has been selected yet. Naming here is a project choice, not a claim of trademark or package-name availability.
+No distribution license has been selected yet. Adapted T3 Code UI components retain their [MIT notice](apps/web/public/THIRD_PARTY_NOTICES.txt), also included in built assets. Naming here is a project choice, not a claim of trademark or package-name availability.
