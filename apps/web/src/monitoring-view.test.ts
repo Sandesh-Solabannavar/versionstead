@@ -357,6 +357,12 @@ test("scan progress has real stage counts or indeterminate state, and notificati
     max: 240,
     count: "100/240 packages",
   });
+  assert.deepEqual(scanStage({ stage: "native-versions", completed: 40, total: 42 }), {
+    label: "Checking updates with the package manager",
+    value: 40,
+    max: 42,
+    count: "40/42 packages",
+  });
   for (const [completed, total] of [
     [null, null],
     [0, 0],

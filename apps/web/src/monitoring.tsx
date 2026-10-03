@@ -25,7 +25,11 @@ class RequestError extends Error {
   }
 }
 
-async function request<T>(path: string, decoder: Decoder<T>, init: RequestInit = {}): Promise<T> {
+export async function request<T>(
+  path: string,
+  decoder: Decoder<T>,
+  init: RequestInit = {},
+): Promise<T> {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store", ...init });
   if (!response.ok) {
     let message = `Coordinator returned HTTP ${response.status}.`;

@@ -1,0 +1,605 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
+import { randomBytes, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { MonitoringCoordinator } from "../dist/monitoring.js";
+import { ApplicationService } from "../dist/application.js";
+import { startServer } from "../dist/server.js";
+import {
+  listRepositories,
+  providerAccount,
+  inspectRepository,
+} from "../dist/adapters/repositories.js";
+import {
+  createPeerCertificate,
+  peerRequest,
+  peerOrigin,
+  sharedEvidence,
+} from "../dist/adapters/paired-computers.js";
+import { decodeApplicationSnapshot } from "@versionstead/contracts/application";
+import { runTool, toolExecutable, inspectGit } from "../dist/adapters/development-tools.js";
+
+const sha = "a".repeat(40);
+const files = {
+  "package.json": JSON.stringify({
+    name: "read-only-fixture",
+    scripts: { install: "never-execute" },
+    dependencies: { example: "^1.0.0" },
+  }),
+  "package-lock.json": JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      "": { dependencies: { example: "^1.0.0" } },
+      "node_modules/example": {
+        version: "1.0.0",
+        resolved: "https://registry.npmjs.org/example/-/example-1.0.0.tgz",
+      },
+    },
+  }),
+};
+const response = (value) =>
+  new Response(JSON.stringify(value), { headers: { "Content-Type": "application/json" } });
+function providerFixture() {
+  const requests = [];
+  let failFiles = false;
+  let failAuth = false;
+  let holdAuth = null;
+  let release = null;
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(input);
+    requests.push({ url: url.href, headers: init.headers });
+    assert(["api.github.com", "gitlab.com"].includes(url.hostname));
+    assert.equal(init.redirect, "error");
+    const kind = url.hostname === "api.github.com" ? "github" : "gitlab";
+    if (url.pathname.endsWith("/user")) {
+      if (holdAuth && kind === "github") await holdAuth;
+      if (failAuth) return new Response("denied", { status: 401 });
+      return response(
+        kind === "github" ? { login: "fixture-owner" } : { username: "fixture-owner" },
+      );
+    }
+    if (url.pathname.endsWith("/user/repos"))
+      return response(
+        [1, 2].map((id) => ({
+          id,
+          full_name: `fixture/repo-${id}`,
+          default_branch: "main",
+          private: true,
+        })),
+      );
+    if (url.pathname === "/api/v4/projects")
+      return response([
+        {
+          id: 1,
+          path_with_namespace: "fixture/repo-1",
+          default_branch: "main",
+          visibility: "private",
+        },
+      ]);
+    if (url.pathname.endsWith("/releases/latest"))
+      return release ? response(release) : new Response("", { status: 404 });
+    if (url.pathname.includes("/commits/"))
+      return response(kind === "github" ? { sha } : { id: sha });
+    if (url.pathname.includes("/contents/") || url.pathname.includes("/repository/files/")) {
+      assert.equal(
+        url.searchParams.get("ref"),
+        sha,
+        "Every file must be read at the resolved immutable commit",
+      );
+      if (failFiles) return new Response("denied", { status: 403 });
+      const name = decodeURIComponent(
+        url.pathname.split(kind === "github" ? "/contents/" : "/repository/files/")[1],
+      );
+      const content = files[name];
+      if (!content) return new Response("", { status: 404 });
+      return kind === "github"
+        ? new Response(content)
+        : response({
+            encoding: "base64",
+            content: Buffer.from(content).toString("base64"),
+            file_path: name,
+            commit_id: sha,
+          });
+    }
+    throw new Error(`Unexpected fixture route: ${url.pathname}`);
+  };
+  return {
+    fetcher,
+    requests,
+    failAuth: (value) => {
+      failAuth = value;
+    },
+    holdAuth: (value) => {
+      holdAuth = value;
+    },
+    fail: () => {
+      failFiles = true;
+    },
+    setRelease: (value) => {
+      release = value;
+    },
+  };
+}
+const project = (provider = "github") => ({
+  id: randomUUID(),
+  name: "fixture/repo-1",
+  path: `https://${provider}.com/fixture/repo-1`,
+  mode: "maintained",
+  packageManager: "unknown",
+  manifestPath: null,
+  lockfilePath: null,
+  evidence: {
+    status: "not-scanned",
+    lastAttempt: null,
+    lastSuccess: null,
+    coverage: [],
+    errors: [],
+  },
+  dependencies: [],
+  createdAt: new Date().toISOString(),
+  repository: {
+    provider,
+    repositoryId: "1",
+    name: "fixture/repo-1",
+    ref: "feature/test",
+    commit: null,
+    url: `https://${provider}.com/fixture/repo-1`,
+  },
+});
+const temporaryPaths = new WeakMap();
+async function cleanupTemporary(t) {
+  for (const path of temporaryPaths.get(t) ?? []) {
+    assert(path.startsWith(join(tmpdir(), "versionstead-application-")));
+    await rm(path, { recursive: true, force: true });
+  }
+}
+async function temporary(t) {
+  const path = await mkdtemp(join(tmpdir(), "versionstead-application-"));
+  temporaryPaths.set(t, [...(temporaryPaths.get(t) ?? []), path]);
+  return path;
+}
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 400; attempt++) {
+    if (predicate()) return;
+    await delay(20);
+  }
+  throw new Error("Timed out waiting for application state.");
+}
+async function freePort() {
+  const server = createHttpServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+test("GitHub and GitLab use the shared read-only parser with immutable commit provenance", async () => {
+  for (const kind of ["github", "gitlab"]) {
+    const fixture = providerFixture();
+    assert.equal(await providerAccount(kind, "read-token", fixture.fetcher), "fixture-owner");
+    const list = await listRepositories(kind, "read-token", fixture.fetcher);
+    assert.equal(list[0].id, "1");
+    const inputs = await inspectRepository(project(kind), "read-token", fixture.fetcher);
+    assert.equal(inputs.repositoryCommit, sha);
+    assert.equal(inputs.dependencies[0].resolved, "1.0.0");
+    assert.equal(inputs.dependencies[0].name, "example");
+    assert.equal(inputs.errors.length, 0);
+    assert.match(inputs.coverage[0], /read-only.*commit/);
+    assert(
+      fixture.requests.every(
+        (r) => r.headers[kind === "github" ? "Authorization" : "PRIVATE-TOKEN"],
+      ),
+    );
+    fixture.fail();
+    await assert.rejects(
+      inspectRepository(project(kind), "read-token", fixture.fetcher),
+      /read permission/,
+    );
+    await assert.rejects(
+      inspectRepository(
+        { ...project(kind), repository: { ...project(kind).repository, name: "../../untrusted" } },
+        "read-token",
+        fixture.fetcher,
+      ),
+      /identity/,
+    );
+  }
+});
+
+test("repository discovery reads every page and does not silently truncate accessible repositories", async () => {
+  let pages = 0;
+  const fetcher = async (input) => {
+    const url = new URL(input);
+    const page = Number(url.searchParams.get("page"));
+    pages++;
+    return response(
+      Array.from({ length: page === 1 ? 100 : 2 }, (_, i) => ({
+        id: (page - 1) * 100 + i + 1,
+        full_name: `fixture/repo-${(page - 1) * 100 + i + 1}`,
+        default_branch: "main",
+        private: false,
+      })),
+    );
+  };
+  assert.equal((await listRepositories("github", "token", fetcher)).length, 102);
+  assert.equal(pages, 2);
+});
+
+test("application settings routes require local authentication and validate mutations", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const fixture = providerFixture();
+  const app = await ApplicationService.create(core, fixture.fetcher);
+  const token = randomBytes(32).toString("base64url");
+  const server = await startServer({
+    port: 0,
+    monitoring: core,
+    authToken: token,
+    application: app,
+  });
+  t.after(async () => {
+    await server.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  const call = (path, body, headers = {}) =>
+    fetch(server.origin + path, {
+      method: body ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...headers },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  assert.equal((await call("/api/application", undefined, { Authorization: "" })).status, 401);
+  assert.equal((await call("/api/application/computers/refresh", { id: "bad-id" })).status, 400);
+  assert.equal(
+    (await call("/api/application/providers/connect", { kind: "bitbucket", token: "invalid" }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (await call("/api/application", undefined, { Origin: "https://attacker.invalid" })).status,
+    403,
+  );
+  const state = decodeApplicationSnapshot(await (await call("/api/application")).json());
+  const status = await call("/api/status");
+  assert.equal(status.status, 200);
+  assert.equal((await status.json()).capabilities.remoteAgents, true);
+  assert.equal(state.preferences.automaticRepositoryScans, true);
+  assert(!JSON.stringify(state).includes("secrets"));
+  const result = await fetch(server.origin + "/api/application/preferences", {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ automaticRepositoryScans: false }),
+  });
+  assert.equal(result.status, 200);
+  assert.equal((await result.json()).preferences.automaticRepositoryScans, false);
+  assert.equal((await app.checkUpdate()).update.status, "unpublished");
+  fixture.setRelease({
+    tag_name: "v0.2.0",
+    html_url: "https://github.com/Sandesh-Solabannavar/versionstead/releases/tag/v0.2.0",
+    body: "Fixture release",
+  });
+  assert.equal((await app.checkUpdate()).update.status, "available");
+  fixture.setRelease({ tag_name: "v0.2.0", html_url: "https://attacker.invalid/installer" });
+  assert.equal((await app.checkUpdate()).update.status, "failed");
+});
+
+test(
+  "selected repositories scan automatically; protected credentials and retained evidence survive restart",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const dataDir = await temporary(t);
+    let core = new MonitoringCoordinator({ dataDir, lookup: false });
+    let app;
+    const fixture = providerFixture();
+    t.after(async () => {
+      await app?.close();
+      await core.close();
+      await cleanupTemporary(t);
+    });
+    app = await ApplicationService.create(core, fixture.fetcher);
+    const token = "fixture-secret-" + randomBytes(32).toString("base64url");
+    await app.connectProvider("github", token);
+    assert.equal(
+      core.snapshot().projects.length,
+      0,
+      "Connecting must not scan or select any repository",
+    );
+    const added = await app.selectRepository("github", "1", undefined, "maintained");
+    await waitFor(
+      () =>
+        core.snapshot().projects[0]?.repository.commit === sha &&
+        core.snapshot().scanProgress.active === null,
+    );
+    assert.equal(core.snapshot().projects.length, 1);
+    assert.equal(core.snapshot().projects[0].dependencies.length, 1);
+    assert.equal(core.snapshot().projects[0].repository.ref, "main");
+    assert.equal(core.snapshot().projects[0].evidence.status, "partial");
+    assert(!JSON.stringify(app.snapshot()).includes(token));
+    assert(!JSON.stringify(core.readApplication()).includes(token));
+    assert(
+      !Buffer.from(await readFile(join(dataDir, "monitoring.sqlite"))).includes(Buffer.from(token)),
+      "Plaintext credentials must not be in SQLite",
+    );
+    app.changePreferences({ automaticRepositoryScans: false });
+    await app.selectRepository("github", "2", undefined, "watch");
+    assert.equal(core.snapshot().projects[1].evidence.status, "not-scanned");
+    const evidence = core.snapshot().projects[0];
+    fixture.fail();
+    core.requestScan({ target: "projects", projectId: added.id });
+    await waitFor(() => core.snapshot().projects[0].evidence.status === "failed");
+    assert.deepEqual(core.snapshot().projects[0].dependencies, evidence.dependencies);
+    assert.equal(core.snapshot().projects[0].evidence.lastSuccess, evidence.evidence.lastSuccess);
+    assert.equal(core.snapshot().projects[0].repository.commit, sha);
+    await app.close();
+    await core.close();
+    core = new MonitoringCoordinator({ dataDir, lookup: false });
+    app = await ApplicationService.create(core, fixture.fetcher);
+    assert.equal(app.snapshot().providers[0].account, "fixture-owner");
+    assert.equal((await app.repositories("github")).length, 2);
+    assert.equal(app.snapshot().preferences.automaticRepositoryScans, false);
+    app.changeProvider("github", false, true);
+    assert.equal(core.readApplication().secrets.length, 0);
+    assert.equal(core.snapshot().projects.length, 2);
+  },
+);
+
+test(
+  "source control refresh rechecks authentication, retains errors and pause state, and cannot undo disconnect",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const dataDir = await temporary(t);
+    const core = new MonitoringCoordinator({ dataDir, lookup: false });
+    core.changeSettings({ paused: true });
+    const fixture = providerFixture();
+    const app = await ApplicationService.create(core, fixture.fetcher);
+    t.after(async () => {
+      await app.close();
+      await core.close();
+      await cleanupTemporary(t);
+    });
+    await app.connectProvider("github", "fixture-github-token");
+    await app.connectProvider("gitlab", "fixture-gitlab-token");
+    app.changeProvider("gitlab", false);
+    fixture.requests.length = 0;
+    await app.readSnapshot();
+    assert.equal(
+      fixture.requests.length,
+      0,
+      "Routine polling must not repeatedly probe provider authentication",
+    );
+    fixture.failAuth(true);
+    const failed = await app.discover(true);
+    assert.equal(
+      fixture.requests.filter((r) => new URL(r.url).pathname.endsWith("/user")).length,
+      2,
+    );
+    assert(failed.providers.every((p) => p.account === "fixture-owner" && p.error && p.checkedAt));
+    assert.equal(failed.providers.find((p) => p.kind === "gitlab").enabled, false);
+    assert.equal(core.snapshot().projects.length, 0);
+    fixture.failAuth(false);
+    const recovered = await app.discover(true);
+    assert(recovered.providers.every((p) => p.error === null));
+    assert.equal(recovered.providers.find((p) => p.kind === "gitlab").enabled, false);
+    assert(
+      fixture.requests.every((r) => new URL(r.url).pathname.endsWith("/user")),
+      "Refresh must not discover or scan unselected repositories",
+    );
+    let release;
+    fixture.holdAuth(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const before = fixture.requests.length;
+    const pending = app.discover(true);
+    await waitFor(() => fixture.requests.length > before);
+    app.changeProvider("github", false, true);
+    release();
+    const state = await pending;
+    assert.equal(state.providers.find((p) => p.kind === "github").account, null);
+    assert.equal(state.providers.find((p) => p.kind === "github").enabled, false);
+    assert.equal(core.readApplication().secrets.length, 1);
+  },
+);
+
+test(
+  "two HTTPS coordinators pair once, retain remote evidence offline, and revoke access",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const hostCore = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    const clientCore = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    hostCore.changeSettings({ paused: true });
+    clientCore.changeSettings({ paused: true });
+    let host = await ApplicationService.create(hostCore);
+    let client = await ApplicationService.create(clientCore);
+    t.after(async () => {
+      await client.close();
+      await host.close();
+      await clientCore.close();
+      await hostCore.close();
+      await cleanupTemporary(t);
+    });
+    const folder = join(await temporary(t), "private-project");
+    await mkdir(folder);
+    await writeFile(join(folder, "package.json"), files["package.json"]);
+    await writeFile(join(folder, "package-lock.json"), files["package-lock.json"]);
+    await hostCore.addProject({ path: folder, mode: "maintained" });
+    const port = await freePort();
+    await host.changeSharing(true, "127.0.0.1", port);
+    const invitation = host.createInvitation();
+    const paired = await client.pairComputer(invitation.invitation);
+    assert.equal(paired.computers.length, 1);
+    const remote = paired.computers[0];
+    assert.equal(remote.snapshot.device.id, hostCore.snapshot().device.id);
+    assert(!JSON.stringify(remote.snapshot).includes(folder));
+    assert.equal(host.snapshot().sharing.clients.length, 1);
+    await assert.rejects(client.pairComputer(invitation.invitation), /already connected/);
+    const decoded = JSON.parse(Buffer.from(invitation.invitation, "base64url").toString("utf8"));
+    await assert.rejects(
+      peerRequest(decoded.origin, decoded.fingerprint, "/pair", {
+        body: { code: decoded.code, label: "Replay", deviceId: randomUUID() },
+      }),
+      /rejected access/,
+    );
+    await client.scanComputer(remote.id);
+    await waitFor(
+      () =>
+        hostCore.snapshot().history.length >= 2 && hostCore.snapshot().scanProgress.active === null,
+    );
+    await client.refreshComputer(remote.id);
+    const received = client.snapshot().computers[0].snapshot;
+    assert(received.projects[0].dependencies.length);
+    await client.close();
+    await host.close();
+    host = await ApplicationService.create(hostCore);
+    client = await ApplicationService.create(clientCore);
+    assert.match(client.snapshot().computers[0].error, /not been checked/);
+    await client.refreshComputer(remote.id);
+    assert.equal(client.snapshot().computers[0].error, null);
+    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    await host.changeSharing(false);
+    await client.refreshComputer(remote.id);
+    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    assert.match(client.snapshot().computers[0].error, /retained/);
+    await host.changeSharing(true, "127.0.0.1", port);
+    await client.refreshComputer(remote.id);
+    assert.equal(client.snapshot().computers[0].error, null);
+    const old = host.snapshot().sharing.clients[0];
+    host.revokeClient(old.id);
+    await client.refreshComputer(remote.id);
+    assert.match(client.snapshot().computers[0].error, /revoked/);
+    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    await client.removeComputer(remote.id);
+    assert.equal(client.snapshot().computers.length, 0);
+    assert(
+      !clientCore.readApplication().secrets.some((secret) => secret.key.startsWith("computer:")),
+    );
+  },
+);
+
+test(
+  "certificate pins are checked before sending credentials and peer endpoints reject browser/admin access",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const certificate = await createPeerCertificate();
+    let requests = 0;
+    const server = createHttpsServer(
+      { pfx: Buffer.from(certificate.pfx, "base64"), passphrase: certificate.password },
+      (req, res) => {
+        requests++;
+        res.end("{}");
+      },
+    );
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const origin = `https://127.0.0.1:${server.address().port}`;
+    await assert.rejects(
+      peerRequest(origin, "b".repeat(64), "/evidence", {
+        token: randomBytes(32).toString("base64url"),
+        nonce: randomBytes(32).toString("base64url"),
+      }),
+      /verify its certificate/,
+    );
+    assert.equal(
+      requests,
+      0,
+      "The wrong certificate must never receive HTTP headers or credentials",
+    );
+    assert.throws(() => peerOrigin("https://example.com:4389"));
+    assert.throws(() => peerOrigin("http://192.168.1.2:4389"));
+    assert.throws(() => peerOrigin("https://127.0.0.1:4389/admin"));
+    const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    core.changeSettings({ paused: true });
+    const app = await ApplicationService.create(core);
+    t.after(async () => {
+      await app.close();
+      await core.close();
+      await cleanupTemporary(t);
+    });
+    await app.changeSharing(true, "127.0.0.1", await freePort());
+    const state = app.snapshot();
+    const get = (path, headers = {}) =>
+      new Promise((resolve, reject) => {
+        httpsRequest(
+          `https://127.0.0.1:${state.sharing.port}${path}`,
+          { rejectUnauthorized: false, headers },
+          (reply) => {
+            reply.resume();
+            resolve(reply.statusCode);
+          },
+        )
+          .on("error", reject)
+          .end();
+      });
+    assert.equal(await get("/evidence"), 401);
+    assert.equal(await get("/api/application", { Origin: "https://attacker.invalid" }), 403);
+    assert.equal(await get("/api/shutdown"), 401);
+    assert.equal(sharedEvidence(core.snapshot()).notifications.length, 0);
+    const local = core.snapshot();
+    const input = await inspectRepository(project(), "fixture-token", providerFixture().fetcher);
+    const dependency = {
+      ...input.dependencies[0],
+      origin: "git",
+      requested: "git+https://owner:fixture-secret@example.invalid/repository",
+    };
+    local.projects = [
+      {
+        ...project(),
+        repository: undefined,
+        path: "C:/private/project",
+        manifestPath: "C:/private/project/package.json",
+        lockfilePath: "C:/private/project/package-lock.json",
+        dependencies: [dependency],
+      },
+    ];
+    const shared = sharedEvidence(local);
+    assert(!JSON.stringify(shared).includes("C:/private"));
+    assert(!JSON.stringify(shared).includes("fixture-secret"));
+    assert.equal(shared.projects[0].dependencies[0].origin, "git");
+  },
+);
+
+test("Git context never executes clean/process filters or inherited project overrides", async (t) => {
+  if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
+  const folder = await temporary(t);
+  t.after(() => cleanupTemporary(t));
+  await runTool("git", ["-c", "init.templateDir=", "init", folder]);
+  const args = ["-c", "core.hooksPath=", "-C", folder];
+  await writeFile(join(folder, ".gitattributes"), "tracked filter=fixture\n");
+  await writeFile(join(folder, "tracked"), "original\n");
+  await runTool("git", [...args, "add", "--", ".gitattributes", "tracked"]);
+  await runTool("git", [
+    ...args,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "-m",
+    "Fixture",
+  ]);
+  const command = "node -e \"require('fs').writeFileSync('filter-ran','unsafe')\"";
+  await runTool("git", [...args, "config", "filter.fixture.clean", command]);
+  await runTool("git", [...args, "config", "filter.fixture.process", command]);
+  await runTool("git", [...args, "config", "filter.fixture.required", "true"]);
+  await writeFile(join(folder, "tracked"), "changed\n");
+  const before = process.env.GIT_WORK_TREE;
+  process.env.GIT_WORK_TREE = join(folder, "untrusted-override");
+  try {
+    const result = await inspectGit(folder);
+    assert(result);
+    assert.match(result.commit, /^[a-f0-9]{40}$/);
+    assert.equal(result.dirty, true);
+    await assert.rejects(readFile(join(folder, "filter-ran")), { code: "ENOENT" });
+  } finally {
+    if (before === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = before;
+  }
+});

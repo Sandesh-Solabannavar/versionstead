@@ -344,6 +344,10 @@ test("static serving exposes built routes/assets, never arbitrary workspace path
       "<main>Versionstead</main>",
     );
     assert.equal((await fetch(`${server.origin}/assets/app.js`)).status, 200);
+    assert.equal(
+      await (await fetch(`${server.origin}/settings/project`)).text(),
+      "<main>Versionstead</main>",
+    );
     for (const path of [
       "/secret.txt",
       "/api/unknown",

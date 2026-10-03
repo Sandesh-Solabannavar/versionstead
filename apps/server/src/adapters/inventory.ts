@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
-import { access, readdir, realpath, stat } from "node:fs/promises";
-import { constants, type Dirent } from "node:fs";
+import { readdir, realpath, stat } from "node:fs/promises";
+import { type Dirent } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify, stripVTControlCharacters } from "node:util";
 import * as Schema from "effect/Schema";
 import semver from "semver";
@@ -13,6 +13,10 @@ import {
 } from "@versionstead/contracts/monitoring";
 import { identity, InputError, object, packageName, readSelectedFile, string } from "./projects.ts";
 import { publicPackageVersions } from "./lookups.ts";
+
+import { decodeBunConfiguration } from "./bun-config.ts";
+import { toolExecutable as executable } from "./tool-paths.ts";
+export { decodeBunConfiguration } from "./bun-config.ts";
 
 const execute = promisify(execFile);
 const publicRegistry = "https://registry.npmjs.org";
@@ -129,19 +133,6 @@ export async function validateGlobalToolSources(
   return sources;
 }
 
-async function executable(name: string) {
-  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(isAbsolute)) {
-    try {
-      const candidate = join(directory, name);
-      await access(candidate, constants.X_OK);
-      if ((await stat(candidate)).isFile()) return realpath(candidate);
-    } catch {
-      /* Try the next explicit PATH entry. */
-    }
-  }
-  return null;
-}
-
 async function metadataFile(path: string) {
   try {
     const parent = await realpath(dirname(path));
@@ -197,6 +188,37 @@ async function run(executablePath: string, args: string[], signal?: AbortSignal)
     .trim();
 }
 
+export async function npmGlobalCommand() {
+  const launcher = await executable(process.platform === "win32" ? "npm.cmd" : "npm");
+  if (!launcher) return null;
+  const candidates = [
+    join(dirname(launcher), "node_modules", "npm", "bin", "npm-cli.js"),
+    launcher.endsWith("npm-cli.js")
+      ? launcher
+      : join(dirname(launcher), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const cli = await realpath(candidate);
+      const pkg = object(
+        JSON.parse((await metadataFile(join(dirname(cli), "..", "package.json"))) ?? "null"),
+      );
+      if (pkg.name !== "npm" || typeof pkg.version !== "string" || !semver.valid(pkg.version))
+        continue;
+      const node = /^node(?:\.exe)?$/i.test(basename(process.execPath))
+        ? process.execPath
+        : (process.env.VERSIONSTEAD_NODE_EXECUTABLE ??
+          (await executable(process.platform === "win32" ? "node.exe" : "node")));
+      if (!node || !isAbsolute(node) || !/^node(?:\.exe)?$/i.test(basename(node)))
+        throw new Error();
+      return { executable: await realpath(node), cli, version: pkg.version };
+    } catch {
+      // Validate npm's actual JS entry point; never execute a shell wrapper.
+    }
+  }
+  throw new InputError("npm's executable could not be verified.");
+}
+
 async function npmSource(signal?: AbortSignal): Promise<GlobalToolSource> {
   const source: Writable<GlobalToolSource> = {
     manager: "npm",
@@ -208,40 +230,12 @@ async function npmSource(signal?: AbortSignal): Promise<GlobalToolSource> {
     checkedAt: now(),
     error: null,
   };
-  const launcher = await executable(process.platform === "win32" ? "npm.cmd" : "npm");
-  if (!launcher) return source;
-  source.status = "unavailable";
   try {
-    const candidates = [
-      join(dirname(launcher), "node_modules", "npm", "bin", "npm-cli.js"),
-      launcher.endsWith("npm-cli.js")
-        ? launcher
-        : join(dirname(launcher), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-    ];
-    let cli: string | null = null;
-    for (const candidate of candidates) {
-      try {
-        const file = await realpath(candidate);
-        const pkg = object(
-          JSON.parse((await metadataFile(join(dirname(file), "..", "package.json"))) ?? "null"),
-        );
-        if (pkg.name === "npm" && typeof pkg.version === "string" && semver.valid(pkg.version)) {
-          cli = file;
-          source.version = pkg.version;
-          break;
-        }
-      } catch {
-        /* Only npm's validated CLI is executable; a .cmd shell wrapper is never run. */
-      }
-    }
-    if (!cli) throw new Error();
-    // Electron's executable is not Node. Use the configured/PATH Node when discovery runs in its main process.
-    const node = /^node(?:\.exe)?$/i.test(basename(process.execPath))
-      ? process.execPath
-      : (process.env.VERSIONSTEAD_NODE_EXECUTABLE ??
-        (await executable(process.platform === "win32" ? "node.exe" : "node")));
-    if (!node || !isAbsolute(node) || !/^node(?:\.exe)?$/i.test(basename(node))) throw new Error();
-    const command = (args: string[]) => run(node, [cli!, ...args, "--global"], signal);
+    const npm = await npmGlobalCommand();
+    if (!npm) return source;
+    source.status = "unavailable";
+    source.version = npm.version;
+    const command = (args: string[]) => run(npm.executable, [npm.cli, ...args, "--global"], signal);
     source.root = await canonicalRoot(await command(["root"]));
     const [registry, userconfig, globalconfig] = await Promise.all([
       command(["config", "get", "registry"]),
@@ -261,6 +255,7 @@ async function npmSource(signal?: AbortSignal): Promise<GlobalToolSource> {
     source.blockedScopes = [...blocked];
     source.status = "detected";
   } catch {
+    source.status = "unavailable";
     source.registry = "unknown";
     source.error = "npm global location or registry configuration could not be checked.";
   }
@@ -279,60 +274,6 @@ export function bunGlobalDirectory(
       ? join(env.BUN_INSTALL, "install", "global")
       : join(env.XDG_CACHE_HOME ?? env.HOME ?? home, ".bun", "install", "global"));
   return /^~[\\/]/.test(directory) ? join(home, directory.slice(2)) : directory;
-}
-
-export function decodeBunConfiguration(text: string) {
-  let globalDir: string | null = null;
-  let registry: GlobalToolSource["registry"] | null = null;
-  let unsupported = false;
-  let globalDirUnsupported = false;
-  const blocked = new Set<string>();
-  // ponytail: literal single-line Bun settings are supported; add TOML parsing when real configs need other forms.
-  let section = "";
-  for (const line of text.split(/\r?\n/)) {
-    // Valid dotted/quoted TOML settings need a parser before their registry can be trusted.
-    if (/^\s*["']?install(?:["']?\s*\.|["']?\s*=)/.test(line)) unsupported = true;
-    if (
-      !line.trim().startsWith("#") &&
-      /globalDir|\\[uUx]/.test(line) &&
-      (section !== "install" || !/^\s*globalDir\s*=/.test(line))
-    )
-      globalDirUnsupported = true;
-    const heading = /^\s*\[([^\]]+)\]\s*(?:#.*)?$/.exec(line);
-    if (heading) {
-      section = heading[1]!;
-      if (/install/.test(section) && !["install", "install.scopes"].includes(section))
-        unsupported = true;
-      continue;
-    }
-    if (section === "install.scopes") {
-      const scoped = /^\s*["']?(@[a-z0-9._-]+)["']?\s*=/i.exec(line);
-      if (scoped) blocked.add(scoped[1]!);
-      else if (line.trim() && !line.trim().startsWith("#")) unsupported = true;
-    }
-    if (section !== "install") continue;
-    if (/^\s*["'](?:registry|globalDir|scopes)["']\s*=/.test(line)) unsupported = true;
-    if (/^\s*(?:(?:registry|globalDir)\s*\.|scopes\s*[.=])/.test(line)) unsupported = true;
-    const setting = /^\s*(globalDir|registry)\s*=\s*(.*)$/.exec(line);
-    if (!setting) continue;
-    const literal = /^("(?:[^"\\]|\\.)*"|'[^']*')\s*(?:#.*)?$/.exec(setting[2]!);
-    if (!literal) {
-      if (setting[1] === "globalDir") throw new Error();
-      unsupported = true;
-      continue;
-    }
-    const value = literal[1]!.startsWith('"')
-      ? (JSON.parse(literal[1]!) as string)
-      : literal[1]!.slice(1, -1);
-    if (setting[1] === "registry") registry = publicUrl(value) ? "public" : "unsupported";
-    else globalDir = value;
-  }
-  return {
-    globalDir,
-    registry: unsupported ? ("unknown" as const) : registry,
-    blockedScopes: [...blocked],
-    globalDirUnsupported,
-  };
 }
 
 async function bunSource(signal?: AbortSignal): Promise<GlobalToolSource> {
@@ -427,6 +368,58 @@ function registrySpec(spec: string, alias: string, name: string): boolean {
   );
 }
 
+/** Shared identity/origin verification for collection and explicit owner updates. */
+export async function readGlobalInstallation(
+  source: GlobalToolSource,
+  alias: string,
+  requested: string | null = null,
+): Promise<Writable<Installation>> {
+  if (!source.root || !packageName(alias)) throw new InputError("Invalid global package identity.");
+  const root = await canonicalRoot(source.root);
+  if (root !== source.root)
+    throw new InputError("The global package location changed. Scan again.");
+  const manifest = await readSelectedFile(root, `${alias}/package.json`, 1024 * 1024);
+  if (manifest === null) throw new InputError("The global package is no longer installed.");
+  const pkg = object(JSON.parse(manifest));
+  const name = string(pkg.name);
+  const version = string(pkg.version);
+  if (!name || !packageName(name) || !version || !semver.valid(version))
+    throw new InputError("Invalid installed package metadata.");
+  const resolved = string(pkg["_resolved"]);
+  const from = string(pkg["_from"]);
+  const local = [from, requested].some((spec) =>
+    /^(?:file:|link:|workspace:|git)/i.test(spec ?? ""),
+  );
+  const publicRequest =
+    (from === null || registrySpec(from, alias, name)) &&
+    (source.manager !== "bun" || (requested !== null && registrySpec(requested, alias, name)));
+  const scope = name.startsWith("@") ? name.split("/")[0]! : null;
+  const origin = local
+    ? "local"
+    : pkg.private !== true &&
+        publicRequest &&
+        source.registry === "public" &&
+        (!scope || !source.blockedScopes.includes(scope)) &&
+        (!resolved || resolved.startsWith(`${publicRegistry}/`))
+      ? "registry"
+      : "unknown";
+  return {
+    id: identity("global-tool", source.manager, root, alias, name, version),
+    name: alias,
+    packageId: name,
+    manager: source.manager,
+    rootId: rootId(source),
+    origin,
+    version,
+    source: `${source.manager} global`,
+    scope: inside(homedir(), root) ? "user" : "unknown",
+    channel: semver.prerelease(version) ? "Prerelease" : "Stable",
+    availableVersion: null,
+    updateStatus: "unknown",
+    updateCheckedAt: null,
+  };
+}
+
 export async function inspectGlobalSources(
   configured: readonly GlobalToolSource[],
   signal?: AbortSignal,
@@ -511,51 +504,15 @@ export async function inspectGlobalSources(
       let complete = true;
       for (const alias of names) {
         try {
-          if (!packageName(alias)) throw new Error();
-          const manifest = await readSelectedFile(root, `${alias}/package.json`, 1024 * 1024);
-          if (manifest === null) {
-            if (source.manager === "npm") throw new Error();
-            continue;
-          }
-          const pkg = object(JSON.parse(manifest));
-          const name = string(pkg.name);
-          const version = string(pkg.version);
-          if (!name || !packageName(name) || !version || !semver.valid(version)) throw new Error();
-          const resolved = string(pkg["_resolved"]);
-          const from = string(pkg["_from"]);
           const requested = source.manager === "bun" ? string(requests[alias]) : null;
-          const local = [from, requested].some((spec) =>
-            /^(?:file:|link:|workspace:|git)/i.test(spec ?? ""),
-          );
-          const publicRequest =
-            (from === null || registrySpec(from, alias, name)) &&
-            (source.manager !== "bun" ||
-              (requested !== null && registrySpec(requested, alias, name)));
-          const scope = name.startsWith("@") ? name.split("/")[0]! : null;
-          const origin = local
-            ? "local"
-            : pkg.private !== true &&
-                publicRequest &&
-                source.registry === "public" &&
-                (!scope || !source.blockedScopes.includes(scope)) &&
-                (!resolved || resolved.startsWith(`${publicRegistry}/`))
-              ? "registry"
-              : "unknown";
-          result.installations.push({
-            id: identity("global-tool", source.manager, root, alias, name, version),
-            name: alias,
-            packageId: name,
-            manager: source.manager,
-            rootId: rootId(source),
-            origin,
-            version,
-            source: `${source.manager} global`,
-            scope: inside(homedir(), root) ? "user" : "unknown",
-            channel: semver.prerelease(version) ? "Prerelease" : "Stable",
-            availableVersion: null,
-            updateStatus: "unknown",
-            updateCheckedAt: null,
-          });
+          // Declared Bun packages can be intentionally absent on this OS.
+          if (
+            source.manager === "bun" &&
+            packageName(alias) &&
+            (await readSelectedFile(root, `${alias}/package.json`, 1024 * 1024)) === null
+          )
+            continue;
+          result.installations.push(await readGlobalInstallation(source, alias, requested));
         } catch {
           complete = false;
           result.errors.push(

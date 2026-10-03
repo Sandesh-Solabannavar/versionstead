@@ -1,5 +1,6 @@
 import semver from "semver";
-import type { Dependency } from "@versionstead/contracts/monitoring";
+import type { Dependency, Project } from "@versionstead/contracts/monitoring";
+import type { NativeVersions } from "./outdated.ts";
 import { InputError, object, packageName, requestedRange, string } from "./projects.ts";
 
 export type Advisory = {
@@ -21,9 +22,10 @@ export type DependencyLookup = (
   dependencies: readonly Dependency[],
   signal?: AbortSignal,
   onProgress?: (progress: LookupProgress) => void,
+  localProject?: { root: string; packageManager: Project["packageManager"] },
 ) => Promise<LookupResult>;
 export type LookupProgress = {
-  stage: "advisories" | "advisory-details" | "versions";
+  stage: "advisories" | "advisory-details" | "native-versions" | "versions";
   completed: number;
   total: number;
 };
@@ -128,6 +130,7 @@ export async function lookupDependencies(
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
   onProgress?: (progress: LookupProgress) => void,
+  nativeCheck?: () => Promise<NativeVersions>,
 ): Promise<LookupResult> {
   const result: Omit<LookupResult, "dependencies"> & { dependencies: CheckedDependency[] } = {
     dependencies: dependencies.map((d) => ({
@@ -295,9 +298,26 @@ export async function lookupDependencies(
     });
     result.advisories.set(dep.id, advisories);
   }
-  const directNames = [
-    ...new Set(candidates.filter((d) => d.role !== "transitive").map((d) => d.packageName)),
-  ];
+  if (nativeCheck) {
+    const native = await nativeCheck();
+    result.coverage.push(...native.coverage);
+    for (const dep of candidates.filter((candidate) => candidate.role !== "transitive")) {
+      const versions = native.checked.get(dep.id);
+      if (!versions) continue;
+      dep.availableVersion =
+        versions.compatible && semver.gt(versions.compatible, dep.resolved!)
+          ? versions.compatible
+          : null;
+      dep.latestVersion = semver.gt(versions.latest, dep.resolved!) ? versions.latest : null;
+      dep.versionSource = versions.source;
+      dep.versionStatus = "checked";
+      result.versionChecked!.add(dep.id);
+    }
+  }
+  const versionCandidates = candidates.filter(
+    (dep) => dep.role !== "transitive" && !result.versionChecked!.has(dep.id),
+  );
+  const directNames = [...new Set(versionCandidates.map((dep) => dep.packageName))];
   const versionDeadline =
     Date.now() + Math.max(90000, Math.ceil(directNames.length / 4) * 12000 + 12000);
   let versionCount = 0;
@@ -313,9 +333,7 @@ export async function lookupDependencies(
           versionDeadline,
           signal,
         );
-        for (const dep of candidates.filter(
-          (d) => d.packageName === name && d.role !== "transitive",
-        )) {
+        for (const dep of versionCandidates.filter((d) => d.packageName === name)) {
           const range = requestedRange(dep);
           const compatible =
             range && semver.validRange(range) ? semver.maxSatisfying(versions, range) : null;
@@ -323,13 +341,12 @@ export async function lookupDependencies(
             compatible && semver.gt(compatible, dep.resolved!) ? compatible : null;
           dep.latestVersion = semver.gt(latest, dep.resolved!) ? latest : null;
           dep.versionStatus = "checked";
+          dep.versionSource = "npm registry";
           result.versionChecked!.add(dep.id);
         }
         checkedVersions++;
       } catch {
-        for (const dep of candidates.filter(
-          (d) => d.packageName === name && d.role !== "transitive",
-        ))
+        for (const dep of versionCandidates.filter((d) => d.packageName === name))
           dep.versionStatus = "failed";
         result.errors.push(
           "Public-registry version lookup failed; unavailable update evidence remains unknown.",

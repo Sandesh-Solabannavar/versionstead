@@ -20,6 +20,15 @@ import {
   type Project,
 } from "@versionstead/contracts/monitoring";
 import { useMonitoring } from "./monitoring";
+import { useApplication } from "./application";
+import { AddProjectDialog } from "./add-project";
+import { ProjectBadge } from "./project-icons";
+import { ProjectCommands } from "./project-settings";
+import {
+  GlobalToolUpdateButton,
+  GlobalToolUpdateDetails,
+  useGlobalToolUpdates,
+} from "./global-tool-updates";
 import { versionCandidate } from "./versions";
 import {
   filterInstallations,
@@ -149,7 +158,21 @@ function FindingCounts({ counts }: { counts: ReturnType<typeof findingCounts> })
 
 declare global {
   interface Window {
-    versionstead?: { selectProjectDirectory: () => Promise<string | null> };
+    versionstead?: {
+      selectProjectDirectory: () => Promise<string | null>;
+      runProjectAction: (
+        projectId: string,
+        actionId: string,
+        expectedCommand: string,
+      ) => Promise<unknown>;
+      projectActionStatus: (
+        input: string | { projectId: string; actionId: string },
+      ) => Promise<unknown>;
+      stopProjectAction: (id: string) => Promise<unknown>;
+      updateGlobalTool: (input: unknown) => Promise<unknown>;
+      globalToolUpdateCommand: (input: unknown) => Promise<unknown>;
+      globalToolUpdateStatus: () => Promise<unknown>;
+    };
   }
 }
 
@@ -278,6 +301,7 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
 
 export function Attention() {
   const { snapshot, connection } = useMonitoring();
+  const { snapshot: application } = useApplication();
   const { filter = "all" } = useSearch({ from: "/" });
   const navigate = useNavigate({ from: "/" });
   const [query, setQuery] = useState("");
@@ -310,6 +334,46 @@ export function Attention() {
         actions={<ScanButton target="all" />}
       />
       <ScanProgress snapshot={snapshot} connected={connection === "connected"} />
+      {application &&
+        application.computers.some(
+          (computer) =>
+            computer.error ||
+            !computer.snapshot ||
+            attentionGroups(computer.snapshot, filter, query).length > 0,
+        ) && (
+          <section className="setting-section" aria-label="Connected PC attention">
+            <h2>Connected PCs</h2>
+            <div className="setting-group">
+              {application.computers.flatMap((computer) => {
+                const remote = computer.snapshot
+                  ? attentionGroups(computer.snapshot, filter, query)
+                  : [];
+                if (!remote.length && !computer.error && computer.snapshot) return [];
+                return (
+                  <div className="preference-row" key={computer.id}>
+                    <div>
+                      <h3>{computer.label}</h3>
+                      <p className="muted small">
+                        {computer.snapshot
+                          ? `${remote.length} targets need attention`
+                          : "No evidence received"}{" "}
+                        · Last received {timestamp(computer.checkedAt)}
+                        {computer.error ? " · Unreachable, evidence retained" : ""}
+                      </p>
+                    </div>
+                    <Link
+                      className="button outline"
+                      to="/computers/$computerId"
+                      params={{ computerId: computer.id }}
+                    >
+                      View evidence
+                    </Link>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
       {!snapshot ? (
         <EmptyState title="Waiting for your coordinator">
           <p>
@@ -422,6 +486,8 @@ export function Attention() {
                           <span className="target-group-icon">
                             {group.kind === "pc" ? (
                               <Laptop size={19} aria-hidden="true" />
+                            ) : group.project ? (
+                              <ProjectBadge project={group.project} />
                             ) : (
                               <Folder size={19} aria-hidden="true" />
                             )}
@@ -614,6 +680,7 @@ export function Attention() {
 }
 export function ThisPc() {
   const { snapshot, connection } = useMonitoring();
+  const updater = useGlobalToolUpdates();
   const [query, setQuery] = useState("");
   const [source, setSource] = useState("all");
   const [filter, setFilter] = useState<InventoryFilter>("updates");
@@ -635,6 +702,23 @@ export function ThisPc() {
         actions={<ScanButton target="pc" />}
       />
       <ScanProgress snapshot={snapshot} connected={connection === "connected"} kind="pc" />
+      {updater.error && (
+        <p role="alert" className="error-text small mb-4">
+          {updater.error}
+        </p>
+      )}
+      {updater.runs.length > 0 && (
+        <div className="panel panel-body mb-4" aria-label="Global tool updates" aria-live="polite">
+          {updater.runs.map((run) => (
+            <p
+              key={`${run.rootId}:${run.name}`}
+              className={run.status === "failed" ? "small error-text" : "small"}
+            >
+              {run.message}
+            </p>
+          ))}
+        </div>
+      )}
       {snapshot && snapshot.inventory.collector !== "npm-bun-global-v1" ? (
         <EmptyState title="Global tool scanner update required">
           <p>Restart monitoring using the instructions above to detect npm and Bun global tools.</p>
@@ -768,6 +852,9 @@ export function ThisPc() {
                     <th scope="col">Available</th>
                     <th scope="col">Manager / channel</th>
                     <th scope="col">Update check</th>
+                    <th scope="col">
+                      <span className="sr-only">Update package</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -797,6 +884,9 @@ export function ThisPc() {
                                 : "Current at source"}
                           </Badge>
                         )}
+                      </td>
+                      <td>
+                        <GlobalToolUpdateButton item={item} updater={updater} />
                       </td>
                     </tr>
                   ))}
@@ -828,6 +918,7 @@ export function ThisPc() {
       {selected && (
         <Dialog title="Installation evidence" onClose={() => setSelectedId(null)} drawer>
           <h3>{selected.name}</h3>
+          <GlobalToolUpdateDetails key={selected.id} item={selected} updater={updater} />
           <dl className="details-list">
             <dt>Installation identity</dt>
             <dd className="mono">{selected.id}</dd>
@@ -880,99 +971,6 @@ export function ThisPc() {
         </Dialog>
       )}
     </>
-  );
-}
-
-function AddProjectDialog({ close, added }: { close: () => void; added: (id: string) => void }) {
-  const { busy, connection, error, mutate } = useMonitoring();
-  const [path, setPath] = useState("");
-  const [mode, setMode] = useState<Project["mode"]>("maintained");
-  const [pickerError, setPickerError] = useState<string | null>(null);
-  return (
-    <Dialog title="Select a project folder" onClose={close}>
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          void mutate(
-            "/api/projects",
-            { path: path.trim(), mode },
-            decodeProject,
-            "Project selected. A read-only scan is scheduled.",
-          ).then((project) => {
-            if (project) {
-              added(project.id);
-              close();
-            }
-          });
-        }}
-      >
-        <label className="field">
-          <span>Local folder path</span>
-          <Input
-            required
-            value={path}
-            placeholder={"D:\\projects\\my-app"}
-            onChange={(event) => setPath(event.target.value)}
-            autoComplete="off"
-          />
-        </label>
-        {window.versionstead && (
-          <Button
-            disabled={busy}
-            onClick={() => {
-              setPickerError(null);
-              void window.versionstead
-                ?.selectProjectDirectory()
-                .then((selected) => {
-                  if (selected) setPath(selected);
-                })
-                .catch(() =>
-                  setPickerError(
-                    "The folder picker could not be opened. Enter a local path instead.",
-                  ),
-                );
-            }}
-          >
-            Browse folders…
-          </Button>
-        )}
-        <label className="field">
-          <span>Maintenance intent</span>
-          <SelectControl
-            label="Maintenance intent"
-            value={mode}
-            items={maintenanceItems}
-            onChange={(value) => setMode(value as Project["mode"])}
-          />
-        </label>
-        <p className="muted small">
-          Only explicitly selected folders are inspected. Scans read manifests and supported
-          lockfiles; they do not restore dependencies or execute project scripts.
-        </p>
-        {pickerError && (
-          <p className="error-text" role="alert">
-            {pickerError}
-          </p>
-        )}
-        {error && (
-          <p className="error-text" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="form-actions">
-          <Button onClick={close} disabled={busy}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            type="submit"
-            disabled={!path.trim() || busy || connection !== "connected"}
-          >
-            {busy ? "Adding…" : "Add project"}
-          </Button>
-        </div>
-      </form>
-    </Dialog>
   );
 }
 
@@ -1148,7 +1146,7 @@ export function Projects() {
     <>
       <PageHeading
         title="Projects"
-        description="Selected folders, dependencies needing review, and the evidence behind every check."
+        description="Selected folders and repositories, dependencies needing review, and the evidence behind every check."
         actions={
           <div className="action-row">
             <ScanButton target="projects" label="Scan projects" />
@@ -1178,14 +1176,14 @@ export function Projects() {
               disabled={connection !== "connected" || busy}
               onClick={() => setAdding(true)}
             >
-              Add project folder
+              Add project
             </Button>
           }
         >
           <p>
-            Start with an npm or pnpm project. Supported manifests and lockfiles provide requested
-            ranges, resolved versions, and source identities. No folder is scanned until you select
-            it.
+            Start with an npm, pnpm, or Bun project. Supported manifests and lockfiles provide
+            requested ranges, resolved versions, and source identities. No folder is scanned until
+            you select it.
           </p>
         </EmptyState>
       ) : (
@@ -1285,7 +1283,7 @@ export function Projects() {
                         >
                           <ChevronDown className="target-chevron" size={15} aria-hidden="true" />
                           <span className="target-group-icon">
-                            <Folder size={19} aria-hidden="true" />
+                            <ProjectBadge project={project} />
                           </span>
                           <span className="target-group-title">
                             <strong>{project.name}</strong>
@@ -1357,6 +1355,7 @@ export function Projects() {
                             >
                               Remove
                             </Button>
+                            <ProjectCommands project={project} />
                           </div>
                         </div>
                         {project.evidence.errors.length > 0 && (
@@ -1373,14 +1372,14 @@ export function Projects() {
                           <EmptyState
                             title={
                               project.evidence.status === "not-scanned"
-                                ? "This folder has not been scanned"
+                                ? "This project has not been scanned"
                                 : "No dependency records collected"
                             }
                             action={<ScanButton target="projects" projectId={project.id} />}
                           >
                             <p>
                               {project.evidence.status === "not-scanned"
-                                ? "Run a read-only scan to verify folder access and inspect supported project inputs."
+                                ? "Run a read-only scan to verify access and inspect supported project inputs."
                                 : "Review coverage and errors. Missing or unsupported inputs leave resolved dependency coverage incomplete."}
                             </p>
                           </EmptyState>
@@ -1535,6 +1534,22 @@ export function Projects() {
                         )}
                         <details className="group-evidence">
                           <summary>Project inputs, scan evidence & coverage</summary>
+                          {project.repository && (
+                            <p className="muted">
+                              {project.repository.provider === "github" ? "GitHub" : "GitLab"} ·{" "}
+                              {project.repository.ref} · Commit{" "}
+                              {project.repository.commit ?? "not yet checked"}
+                            </p>
+                          )}
+                          {project.git && (
+                            <p className="muted">
+                              Git · {project.git.branch ?? "Detached HEAD"} ·{" "}
+                              {project.git.commit ?? "No commit"} ·{" "}
+                              {project.git.dirty
+                                ? "Working tree has tracked changes"
+                                : "No tracked changes"}
+                            </p>
+                          )}
                           <div className="input-summary">
                             <span>
                               Package manager: <strong>{project.packageManager}</strong>

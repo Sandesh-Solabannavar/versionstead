@@ -4,6 +4,18 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./global-tool-updates": {
+      "types": "./dist/global-tool-updates.d.ts",
+      "default": "./dist/global-tool-updates.js"
+    },
+    "./project-settings": {
+      "types": "./dist/project-settings.d.ts",
+      "default": "./dist/project-settings.js"
+    },
+    "./application": {
+      "types": "./dist/application.d.ts",
+      "default": "./dist/application.js"
+    },
     "./monitoring": {
       "types": "./dist/monitoring.d.ts",
       "default": "./dist/monitoring.js"

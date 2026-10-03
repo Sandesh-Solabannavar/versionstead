@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn, execFile } from "node:child_process";
+import { mkdtemp, rm, mkdir, realpath, readFile, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, isAbsolute, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { readRuntime } from "@versionstead/server/runtime";
+import { readRuntime, acquireCoordinatorLock } from "@versionstead/server/runtime";
 import { decodeMonitoringSnapshot } from "@versionstead/contracts/monitoring";
-import { externalAdvisoryUrl } from "../dist/navigation.js";
+import { externalAdvisoryUrl, externalApplicationUrl } from "../dist/navigation.js";
+import {
+  npmGlobalCommand,
+  discoverGlobalToolSources,
+  inspectGlobalSources,
+} from "../../server/dist/adapters/inventory.js";
+import { toolExecutable } from "../../server/dist/adapters/tool-paths.js";
 
 assert.equal(
   externalAdvisoryUrl("https://osv.dev/vulnerability/GHSA-abcd-1234-wxyz"),
@@ -30,11 +37,25 @@ for (const url of [
   assert.equal(externalAdvisoryUrl(url), null);
 
 const temporary = await mkdtemp(join(tmpdir(), "versionstead-desktop-smoke-"));
+assert.equal(
+  externalApplicationUrl(
+    "https://github.com/Sandesh-Solabannavar/versionstead/releases/tag/v0.2.0",
+  ),
+  "https://github.com/Sandesh-Solabannavar/versionstead/releases/tag/v0.2.0",
+);
+for (const value of [
+  "https://github.com.evil.example/Sandesh-Solabannavar/versionstead/releases/tag/v0.2.0",
+  "https://github.com/other/app/releases/tag/v0.2.0",
+  "https://github.com/Sandesh-Solabannavar/versionstead/releases/tag/v0.2.0?token=secret",
+  "file:///C:/Windows/notepad.exe",
+])
+  assert.equal(externalApplicationUrl(value), null);
 const dataDir = join(temporary, "coordinator");
 const userDir = join(temporary, "desktop");
 const appPath = fileURLToPath(new URL("../", import.meta.url));
 const projectPath = fileURLToPath(new URL("../../../", import.meta.url));
 let coordinator;
+let fixtureGuard;
 
 async function launch(capture = false) {
   const output = await new Promise((resolve, reject) => {
@@ -99,10 +120,20 @@ async function launch(capture = false) {
       result.nativeScanProgress &&
       result.nativeSummaryDestination &&
       result.nativeThemeSpacing &&
+      result.nativeSettings &&
+      result.nativeSourceControl &&
+      result.nativeProjectSources &&
+      result.nativeAppearanceSync &&
+      result.nativeConnectionsFlow &&
+      result.nativeProjectSettings &&
+      result.nativeProjectActions &&
+      result.nativeKeybindings &&
+      result.nativeUpdatePanel &&
       (!capture || (result.nativeGroupedProjects && result.nativeEvidenceSheet)),
     "Real renderer, native bridge, and tray lifecycle must pass",
   );
   for (const line of output.split(/\r?\n/)) {
+    if (/^Desktop smoke: native (npm|bun) Update now/.test(line)) console.log(line);
     try {
       if (JSON.parse(line)?.nativeProjectTable) console.log(line);
     } catch {}
@@ -121,6 +152,79 @@ async function request(path, init = {}) {
 }
 
 try {
+  if (process.env.VERSIONSTEAD_SMOKE_VERIFY_GLOBAL_UPDATES === "1") {
+    const npm = await npmGlobalCommand();
+    const bun = await toolExecutable(process.platform === "win32" ? "bun.exe" : "bun");
+    assert(npm && bun, "The optional live update check requires installed npm and Bun");
+    const globalsPath = join(temporary, "globals");
+    await mkdir(globalsPath);
+    const globals = await realpath(globalsPath);
+    // Contain Bun's ancestor lookup even if its exact global-manifest setup regresses.
+    fixtureGuard = {
+      path: join(globals, "package.json"),
+      contents: JSON.stringify({ private: true, dependencies: {} }),
+    };
+    await writeFile(fixtureGuard.path, fixtureGuard.contents);
+    process.env.npm_config_prefix = join(globals, "npm");
+    process.env.BUN_INSTALL_GLOBAL_DIR = join(globals, "bun");
+    process.env.BUN_INSTALL_BIN = join(globals, "bun-bin");
+    await mkdir(process.env.BUN_INSTALL_GLOBAL_DIR);
+    await writeFile(
+      join(process.env.BUN_INSTALL_GLOBAL_DIR, "package.json"),
+      JSON.stringify({ dependencies: {} }),
+    );
+    process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT = globals;
+    const run = promisify(execFile);
+    const options = {
+      cwd: globals,
+      env: { ...process.env, NODE_OPTIONS: "" },
+      windowsHide: true,
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    };
+    await run(
+      npm.executable,
+      [
+        npm.cli,
+        "install",
+        "--global",
+        "--prefix",
+        process.env.npm_config_prefix,
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "semver@7.0.0",
+      ],
+      options,
+    );
+    await run(bun, ["add", "--global", "--exact", "--ignore-scripts", "semver@7.0.0"], {
+      ...options,
+      cwd: process.env.BUN_INSTALL_GLOBAL_DIR,
+    });
+    assert.equal(await readFile(fixtureGuard.path, "utf8"), fixtureGuard.contents);
+    const sources = await discoverGlobalToolSources();
+    for (const source of sources) {
+      const path = source.root ? relative(globals, source.root) : "..";
+      assert(
+        path && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path),
+        `The ${source.manager} fixture discovery must target its disposable root`,
+      );
+    }
+    const inventory = await inspectGlobalSources(sources, undefined, undefined, async (url) =>
+      Response.json({
+        name: decodeURIComponent(new URL(url).pathname.slice(1)),
+        versions: { "7.0.0": {} },
+        "dist-tags": { latest: "7.0.0" },
+      }),
+    );
+    assert.deepEqual(inventory.errors, []);
+    assert.equal(
+      inventory.installations.filter((i) => i.name === "semver").length,
+      2,
+      "Both global fixtures must be collected before UI launch",
+    );
+    console.log("Desktop smoke: isolated npm/Bun update fixtures installed");
+  }
   await launch();
   console.log("Desktop smoke: first launch and close-to-tray passed");
   coordinator = await readRuntime(dataDir);
@@ -194,6 +298,15 @@ try {
       nativeThemeSpacing: true,
       nativeGroupedProjects: true,
       nativeEvidenceSheet: true,
+      nativeSettings: true,
+      nativeSourceControl: true,
+      nativeProjectSources: true,
+      nativeAppearanceSync: true,
+      nativeConnectionsFlow: true,
+      nativeProjectSettings: true,
+      nativeProjectActions: true,
+      nativeKeybindings: true,
+      nativeUpdatePanel: true,
     }),
   );
 } finally {
@@ -206,5 +319,26 @@ try {
   if (await readRuntime(dataDir)) {
     console.error("Temporary coordinator cleanup failed; its isolated data was retained");
     process.exitCode = 1;
-  } else await rm(temporary, { recursive: true, force: true });
+  } else {
+    let unlocked = false;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        const release = acquireCoordinatorLock(dataDir);
+        release();
+        unlocked = true;
+        break;
+      } catch {
+        await delay(100);
+      }
+    }
+    assert(temporary.startsWith(join(tmpdir(), "versionstead-desktop-smoke-")));
+    if (unlocked) {
+      if (fixtureGuard)
+        assert.equal(await readFile(fixtureGuard.path, "utf8"), fixtureGuard.contents);
+      await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } else {
+      console.error("Temporary coordinator still owns its database; isolated data retained");
+      process.exitCode = 1;
+    }
+  }
 }

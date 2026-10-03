@@ -18,6 +18,22 @@ import {
 } from "@versionstead/contracts/monitoring";
 import { InputError, type MonitoringCoordinator } from "./monitoring.ts";
 import { getStatus } from "./status.ts";
+import { ApplicationService } from "./application.ts";
+import {
+  ConnectProvider,
+  ChangeProvider,
+  SelectRepository,
+  ChangeApplicationPreferences,
+  ChangeSharing,
+  PairComputer,
+  ChangeComputer,
+  decodeSshHostList,
+  ComputerAction,
+  ProviderKind,
+  decodeApplicationSnapshot,
+  decodeRepositoryList,
+  decodeInvitation,
+} from "@versionstead/contracts/application";
 
 const contentTypes: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -85,11 +101,15 @@ export async function startServer(
     authToken?: string;
     devOrigin?: string;
     onShutdown?: () => void;
+    application?: ApplicationService;
   } = {},
 ) {
   if (options.monitoring && !/^[A-Za-z0-9_-]{43}$/.test(options.authToken ?? "")) {
     throw new Error("Monitoring requires a private local capability");
   }
+  const application =
+    options.application ??
+    (options.monitoring ? await ApplicationService.create(options.monitoring) : null);
   const server = createServer({ maxHeaderSize: 16 * 1024 }, async (request, response) => {
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Cache-Control", "no-store");
@@ -131,7 +151,7 @@ export async function startServer(
                   inventory: true,
                   updates: true,
                   vulnerabilities: true,
-                  remoteAgents: false,
+                  remoteAgents: true,
                 },
               })
             : status,
@@ -153,6 +173,129 @@ export async function startServer(
         }
         if (!authenticate(request, options.authToken))
           throw new HttpError(401, "Enter the owner access code to connect");
+        if (application && path.startsWith("/api/application")) {
+          if (path === "/api/application" && request.method === "GET") {
+            json(decodeApplicationSnapshot(await application.readSnapshot()));
+            return;
+          }
+          if (path === "/api/application/preferences" && request.method === "PATCH") {
+            json(
+              decodeApplicationSnapshot(
+                application.changePreferences(
+                  decode(ChangeApplicationPreferences, await readJson(request)),
+                ),
+              ),
+            );
+            return;
+          }
+          if (path === "/api/application/discover" && request.method === "POST") {
+            decode(Schema.Struct({}), await readJson(request));
+            json(decodeApplicationSnapshot(await application.discover(true)));
+            return;
+          }
+          if (path === "/api/application/providers/connect" && request.method === "POST") {
+            const input = decode(ConnectProvider, await readJson(request));
+            json(
+              decodeApplicationSnapshot(
+                await application.connectProvider(input.kind, input.token, input.useCli),
+              ),
+            );
+            return;
+          }
+          if (path === "/api/application/providers" && request.method === "PATCH") {
+            const input = decode(ChangeProvider, await readJson(request));
+            json(
+              decodeApplicationSnapshot(
+                application.changeProvider(input.kind, input.enabled, input.disconnect),
+              ),
+            );
+            return;
+          }
+          const provider = /^\/api\/application\/repositories\/(github|gitlab)$/.exec(path)?.[1];
+          if (provider && request.method === "GET") {
+            json(
+              decodeRepositoryList(await application.repositories(decode(ProviderKind, provider))),
+            );
+            return;
+          }
+          if (path === "/api/application/repositories" && request.method === "POST") {
+            const input = decode(SelectRepository, await readJson(request));
+            json(
+              decodeProject(
+                await application.selectRepository(
+                  input.kind,
+                  input.repositoryId,
+                  input.ref,
+                  input.mode,
+                ),
+              ),
+              201,
+            );
+            return;
+          }
+          if (path === "/api/application/update" && request.method === "POST") {
+            decode(Schema.Struct({}), await readJson(request));
+            json(decodeApplicationSnapshot(await application.checkUpdate()));
+            return;
+          }
+          if (path === "/api/application/sharing" && request.method === "PATCH") {
+            const input = decode(ChangeSharing, await readJson(request));
+            json(
+              decodeApplicationSnapshot(
+                await application.changeSharing(input.enabled, input.address, input.port),
+              ),
+            );
+            return;
+          }
+          if (path === "/api/application/invitation" && request.method === "POST") {
+            decode(Schema.Struct({}), await readJson(request));
+            json(decodeInvitation(application.createInvitation()));
+            return;
+          }
+          if (path === "/api/application/ssh-hosts" && request.method === "GET") {
+            json(decodeSshHostList(await application.sshHosts()));
+            return;
+          }
+          if (path === "/api/application/computers/enabled" && request.method === "PATCH") {
+            const input = decode(ChangeComputer, await readJson(request));
+            json(
+              decodeApplicationSnapshot(await application.changeComputer(input.id, input.enabled)),
+            );
+            return;
+          }
+          if (path === "/api/application/computers" && request.method === "POST") {
+            const input = decode(PairComputer, await readJson(request));
+            json(
+              decodeApplicationSnapshot(
+                await application.pairComputer(input.invitation, input.ssh),
+              ),
+            );
+            return;
+          }
+          const action = /^\/api\/application\/computers\/(refresh|scan|remove|revoke)$/.exec(
+            path,
+          )?.[1];
+          if (action && request.method === "POST") {
+            const input = decode(ComputerAction, await readJson(request));
+            if (!/^[a-f0-9-]{36}$/.test(input.id))
+              throw new HttpError(400, "Invalid computer identity");
+            if (action === "revoke") {
+              application.revokeClient(input.id);
+              json(decodeApplicationSnapshot(application.snapshot()));
+            } else
+              json(
+                decodeApplicationSnapshot(
+                  await (action === "refresh"
+                    ? application.refreshComputer(input.id)
+                    : action === "scan"
+                      ? application.scanComputer(input.id)
+                      : application.removeComputer(input.id)),
+                ),
+              );
+            return;
+          }
+          throw new HttpError(404, "Application route not found");
+        }
         if (path === "/api/monitoring" && (request.method === "GET" || request.method === "HEAD")) {
           json(decodeMonitoringSnapshot(coordinator.snapshot()));
           return;
@@ -237,11 +380,16 @@ export async function startServer(
       }
       if (request.method !== "GET" && request.method !== "HEAD")
         throw new HttpError(405, "Method not allowed");
-      const file = ["/", "/pc", "/projects", "/service", "/coverage", "/about"].includes(path)
-        ? "index.html"
-        : /^\/assets\/[a-zA-Z0-9_.-]+$/.test(path)
-          ? path.slice(1)
-          : undefined;
+      const file =
+        ["/", "/pc", "/projects", "/service", "/coverage", "/about"].includes(path) ||
+        /^\/settings\/(general|project|appearance|keybindings|source-control|connections)$/.test(
+          path,
+        ) ||
+        /^\/computers\/[a-f0-9-]{36}$/.test(path)
+          ? "index.html"
+          : /^\/assets\/[a-zA-Z0-9_.-]+$/.test(path)
+            ? path.slice(1)
+            : undefined;
       if (!options.webRoot || !file) throw new HttpError(404, "Not found");
       const content = await readFile(join(options.webRoot, file));
       response.writeHead(200, {
@@ -266,21 +414,30 @@ export async function startServer(
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.port ?? 4318, "127.0.0.1", () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(options.port ?? 4318, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (failure) {
+    await application?.close();
+    throw failure;
+  }
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+  const localOrigin = new URL(`http://127.0.0.1:${address.port}`).origin;
+  application?.setLocalOrigin(localOrigin);
   return {
-    origin: new URL(`http://127.0.0.1:${address.port}`).origin,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
+    origin: localOrigin,
+    close: async () => {
+      await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
         server.closeIdleConnections();
-      }),
+      });
+      await application?.close();
+    },
   };
 }

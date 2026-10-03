@@ -7,7 +7,7 @@ flowchart LR
   Desktop[Electron tray and notifier] --> Web[React interface]
   Web --> Server[Independent loopback Node coordinator]
   Server --> Inventory[Owner npm and Bun global metadata]
-  Server --> Projects[Selected npm/pnpm lockfiles]
+  Server --> Projects[Selected npm/pnpm/Bun lockfiles]
   Server --> Sources[Public npm and OSV]
   Server --> DB[(SQLite evidence and receipts)]
   Server --> Status[Runtime and coverage status]
@@ -15,7 +15,7 @@ flowchart LR
   Contracts -.-> Server
 ```
 
-`apps/web` owns rendering, TanStack routes, shared semantic controls, and one validated polling/cache boundary. `apps/server` owns a thin authenticated HTTP boundary, the focused monitoring coordinator, SQLite storage, and input/source adapters. `apps/desktop` is a sandboxed client with a narrow folder-picker preload, native tray, and notifier. `packages/contracts` owns status, request, evidence, and response schemas. Development runs the frontend and coordinator separately; desktop uses the built application.
+`apps/web` owns rendering, TanStack routes, shared semantic controls, and validated polling/cache boundaries. `apps/server` owns a thin authenticated HTTP boundary, the focused monitoring coordinator, SQLite storage, and input/source adapters. `apps/desktop` is a sandboxed client with a narrow folder-picker preload, native tray, and notifier. `packages/contracts` owns status, request, evidence, and response schemas. Development runs the frontend and coordinator separately; desktop uses the built application.
 
 Web controls are source-owned shadcn/Base UI components under `src/components/ui`, adapted from T3 Code with its MIT notice bundled in public assets. `ui.tsx` retains the app-level semantic wrappers and evidence/progress controls; `monitoring-view.ts` owns pure filtering, grouping, counts, and row matching. Needs attention and Projects render stable target IDs, while open evidence sheets resolve selected IDs against the current validated snapshot. This keeps presentation independent of collector and registry details without adding a new process or wire contract.
 
@@ -23,11 +23,11 @@ Web development uses ports `4317` (frontend) and `4318` (coordinator); the built
 
 Desktop startup reuses compatible coordinators. A legacy interactive session host missing scan-progress or the `npm-bun-global-v1` collector marker is gracefully stopped through its authenticated API and replaced using the same database after startup prerequisites pass. An explicit tray restart uses the same path. Boot/background hosts retain their identity and account; they require their host-specific restart procedure. A compatible boot host receives validated owner source configuration through authenticated `POST /api/global-tools/sources` when Electron attaches; changing sources during a PC scan is rejected.
 
-The coordinator persists settings, projects, current evidence, bounded scan history, notification fingerprints, and delivery receipts in SQLite. A separate SQLite exclusive lock prevents duplicate writers. Runtime capabilities are protected by Windows DPAPI plus filesystem ACLs; authenticated requests validate Effect schemas at the boundary. Browser sessions use HttpOnly SameSite cookies. No remote collector or Git host integration exists.
+The coordinator persists settings, projects, current evidence, bounded scan history, notification fingerprints, and delivery receipts in SQLite. A separate SQLite exclusive lock prevents duplicate writers. Runtime capabilities are protected by Windows DPAPI plus filesystem ACLs; authenticated requests validate Effect schemas at the boundary. Browser sessions use HttpOnly SameSite cookies. Application preferences, protected credentials, pairing records, and received PC evidence share the existing SQLite database. `ApplicationService` owns their state and focused adapters implement provider file reads, Git discovery, and paired HTTPS requests. GitHub/GitLab repository inputs use the same project parser, lookup stages, scan queue, evidence/history, and notifications as selected folders. Paired PCs exchange evidence through a separate authenticated HTTPS listener; the administrative coordinator stays on loopback.
 
 The structure borrows T3 Code’s separation of desktop, web, server, and contracts, with semantic UI styling and thin service boundaries. Reference: local clone `D:\production_code\t3code`, revision `54084ae1e6`. Full event-sourced orchestration is unnecessary for this workload.
 
-## Planned monitoring flow
+## Monitoring flow and remaining extensions
 
 ```mermaid
 flowchart LR
@@ -40,11 +40,11 @@ flowchart LR
   Hub --> Alerts[Notifications and digest]
 ```
 
-Use one coordinator and a collector on each enrolled computer. Collectors inspect local state; the coordinator owns scheduling, stored history, correlation, and notifications. Start both roles in one local process. Add an independent collector mode only when the second-device milestone needs it, sharing the scanner implementation.
+Each paired PC runs the same coordinator and scanners locally, keeping its own scheduling, durable evidence, and notifications. Its optional scoped HTTPS listener shares evidence and accepts selected-source scan requests. A receiving coordinator stores the last validated receipt; its UI shows received times and unavailable peers. No separate collector package or arbitrary remote command runner is needed for this flow.
 
 The independent process already survives Electron UI exit. `scripts/windows-background.ps1` can register a LocalService boot task to own it after sign-out. Elevated installation, actual folder access, boot, and sign-out remain manual acceptance gates; see [Windows background verification](windows-background.md). A user-session notifier delivers pending findings when Electron next opens. Automatic tray startup at login is not configured.
 
-The coordinator initially runs on the owner’s main computer. Central work pauses while it sleeps or is off. Remote collectors retain bounded pending results and reconnect with backoff once implemented; the UI shows disconnected devices and stale evidence. Moving the coordinator to an always-on computer is a later deployment choice.
+The coordinator initially runs on the owner’s main computer. Central work pauses while it sleeps or is off. Paired coordinators retain their own durable results; the client polls received snapshots every 30 seconds and retains its last receipt when unreachable. Central notification aggregation and push delivery remain deferred; the UI shows disconnected devices and stale evidence. Moving the coordinator to an always-on computer is a later deployment choice.
 
 ## Evidence model and next extensions
 
@@ -64,22 +64,26 @@ For repository scans record the commit, manifest/lockfile path, and workspace. F
 
 ## Adapter boundaries
 
-| Adapter             | Evidence and limits                                                                                                                                                  |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PC global tools     | Implemented: npm/Bun detection, actual global roots and installed manifests, stable public npm latest-version checks. Private/local/unknown origins stay unverified. |
-| macOS inventory     | Homebrew formula/cask metadata first; manual installations require explicit further support.                                                                         |
-| Linux inventory     | Distribution package manager and repository identity; use vendor-aware vulnerability data for backports.                                                             |
-| JavaScript projects | Implemented: npm package-lock v2/v3 and pnpm v9 importer/snapshot evidence; private/Git/local origins excluded from public checks.                                   |
-| .NET projects       | NuGet manifests and available resolved assets/lockfiles; never implicitly restore during a background scan.                                                          |
-| Rust projects       | Cargo manifests and lockfile; distinguish registry, Git, and local dependencies.                                                                                     |
-| GitHub/GitLab       | Read-only retrieval of selected manifests/lockfiles at a recorded commit; obey rate limits.                                                                          |
-| Advisory lookup     | Implemented: bounded OSV npm querybatch and advisory details, plus direct npm-registry SemVer updates. Other ecosystems deferred.                                    |
+Manual This PC updates use a focused adapter imported only by the Electron `GlobalToolUpdateRunner`. Trusted-frame IPC rechecks the current coordinator snapshot and the adapter resolves fresh manager/root ownership before invoking argument-array npm/Bun installs. Root locks, bounded process supervision, exact-version verification, and a PC rescan establish the terminal result. The coordinator has no updater HTTP endpoint and retains read-only scan behavior. Installer output/state remains transient desktop memory. See [Global tool updates](global-tool-updates.md).
+
+| Adapter             | Evidence and limits                                                                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PC global tools     | Implemented: npm/Bun detection, actual global roots and installed manifests, stable public npm latest-version checks. Private/local/unknown origins stay unverified.    |
+| macOS inventory     | Homebrew formula/cask metadata first; manual installations require explicit further support.                                                                            |
+| Linux inventory     | Distribution package manager and repository identity; use vendor-aware vulnerability data for backports.                                                                |
+| JavaScript projects | Implemented: npm package-lock v2/v3 and pnpm v9 importer/snapshot and Bun text v0/v1 workspace/catalog evidence; private/Git/local origins excluded from public checks. |
+| .NET projects       | NuGet manifests and available resolved assets/lockfiles; never implicitly restore during a background scan.                                                             |
+| Rust projects       | Cargo manifests and lockfile; distinguish registry, Git, and local dependencies.                                                                                        |
+| GitHub/GitLab       | Implemented: read-only retrieval of selected manifests/lockfiles at a recorded commit; obey rate limits.                                                                |
+| Advisory lookup     | Implemented: bounded OSV npm querybatch and advisory details, plus direct npm-registry SemVer updates. Other ecosystems deferred.                                       |
 
 Adapters return typed evidence and diagnostics; they do not directly send notifications. Avoid a generic plugin framework until real adapters establish what is common.
 
 OSV supports several relevant lockfile formats, but supported text `bun.lock` does not imply support for older binary `bun.lockb`. Missing lockfiles mean limited coverage, not a successful scan of transitive dependencies. Registry authentication, prereleases, withdrawn versions, and update channels need explicit handling.
 
 ## Persistence, scheduling, and notifications
+
+Local owner-session projects use the focused `outdated.ts` adapter during a separate native-version progress stage. Installed npm 11/pnpm 10/Bun 1.4 commands inspect each importer with constrained arguments, deadlines, output limits, and script/hook suppression. pnpm performs latest and compatible queries separately: its JSON `wanted` is the locked target, and recursive JSON can collapse multiple importer versions. `lookupDependencies` merges verified native candidates by dependency ID before querying remaining public names; OSV still uses original lockfile identities. An optional per-dependency source string distinguishes manager results from registry fallback. Provider repositories and noninteractive hosts never receive a native-command context. [Package-manager checks](package-manager-checks.md) records the verified flags, format versions, and fallback rules.
 
 Node 24’s built-in SQLite stores one validated personal-scale snapshot plus durable scheduling/fingerprint metadata atomically, with a schema-version gate and WAL. The scan queue coalesces each PC/project target; persisted due times survive restarts. Defaults are PC every six hours and projects hourly; intervals range from five minutes to seven days. Pause stops automatic scheduling while manual scan remains available. History is bounded to 200 attempts and selected projects to 50.
 
@@ -89,7 +93,7 @@ The first PC scan requires an explicit request; later attempts follow the config
 
 Notifications retain durable per-finding fingerprints/events but present one count summary after the queue has been idle for two seconds. Project update counts collapse duplicate importer rows by package/resolved/candidate identity; PC observations retain manager/global-root/alias identity. Obsolete pending events are pruned. Frozen summary receipts acknowledge only the events represented by that presentation, atomically storing a shared five-minute cooldown in the existing SQLite snapshot. Findings arriving during presentation remain pending. Electron acknowledges after the native notification's show event and retries failed receipts; a crash between OS presentation and the saved receipt can repeat one summary. Signed-out backlogs combine on reconnection. Daily digests, reminders, quiet hours, and snoozes remain deferred.
 
-Global source configuration records manager availability/version, canonical root, registry classification, excluded private scopes, checked time, and sanitized errors. Session scans rediscover sources; background scans read only captured owner metadata. npm scans direct global package directories; Bun resolves its exact configured/default global directory and reads that directory's direct dependency declarations and installed manifests, excluding hoisted transitive packages and parent project manifests. It never invokes `bun pm ls`, whose missing-manifest fallback can identify a parent project. Public checks reuse the project's bounded registry adapter, compare stable SemVer against `latest`, and preserve failures as unknown. Inventory remains bounded at 500 direct tools per source with 15-second discovery commands; version lookups cover all eligible names within the workload-scaled budget described above. Unsupported Bun configuration forms remain unknown instead of exposing package identities. No package install/update command runs.
+Global source configuration records manager availability/version, canonical root, registry classification, excluded private scopes, checked time, and sanitized errors. Session scans rediscover sources; background scans read only captured owner metadata. npm scans direct global package directories; Bun resolves its exact configured/default global directory and reads that directory's direct dependency declarations and installed manifests, excluding hoisted transitive packages and parent project manifests. It never invokes `bun pm ls`, whose missing-manifest fallback can identify a parent project. Public checks reuse the project's bounded registry adapter, compare stable SemVer against `latest`, and preserve failures as unknown. Inventory remains bounded at 500 direct tools per source with 15-second discovery commands; version lookups cover all eligible names within the workload-scaled budget described above. Unsupported Bun configuration forms remain unknown instead of exposing package identities. No package install/update command runs during scans. Explicit owner-session updates are documented in [Global tool updates](global-tool-updates.md).
 
 On the first load of older stored data, only active Windows PC evidence, PC findings, and their pending notifications are cleared. Device/settings/projects/history and delivered receipts are retained. Failed root reads preserve prior installations; successful metadata coverage or confirmed manager removal retires obsolete roots. A failed public lookup retains previous update evidence with its age.
 
@@ -107,3 +111,21 @@ On the first load of older stored data, only active Windows PC evidence, PC find
 - [Tailscale device connectivity](https://tailscale.com/docs/how-to/connect-to-devices)
 
 These are planning references, not a guarantee that a particular tool version or format has been implemented. Verify documentation against pinned versions while implementing each adapter.
+
+## Settings, provider scans, and PC pairing
+
+Wire schemas live in `packages/contracts/src/application.ts`. Authenticated `/api/application/*` handlers validate requests and invoke `ApplicationService`; they never return protected secret entries. Provider repositories are selected by account-scoped IDs and branch/ref, then resolved to one immutable commit per scan. Only supported manifests, workspace package manifests, lockfiles, and selected-root registry configuration are read. Nothing is cloned, restored, or built. Git discovery reads branch, commit, and tracked working-tree status with repository filters and fsmonitor disabled and submodule status checks suppressed.
+
+The paired listener binds a specific LAN/Tailscale IPv4 address, serves only pair/evidence/scan/self-revoke operations, and uses a Windows-generated PFX protected with DPAPI. Invites carry a certificate pin and five-minute one-time code. Each paired client receives a separately revocable token; the host stores its hash. Clients verify the certificate pin before sending HTTP credentials and validate device identity, response schemas, and per-request nonces. Remote evidence excludes local folder/global-root paths and notification payloads. See [setup and limitations](settings-and-connections.md).
+
+T3 references for this adaptation include `SettingsSidebarNav.tsx`, `SourceControlSettings.tsx`, `SidebarUpdatePill.tsx`, `DesktopUpdateStatusIcon.tsx`, `ConnectionsSettings.logic.ts`, and `KeybindingsSettings.logic.ts` under `apps/web/src/components`. Versionstead uses its own scanner and small SQLite state.
+
+Bun project scans use a bounded JSONC syntax tree and null-prototype values, then validate package tuples and workspace paths before fetching child manifests. Direct dependencies keep their original catalog request and a separate effective SemVer range for compatible updates. The project scanner and global-tool capture share the Bun configuration decoder; selected-root private/scoped or unsupported routing stays excluded from public checks. No Bun executable is needed to scan a project.
+
+Connections uses the same validated pairing parser in the renderer and server. A full HTTPS link carries the legacy invitation in its fragment; it preserves the device ID, private IPv4 endpoint, and certificate pin. Manual host/code input must match that identity. Saved environments persist their enabled state and optional SSH target alongside protected credentials and retained evidence. Disabled environments do not poll or accept refresh/scan actions.
+
+The focused `ssh-connections.ts` adapter reads simple owner SSH configuration as data and starts bounded, cancellable OpenSSH local forwards. `ApplicationService` coalesces and reuses one live tunnel per environment, reconnects after failure, and closes it on disable/removal/shutdown. The peer transport connects through the loopback tunnel while retaining the original HTTPS authority, device checks, and pin verification before sending credentials. No remote command is executed or monitor installed. SSH is unavailable to noninteractive boot hosts; direct LAN/Tailscale pairing remains their transport.
+
+The `settings-repositories-connections-v6` marker gates the current contracts and handlers, including Project settings and native package-manager checks. Desktop startup upgrades older interactive session hosts while preserving state; boot hosts retain their existing account and restart procedure. Connections composes shared settings groups, Base UI menus, and native dialogs. Shared Select portals use the containing native dialog when present, keeping popups in its top layer with correct hit testing and focus behavior.
+
+Optional project icon/action fields live in the existing validated SQLite snapshot; older records remain valid. `project-settings.ts` owns shared schemas and bounds. Project PATCH validates partial metadata changes and preserves source/evidence identity. Paired evidence strips action definitions. The renderer groups project identities and edits owner-local entries. The focused desktop `project-actions.ts` runner receives selected IDs plus the reviewed command through trusted-frame IPC, rechecks coordinator state, and starts bounded Windows PowerShell commands only on an explicit launch. The coordinator has no action execution HTTP endpoint and never imports that runner. See [Project settings](project-settings.md).

@@ -140,7 +140,7 @@ snapshots:
   assert.equal(inputs.dependencies.find((d) => d.name === "tool").role, "development");
   assert.equal(inputs.dependencies.find((d) => d.name === "peer").role, "transitive");
   assert.equal(inputs.dependencies.filter((d) => d.name === "public-example").length, 0);
-  assert.ok(inputs.errors.some((e) => e.includes("workspace")));
+  assert.ok(inputs.coverage.some((e) => e.includes("internal workspace/local")));
 });
 
 test("missing, malformed and unsupported inputs never produce complete coverage", async (t) => {

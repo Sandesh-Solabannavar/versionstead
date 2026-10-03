@@ -2,6 +2,8 @@
 
 Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out.
 
+Paired-PC access over Tailscale after sign-out also requires **Preferences → Run unattended** in each Windows PC's Tailscale tray menu. Tailscale normally disconnects after Windows sign-out; see its [unattended-mode guide](https://tailscale.com/docs/how-to/run-unattended). Installing Versionstead's boot host does not change Tailscale configuration or Windows Firewall. Verify both separately using the [connection setup](settings-and-connections.md).
+
 ## Install the boot host
 
 Build once in the source checkout with `pnpm build`. Then open PowerShell **as administrator**, using the same Windows account, and run:

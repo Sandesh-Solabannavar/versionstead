@@ -1,6 +1,8 @@
 // Adapted from T3 Code's shadcn/Base UI components (MIT); see apps/web/public/THIRD_PARTY_NOTICES.txt.
 import { Select as SelectPrimitive } from "@base-ui/react/select";
 import { Check, ChevronDown } from "lucide-react";
+import { useContext } from "react";
+import { DialogPortalContainer } from "./dialog-portal";
 import { cn } from "../../lib/utils";
 
 const Select = SelectPrimitive.Root;
@@ -45,9 +47,11 @@ function SelectPopup({
   alignItemWithTrigger = false,
   ...props
 }: SelectPrimitive.Popup.Props & { alignItemWithTrigger?: boolean }) {
+  const container = useContext(DialogPortalContainer);
   return (
-    <SelectPrimitive.Portal>
+    <SelectPrimitive.Portal container={container}>
       <SelectPrimitive.Positioner
+        positionMethod="fixed"
         sideOffset={4}
         align="start"
         alignItemWithTrigger={alignItemWithTrigger}

@@ -1,0 +1,752 @@
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import * as Schema from "effect/Schema";
+import semver from "semver";
+import {
+  ApplicationPreferences,
+  ChangeApplicationPreferences,
+  ProviderConnection,
+  ConnectedComputer,
+  Sharing,
+  type ApplicationSnapshot,
+  type ProviderKind,
+  type Repository,
+  type AppUpdate,
+  decodeRemoteEvidence,
+  parsePairingInvitation,
+  type SshTarget,
+} from "@versionstead/contracts/application";
+import { decodeAcceptedResponse, type Project } from "@versionstead/contracts/monitoring";
+import type { MonitoringCoordinator } from "./monitoring.ts";
+import { InputError, inspectProject, object } from "./adapters/projects.ts";
+import { discoverTools, inspectGit, runTool } from "./adapters/development-tools.ts";
+import { providerAccount, listRepositories, inspectRepository } from "./adapters/repositories.ts";
+import {
+  createPeerCertificate,
+  networkAddresses,
+  peerOrigin,
+  peerRequest,
+  privateAddress,
+  startPeerServer,
+  type PeerCertificate,
+} from "./adapters/paired-computers.ts";
+import { discoverSshHosts, startSshTunnel, validateSshTarget } from "./adapters/ssh-connections.ts";
+import { readSource } from "./adapters/source-http.ts";
+import { protectSecret, unprotectSecret } from "./runtime.ts";
+
+const StoredApplication = Schema.Struct({
+  preferences: ApplicationPreferences,
+  providers: Schema.Array(ProviderConnection),
+  computers: Schema.Array(ConnectedComputer),
+  sharing: Sharing,
+  secrets: Schema.Array(Schema.Struct({ key: Schema.String, encrypted: Schema.String })),
+  clientHashes: Schema.Array(Schema.Struct({ id: Schema.String, hash: Schema.String })),
+});
+type State = {
+  -readonly [K in keyof typeof StoredApplication.Type]: (typeof StoredApplication.Type)[K];
+};
+const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+const equal = (a: string, b: string) =>
+  a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const now = () => new Date().toISOString();
+
+export class ApplicationService {
+  private state: State;
+  private readonly plainSecrets = new Map<string, string>();
+  private readonly repositoryLists = new Map<ProviderKind, readonly Repository[]>();
+  private readonly coordinator: MonitoringCoordinator;
+  private readonly fetcher: typeof fetch;
+  private tools: ApplicationSnapshot["tools"] = {
+    git: { available: false, version: null },
+    github: { available: false, version: null },
+    gitlab: { available: false, version: null },
+    tailscale: { available: false, version: null },
+  };
+  private update: AppUpdate;
+  private localOrigin: string | null = null;
+  private peerServer: Awaited<ReturnType<typeof startPeerServer>> | null = null;
+  private readonly tunnels = new Map<string, Promise<Awaited<ReturnType<typeof startSshTunnel>>>>();
+  private invitation: { code: string; expires: number; attempts: number } | null = null;
+  private readonly shutdown = new AbortController();
+  private readonly timer: ReturnType<typeof setInterval>;
+  private polling: Promise<void> | null = null;
+  private nextUpdate = 0;
+  private discoveredAt = 0;
+
+  private constructor(coordinator: MonitoringCoordinator, fetcher: typeof fetch, version: string) {
+    this.coordinator = coordinator;
+    this.fetcher = fetcher;
+    const saved = coordinator.readApplication();
+    this.state = saved
+      ? Schema.decodeUnknownSync(StoredApplication)(saved)
+      : {
+          preferences: {
+            gitEnabled: true,
+            automaticRepositoryScans: true,
+            automaticAppUpdateChecks: false,
+          },
+          providers: ["github", "gitlab"].map((kind) => ({
+            kind: kind as ProviderKind,
+            enabled: false,
+            account: null,
+            checkedAt: null,
+            error: null,
+          })),
+          computers: [],
+          sharing: {
+            enabled: false,
+            address: "",
+            port: 4389,
+            fingerprint: null,
+            error: null,
+            clients: [],
+          },
+          secrets: [],
+          clientHashes: [],
+        };
+    if (
+      this.state.computers.length > 8 ||
+      this.state.sharing.clients.length > 16 ||
+      this.state.providers.length !== 2 ||
+      new Set(this.state.providers.map((p) => p.kind)).size !== 2 ||
+      this.state.secrets.length > 20
+    )
+      throw new Error("Invalid connection storage.");
+    this.update = {
+      status: "idle",
+      currentVersion: version,
+      latestVersion: null,
+      releaseUrl: null,
+      notes: null,
+      checkedAt: null,
+      error: null,
+    };
+    this.state.computers = this.state.computers.map((computer) => ({
+      ...computer,
+      error:
+        "Connection has not been checked since monitoring started. Last received evidence is retained.",
+    }));
+    coordinator.configureProjectInspection(
+      (p, signal) => this.inspect(p, signal),
+      (p) =>
+        !p.repository ||
+        (this.state.preferences.automaticRepositoryScans &&
+          this.provider(p.repository.provider).enabled),
+    );
+    this.save();
+    this.timer = setInterval(() => {
+      this.polling ??= this.poll().finally(() => {
+        this.polling = null;
+      });
+    }, 30000);
+    this.timer.unref();
+  }
+
+  static async create(coordinator: MonitoringCoordinator, fetcher: typeof fetch = fetch) {
+    const metadata = object(
+      JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")),
+    );
+    if (typeof metadata.version !== "string" || !semver.valid(metadata.version))
+      throw new Error("Invalid application version.");
+    const app = new ApplicationService(coordinator, fetcher, metadata.version);
+    if (app.state.sharing.enabled) {
+      try {
+        await app.enableSharing(app.state.sharing.address, app.state.sharing.port);
+      } catch {
+        app.state.sharing = {
+          ...app.state.sharing,
+          error:
+            "The paired-PC host could not restart. Check its address, certificate, and network access.",
+        };
+        app.save();
+      }
+    }
+    return app;
+  }
+  private save() {
+    this.coordinator.writeApplication(this.state);
+  }
+  private provider(kind: ProviderKind) {
+    return this.state.providers.find((p) => p.kind === kind)!;
+  }
+  private updateProvider(
+    kind: ProviderKind,
+    patch: Partial<ApplicationSnapshot["providers"][number]>,
+  ) {
+    this.state.providers = this.state.providers.map((p) =>
+      p.kind === kind ? { ...p, ...patch } : p,
+    );
+  }
+  private async secret(key: string) {
+    if (this.plainSecrets.has(key)) return this.plainSecrets.get(key)!;
+    const entry = this.state.secrets.find((s) => s.key === key);
+    if (!entry) throw new InputError("Reconnect this source to restore its protected credentials.");
+    try {
+      const value = await unprotectSecret(entry.encrypted);
+      this.plainSecrets.set(key, value);
+      return value;
+    } catch {
+      throw new InputError("The saved credential could not be unlocked on this monitoring host.");
+    }
+  }
+  private async storeSecret(key: string, value: string) {
+    const encrypted = await protectSecret(value);
+    this.state.secrets = [...this.state.secrets.filter((s) => s.key !== key), { key, encrypted }];
+    this.plainSecrets.set(key, value);
+  }
+  private forgetSecret(key: string) {
+    this.state.secrets = this.state.secrets.filter((s) => s.key !== key);
+    this.plainSecrets.delete(key);
+  }
+  snapshot(): ApplicationSnapshot {
+    return structuredClone({
+      localOrigin: this.localOrigin,
+      preferences: this.state.preferences,
+      providers: this.state.providers,
+      tools: this.tools,
+      networkAddresses: networkAddresses(),
+      credentialStorageAvailable: process.platform === "win32",
+      sharing: {
+        ...this.state.sharing,
+        error:
+          this.state.sharing.enabled && !this.peerServer
+            ? (this.state.sharing.error ?? "The sharing listener is unavailable.")
+            : this.state.sharing.error,
+      },
+      computers: this.state.computers,
+      update: this.update,
+    });
+  }
+  setLocalOrigin(origin: string) {
+    this.localOrigin = origin;
+  }
+  async discover(refreshAuthentication = false) {
+    this.tools = await discoverTools();
+    if (refreshAuthentication) {
+      await Promise.all(
+        this.state.providers.map(async (provider) => {
+          if (!provider.account) return;
+          const key = `provider:${provider.kind}`;
+          const credential = this.state.secrets.find((entry) => entry.key === key)?.encrypted;
+          let account = provider.account;
+          let error: string | null = null;
+          try {
+            account = await providerAccount(
+              provider.kind,
+              await this.secret(key),
+              this.fetcher,
+              this.shutdown.signal,
+            );
+          } catch {
+            error =
+              "Provider authentication could not be verified. Check the connection, token permissions, and provider availability, or reconnect.";
+          }
+          if (
+            this.shutdown.signal.aborted ||
+            this.provider(provider.kind).account !== provider.account ||
+            this.state.secrets.find((entry) => entry.key === key)?.encrypted !== credential
+          )
+            return;
+          this.updateProvider(provider.kind, { account, checkedAt: now(), error });
+        }),
+      );
+      this.save();
+    }
+    this.discoveredAt = Date.now();
+    return this.snapshot();
+  }
+  async readSnapshot() {
+    if (Date.now() - this.discoveredAt > 60000) await this.discover();
+    return this.snapshot();
+  }
+  changePreferences(patch: typeof ChangeApplicationPreferences.Type) {
+    const defined = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    );
+    this.state.preferences = Schema.decodeUnknownSync(ApplicationPreferences)({
+      ...this.state.preferences,
+      ...defined,
+    });
+    this.save();
+    return this.snapshot();
+  }
+  async connectProvider(kind: ProviderKind, token?: string, useCli = false) {
+    if (useCli) {
+      if (this.coordinator.snapshot().runtime.mode !== "interactive")
+        throw new InputError(
+          "The background host cannot read your signed-in CLI credentials. Connect with a read-only token instead.",
+        );
+      token = await runTool(kind === "github" ? "gh" : "glab", [
+        "auth",
+        "token",
+        "--hostname",
+        kind === "github" ? "github.com" : "gitlab.com",
+      ]);
+    }
+    if (!token || token.length > 4096 || /[^\x21-\x7e]/.test(token))
+      throw new InputError("Enter a valid read-only provider token.");
+    const account = await providerAccount(kind, token, this.fetcher);
+    await this.storeSecret(`provider:${kind}`, token);
+    this.updateProvider(kind, { account, enabled: true, checkedAt: now(), error: null });
+    this.repositoryLists.delete(kind);
+    this.save();
+    return this.snapshot();
+  }
+  changeProvider(kind: ProviderKind, enabled: boolean, disconnect = false) {
+    const provider = this.provider(kind);
+    if (disconnect) {
+      this.forgetSecret(`provider:${kind}`);
+      this.repositoryLists.delete(kind);
+      this.updateProvider(kind, { account: null, enabled: false, error: null });
+    } else {
+      if (enabled && !provider.account)
+        throw new InputError("Connect the provider before enabling repository scans.");
+      this.updateProvider(kind, { enabled });
+    }
+    this.save();
+    return this.snapshot();
+  }
+  async repositories(kind: ProviderKind) {
+    if (!this.provider(kind).enabled)
+      throw new InputError("Connect and enable this provider first.");
+    try {
+      const repositories = await listRepositories(
+        kind,
+        await this.secret(`provider:${kind}`),
+        this.fetcher,
+        this.shutdown.signal,
+      );
+      this.repositoryLists.set(kind, repositories);
+      this.updateProvider(kind, { checkedAt: now(), error: null });
+      this.save();
+      return repositories;
+    } catch {
+      this.updateProvider(kind, {
+        error:
+          "Repository discovery failed. Check read permissions, authentication, and the provider rate limit.",
+      });
+      this.save();
+      throw new InputError(this.provider(kind).error!);
+    }
+  }
+  async selectRepository(
+    kind: ProviderKind,
+    repositoryId: string,
+    ref: string | undefined,
+    mode: "maintained" | "watch",
+  ) {
+    const repos = this.repositoryLists.get(kind) ?? (await this.repositories(kind));
+    const repo = repos.find((r) => r.id === repositoryId);
+    if (!repo || !this.provider(kind).enabled)
+      throw new InputError("Choose a repository from this connected provider.");
+    const branch = ref?.trim() || repo.defaultBranch;
+    if (branch.length > 200 || Array.from(branch).some((char) => char.charCodeAt(0) < 32))
+      throw new InputError("Invalid branch or ref.");
+    return this.coordinator.addRepository(
+      {
+        provider: kind,
+        repositoryId: repo.id,
+        name: repo.name,
+        ref: branch,
+        commit: null,
+        url: repo.url,
+      },
+      mode,
+      this.state.preferences.automaticRepositoryScans,
+    );
+  }
+  private async inspect(project: Project, signal?: AbortSignal) {
+    if (project.repository) {
+      const provider = this.provider(project.repository.provider);
+      if (!provider.enabled || !provider.account)
+        throw new InputError(
+          "This repository provider is disconnected or paused; previous evidence is retained.",
+        );
+      return inspectRepository(
+        project,
+        await this.secret(`provider:${provider.kind}`),
+        this.fetcher,
+        signal,
+      );
+    }
+    const result = await inspectProject(project.path);
+    if (this.state.preferences.gitEnabled) result.git = await inspectGit(project.path, signal);
+    return result;
+  }
+  async checkUpdate() {
+    if (this.update.status === "checking") return this.snapshot();
+    this.update = { ...this.update, status: "checking", error: null };
+    try {
+      const text = await readSource(
+        "https://api.github.com/repos/Sandesh-Solabannavar/versionstead/releases/latest",
+        {
+          fetcher: this.fetcher,
+          missing: true,
+          headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2026-03-10" },
+          signal: this.shutdown.signal,
+          limit: 1024 * 1024,
+        },
+      );
+      if (text === null)
+        this.update = {
+          ...this.update,
+          status: "unpublished",
+          checkedAt: now(),
+          latestVersion: null,
+          releaseUrl: null,
+          notes: null,
+        };
+      else {
+        const release = object(JSON.parse(text));
+        const version =
+          typeof release.tag_name === "string"
+            ? semver.valid(release.tag_name.replace(/^v/, ""))
+            : null;
+        if (
+          !version ||
+          semver.prerelease(version) ||
+          release.draft === true ||
+          release.prerelease === true ||
+          typeof release.html_url !== "string" ||
+          !release.html_url.startsWith(
+            "https://github.com/Sandesh-Solabannavar/versionstead/releases/tag/",
+          )
+        )
+          throw new Error();
+        this.update = {
+          ...this.update,
+          status: semver.gt(version, this.update.currentVersion) ? "available" : "current",
+          latestVersion: version,
+          releaseUrl: release.html_url,
+          notes: typeof release.body === "string" ? release.body.slice(0, 20000) : null,
+          checkedAt: now(),
+        };
+      }
+    } catch {
+      this.update = {
+        ...this.update,
+        status: "failed",
+        checkedAt: now(),
+        error:
+          "Release information could not be verified. Check the network or GitHub rate limit and retry.",
+      };
+    }
+    this.nextUpdate = Date.now() + 86400000;
+    return this.snapshot();
+  }
+  async changeSharing(enabled: boolean, address?: string, port?: number) {
+    if (this.peerServer) {
+      await this.peerServer.close();
+      this.peerServer = null;
+    }
+    this.invitation = null;
+    if (!enabled) {
+      this.state.sharing = { ...this.state.sharing, enabled: false, error: null };
+      this.save();
+      return this.snapshot();
+    }
+    try {
+      await this.enableSharing(
+        address ?? this.state.sharing.address,
+        port ?? this.state.sharing.port,
+      );
+    } catch {
+      this.state.sharing = {
+        ...this.state.sharing,
+        enabled: false,
+        error:
+          "Could not start HTTPS sharing. Choose an address assigned to this PC and an unused port.",
+      };
+      this.save();
+      throw new InputError(this.state.sharing.error!);
+    }
+    return this.snapshot();
+  }
+  private async enableSharing(address: string, port: number) {
+    if (
+      !privateAddress(address) ||
+      !Number.isInteger(port) ||
+      port < 1024 ||
+      port > 65535 ||
+      (!networkAddresses().includes(address) && !address.startsWith("127."))
+    )
+      throw new InputError(
+        "Choose this PC's LAN or Tailscale address and a port between 1024 and 65535.",
+      );
+    let certificate: PeerCertificate;
+    if (this.state.secrets.some((s) => s.key === "certificate"))
+      certificate = JSON.parse(await this.secret("certificate")) as PeerCertificate;
+    else {
+      certificate = await createPeerCertificate();
+      await this.storeSecret("certificate", JSON.stringify(certificate));
+    }
+    this.peerServer = await startPeerServer({
+      address,
+      port,
+      certificate,
+      snapshot: () => this.coordinator.snapshot(),
+      pair: (code, label, deviceId) => this.acceptPair(code, label, deviceId),
+      authenticate: (token) => this.authenticateClient(token),
+      scan: () => this.coordinator.requestScan({ target: "all" }),
+      revoke: (id) => this.revokeClient(id),
+    });
+    this.state.sharing = {
+      ...this.state.sharing,
+      enabled: true,
+      address,
+      port: this.peerServer.port,
+      fingerprint: certificate.fingerprint,
+      error: null,
+    };
+    this.save();
+  }
+  createInvitation() {
+    if (!this.peerServer || !this.state.sharing.fingerprint)
+      throw new InputError("Enable HTTPS sharing on this PC first.");
+    const code = randomBytes(32).toString("base64url");
+    const expires = Date.now() + 5 * 60000;
+    this.invitation = { code, expires, attempts: 0 };
+    const device = this.coordinator.snapshot().device;
+    return {
+      invitation: Buffer.from(
+        JSON.stringify({
+          version: 1,
+          origin: `https://${this.state.sharing.address}:${this.state.sharing.port}`,
+          fingerprint: this.state.sharing.fingerprint,
+          deviceId: device.id,
+          label: device.label,
+          code,
+        }),
+      ).toString("base64url"),
+      expiresAt: new Date(expires).toISOString(),
+    };
+  }
+  private acceptPair(code: string, label: string, deviceId: string) {
+    const invite = this.invitation;
+    if (
+      !invite ||
+      invite.expires < Date.now() ||
+      ++invite.attempts > 8 ||
+      !/^[A-Za-z0-9_-]{43}$/.test(code) ||
+      !equal(hash(code), hash(invite.code)) ||
+      deviceId === this.coordinator.snapshot().device.id
+    )
+      throw new InputError("The pairing invitation is invalid, expired, or already used.");
+    if (this.state.sharing.clients.length >= 16)
+      throw new InputError("Revoke an existing client before pairing another PC.");
+    this.invitation = null;
+    const id = randomUUID();
+    const token = randomBytes(32).toString("base64url");
+    this.state.sharing = {
+      ...this.state.sharing,
+      clients: [...this.state.sharing.clients, { id, label, deviceId, createdAt: now() }],
+    };
+    this.state.clientHashes = [...this.state.clientHashes, { id, hash: hash(token) }];
+    this.save();
+    return { token, deviceId: this.coordinator.snapshot().device.id };
+  }
+  private authenticateClient(token: string) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+    return this.state.clientHashes.find((c) => equal(c.hash, hash(token)))?.id ?? null;
+  }
+  revokeClient(id: string) {
+    this.state.clientHashes = this.state.clientHashes.filter((c) => c.id !== id);
+    this.state.sharing = {
+      ...this.state.sharing,
+      clients: this.state.sharing.clients.filter((c) => c.id !== id),
+    };
+    this.save();
+  }
+  async sshHosts() {
+    if (this.coordinator.snapshot().runtime.mode !== "interactive")
+      return {
+        available: false,
+        hosts: [],
+        error:
+          "SSH uses the monitoring host's keys and agent. Use Remote link over LAN or Tailscale for unattended monitoring.",
+      };
+    return discoverSshHosts();
+  }
+  private async transport(computer: { id: string; origin: string; ssh?: SshTarget | undefined }) {
+    if (!computer.ssh) return {};
+    if (this.coordinator.snapshot().runtime.mode !== "interactive")
+      throw new InputError(
+        "SSH requires the owner-session monitoring host. Use a LAN or Tailscale Remote link for unattended access.",
+      );
+    let pending = this.tunnels.get(computer.id);
+    if (pending && !(await pending).alive()) {
+      this.tunnels.delete(computer.id);
+      pending = undefined;
+    }
+    if (!pending) {
+      pending = startSshTunnel(computer.ssh, computer.origin, this.shutdown.signal);
+      this.tunnels.set(computer.id, pending);
+      void pending.catch(() => {
+        if (this.tunnels.get(computer.id) === pending) this.tunnels.delete(computer.id);
+      });
+    }
+    return { tunnelPort: (await pending).port };
+  }
+  private async closeTunnel(id: string) {
+    const pending = this.tunnels.get(id);
+    this.tunnels.delete(id);
+    if (pending)
+      await pending.then(
+        (t) => t.close(),
+        () => {},
+      );
+  }
+  async changeComputer(id: string, enabled: boolean) {
+    if (!this.state.computers.some((c) => c.id === id))
+      throw new InputError("This PC is no longer connected.");
+    this.state.computers = this.state.computers.map((c) => (c.id === id ? { ...c, enabled } : c));
+    this.save();
+    if (!enabled) await this.closeTunnel(id);
+    else await this.refreshComputer(id);
+    return this.snapshot();
+  }
+  async pairComputer(invitation: string, ssh?: SshTarget) {
+    let data;
+    try {
+      data = parsePairingInvitation(invitation).identity;
+    } catch {
+      throw new InputError("Paste a valid Versionstead pairing link or code from the other PC.");
+    }
+    if (ssh) validateSshTarget(ssh);
+    if (data.deviceId === this.coordinator.snapshot().device.id)
+      throw new InputError("This invitation belongs to this PC. Create it on the other PC.");
+    if (this.state.computers.some((c) => c.deviceId === data.deviceId))
+      throw new InputError("This PC is already connected.");
+    if (this.state.computers.length >= 8)
+      throw new InputError("A maximum of eight connected computers is supported.");
+    const origin = peerOrigin(data.origin);
+    const local = this.coordinator.snapshot().device;
+    const id = randomUUID();
+    // Verify OS-backed storage before consuming the remote one-time invitation.
+    await protectSecret("pairing-storage-check");
+    let response;
+    try {
+      response = object(
+        await peerRequest(origin, data.fingerprint, "/pair", {
+          ...(await this.transport({ id, origin, ...(ssh ? { ssh } : {}) })),
+          body: { code: data.code, label: local.label, deviceId: local.id },
+          signal: this.shutdown.signal,
+        }),
+      );
+      if (
+        response.deviceId !== data.deviceId ||
+        typeof response.token !== "string" ||
+        !/^[A-Za-z0-9_-]{43}$/.test(response.token)
+      )
+        throw new InputError("The paired PC returned an unexpected identity.");
+      await this.storeSecret(`computer:${id}`, response.token);
+      this.state.computers = [
+        ...this.state.computers,
+        {
+          id,
+          enabled: true,
+          ...(ssh ? { ssh } : {}),
+          label: data.label,
+          origin,
+          fingerprint: data.fingerprint,
+          deviceId: data.deviceId,
+          checkedAt: null,
+          error: null,
+          snapshot: null,
+        },
+      ];
+      this.save();
+    } catch (error) {
+      await this.closeTunnel(id);
+      throw error;
+    }
+    await this.refreshComputer(id);
+    return this.snapshot();
+  }
+  async refreshComputer(id: string) {
+    const computer = this.state.computers.find((candidate) => candidate.id === id);
+    if (!computer) throw new InputError("This PC is no longer connected.");
+    if (computer.enabled === false)
+      throw new InputError("Enable this environment before refreshing or scanning it.");
+    try {
+      const nonce = randomBytes(32).toString("base64url");
+      const evidence = decodeRemoteEvidence(
+        await peerRequest(computer.origin, computer.fingerprint, "/evidence", {
+          ...(await this.transport(computer)),
+          token: await this.secret(`computer:${id}`),
+          nonce,
+          signal: this.shutdown.signal,
+        }),
+      );
+      if (evidence.nonce !== nonce || evidence.snapshot.device.id !== computer.deviceId)
+        throw new Error();
+      this.state.computers = this.state.computers.map((c) =>
+        c.id === id && c.enabled !== false
+          ? { ...c, snapshot: evidence.snapshot, checkedAt: now(), error: null }
+          : c,
+      );
+    } catch {
+      this.state.computers = this.state.computers.map((c) =>
+        c.id === id && c.enabled !== false
+          ? {
+              ...c,
+              error:
+                "This PC is unreachable, its certificate changed, or pairing was revoked. Last received evidence is retained.",
+            }
+          : c,
+      );
+    }
+    if (!this.shutdown.signal.aborted) this.save();
+    return this.snapshot();
+  }
+  async scanComputer(id: string) {
+    const c = this.state.computers.find((computer) => computer.id === id);
+    if (!c) throw new InputError("This PC is no longer connected.");
+    if (c.enabled === false) throw new InputError("Enable this environment before scanning it.");
+    decodeAcceptedResponse(
+      await peerRequest(c.origin, c.fingerprint, "/scan", {
+        ...(await this.transport(c)),
+        token: await this.secret(`computer:${id}`),
+        body: {},
+        signal: this.shutdown.signal,
+      }),
+    );
+    return this.refreshComputer(id);
+  }
+  async removeComputer(id: string) {
+    const c = this.state.computers.find((computer) => computer.id === id);
+    if (!c) throw new InputError("This PC is no longer connected.");
+    try {
+      await peerRequest(c.origin, c.fingerprint, "/revoke", {
+        ...(await this.transport(c)),
+        token: await this.secret(`computer:${id}`),
+        body: {},
+        signal: this.shutdown.signal,
+      });
+    } catch {
+      /* Revoke the client on the host PC if it is currently unreachable. */
+    }
+    await this.closeTunnel(id);
+    this.forgetSecret(`computer:${id}`);
+    this.state.computers = this.state.computers.filter((computer) => computer.id !== id);
+    this.save();
+    return this.snapshot();
+  }
+  private async poll() {
+    if (this.shutdown.signal.aborted) return;
+    for (const c of this.state.computers) {
+      if (this.shutdown.signal.aborted) break;
+      if (c.enabled !== false) await this.refreshComputer(c.id);
+    }
+    if (this.state.preferences.automaticAppUpdateChecks && Date.now() > this.nextUpdate)
+      await this.checkUpdate();
+  }
+  async close() {
+    if (this.shutdown.signal.aborted) return;
+    this.shutdown.abort();
+    clearInterval(this.timer);
+    await this.polling;
+    await Promise.all([...this.tunnels.keys()].map((id) => this.closeTunnel(id)));
+    if (this.peerServer) await this.peerServer.close();
+  }
+}

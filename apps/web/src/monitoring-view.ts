@@ -338,6 +338,7 @@ export function scanStage(scan: Pick<ActiveScan, "stage" | "completed" | "total"
     "project-inputs": "Reading project inputs",
     advisories: "Checking advisories",
     "advisory-details": "Reading advisory details",
+    "native-versions": "Checking updates with the package manager",
     versions: "Checking available versions",
     saving: "Saving scan evidence",
   };
@@ -353,7 +354,7 @@ export function scanStage(scan: Pick<ActiveScan, "stage" | "completed" | "total"
     label: labels[scan.stage],
     ...(known ? { value: scan.completed!, max: scan.total! } : {}),
     count: known
-      ? `${scan.completed}/${scan.total}${scan.stage === "advisories" || scan.stage === "versions" ? " packages" : scan.stage === "advisory-details" ? " advisories" : ""}`
+      ? `${scan.completed}/${scan.total}${scan.stage === "advisories" || scan.stage === "versions" || scan.stage === "native-versions" ? " packages" : scan.stage === "advisory-details" ? " advisories" : ""}`
       : "",
   };
 }

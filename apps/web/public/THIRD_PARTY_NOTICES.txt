@@ -1,4 +1,18 @@
-T3 Code components adapted in src/components/ui and src/lib/utils.ts.
+T3 Code components adapted in src/components/ui, src/lib/utils.ts,
+src/appearance-previews.tsx, src/appearance-settings.tsx, and the discovery-row
+layout in src/components/source-control-row.tsx. Provider and VCS icons in
+src/components/source-control-icons.tsx are copied from T3 Code Icons.tsx. Theme palette
+values in src/theme-palettes.ts are adapted from packages/shared/src/themePalettes.ts.
+
+Account redaction, tooltip/refresh components, visible-animation handling, and the
+Add Project source/back/confirmation flow are also adapted from T3 Code.
+
+Connections section layout, environment mode cards, pairing dialog structure, and menu interactions
+are adapted from T3 Code ConnectionsSettings.tsx and its Base UI menu (MIT).
+
+Project settings layout, icon picker/editor flow, action editor/list, and identity/color helpers
+are adapted from T3 Code ProjectSettingsPanel.tsx, ProjectActionsSettings.tsx,
+ProjectIconPickerDialog.tsx, projectScriptEditor.tsx, and projectIdentity.ts.
 
 MIT License
 

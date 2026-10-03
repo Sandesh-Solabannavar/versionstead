@@ -14,7 +14,7 @@ import {
 } from "electron";
 import { fileURLToPath } from "node:url";
 import { stat, realpath, mkdir, writeFile } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import {
   coordinatorRequest,
   ensureCoordinator,
@@ -22,8 +22,20 @@ import {
   restartCoordinator,
   type CoordinatorRuntime,
 } from "./coordinator.js";
-import { externalAdvisoryUrl } from "./navigation.js";
+import { externalApplicationUrl } from "./navigation.js";
 import { decodeAcceptedResponse } from "@versionstead/contracts/monitoring";
+import {
+  decodeActionRequest,
+  decodeRunActionRequest,
+  decodeActionRun,
+} from "@versionstead/contracts/project-settings";
+import { ProjectActionRunner } from "./project-actions.js";
+import {
+  decodeGlobalToolUpdateRequest,
+  decodeGlobalToolUpdateRun,
+  decodeGlobalToolUpdateRuns,
+} from "@versionstead/contracts/global-tool-updates";
+import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
 
 const smoke = process.argv.includes("--smoke-test");
 let runtime: CoordinatorRuntime | null = null;
@@ -35,6 +47,21 @@ let notificationTimer: ReturnType<typeof setInterval> | undefined;
 const presented = new Set<string>();
 const pendingReceipts = new Set<string>();
 const notifications = new Map<string, Notification>();
+const projectActionRunner = new ProjectActionRunner();
+const globalToolUpdateRunner = new GlobalToolUpdateRunner({
+  ...globalToolUpdateDependencies,
+  refresh: async () => {
+    const connected = await readyCoordinator();
+    if (!connected) throw new Error("Monitoring is unavailable.");
+    const response = await coordinatorRequest(connected.runtime, "/api/scans", {
+      method: "POST",
+      body: JSON.stringify({ target: "pc" }),
+    });
+    if (!response.ok) throw new Error("The PC rescan could not start.");
+    decodeAcceptedResponse(await response.json());
+  },
+});
+let closingActions = false;
 let notificationRuntimePid: number | null = null;
 
 app.setName("Versionstead");
@@ -81,12 +108,12 @@ async function createWindow() {
     },
   });
   window.webContents.setWindowOpenHandler(({ url }) => {
-    const destination = externalAdvisoryUrl(url);
+    const destination = externalApplicationUrl(url);
     if (destination && window && trustedLocation(window.webContents.getURL())) {
       void shell.openExternal(destination).catch(() => {
         dialog.showErrorBox(
           "Versionstead",
-          "The advisory could not open. Check your default browser and retry.",
+          "The link could not open. Check your default browser and retry.",
         );
       });
     }
@@ -128,6 +155,7 @@ function trayIcon() {
 
 async function updateTray() {
   const connected = await readyCoordinator();
+  if (connected) await projectActionRunner.reconcile(connected.snapshot.projects);
   runtime = connected?.runtime ?? null;
   const paused = connected?.snapshot.settings.paused ?? false;
   tray?.setToolTip(
@@ -311,14 +339,19 @@ async function runSmoke() {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false })
   }).then(response => response.ok)`);
   if (rendererWrite !== true) throw new Error("Authenticated renderer mutation failed");
+  const currentBuild: unknown = await window.webContents.executeJavaScript(
+    "!document.body.textContent.includes('Monitoring is running an older build')",
+  );
+  if (currentBuild !== true)
+    throw new Error("The current coordinator must not display a legacy-build warning");
   const clickButton = async (label: string, click = true) => {
     if (!window) throw new Error("Smoke window unavailable");
     await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const deadline = Date.now() + 15000;
       const check = () => {
-        const button = [...document.querySelectorAll('button')].find(button => button.textContent?.includes(${JSON.stringify(label)}) && !button.disabled);
+        const button = [...document.querySelectorAll('button')].find(button => (button.textContent?.includes(${JSON.stringify(label)}) || button.getAttribute('aria-label')===${JSON.stringify(label)}) && !button.disabled);
         if (button) { ${click ? "button.focus(); button.click();" : ""} resolve(true); }
-        else if (Date.now() > deadline) reject(new Error('Expected native smoke action did not become available'));
+        else if (Date.now() > deadline) reject(new Error('Native smoke action unavailable: ' + ${JSON.stringify(label)}));
         else setTimeout(check, 100);
       }; check();
     })`);
@@ -332,7 +365,8 @@ async function runSmoke() {
       trigger.click();
       const deadline = Date.now() + 5000;
       const choose = () => {
-        const item = [...document.querySelectorAll('[role="option"]')].find(item => item.textContent.trim() === ${JSON.stringify(option)});
+        const popups = [...document.querySelectorAll('[data-slot="select-popup"]')].filter(popup => !popup.hasAttribute('data-ending-style') && !popup.hasAttribute('data-closed') && popup.getClientRects().length && getComputedStyle(popup).visibility !== 'hidden');
+        const item = popups.flatMap(popup => [...popup.querySelectorAll('[role="option"]')]).find(item => item.textContent.trim() === ${JSON.stringify(option)});
         if (item) { item.click(); setTimeout(resolve, 100); }
         else if (Date.now() > deadline) reject(new Error('Native select option unavailable'));
         else setTimeout(choose, 50);
@@ -420,6 +454,74 @@ async function runSmoke() {
     (meter.value !== null && (!meter.max || Number(meter.value) > Number(meter.max)))
   )
     throw new Error("Scan progress must be labeled and use bounded real counts");
+  if (process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT) {
+    // Only the smoke harness's two disposable roots may be updated by this test.
+    const base = await realpath(process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT);
+    const waitForPc = async () => {
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        const connected = await readyCoordinator();
+        if (
+          connected &&
+          connected.snapshot.inventory.evidence.status !== "scanning" &&
+          !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
+        )
+          return connected;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error("Fixture PC scan did not finish");
+    };
+    await waitForPc();
+    for (const manager of ["npm", "bun"] as const) {
+      const connected = await readyCoordinator();
+      const source = connected?.snapshot.inventory.managers?.find((s) => s.manager === manager);
+      const path = source?.root ? relative(base, source.root) : "..";
+      if (!path || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path))
+        throw new Error(
+          `Live ${manager} update fixture is outside its disposable directory or unavailable (${source?.status}, root present: ${Boolean(source?.root)}): ${source?.error ?? "no source error"}`,
+        );
+      const item = connected?.snapshot.inventory.installations.find(
+        (i) => i.name === "semver" && i.manager === manager,
+      );
+      if (!item) throw new Error("Live update fixture was not collected");
+      if (item.version !== "7.0.0") {
+        if (item.updateStatus === "current") continue;
+        throw new Error("Unexpected live update fixture version");
+      }
+      await window.loadURL("versionstead://app/pc");
+      await clickButton("Update now semver", false);
+      await selectOption("Global package manager", manager === "npm" ? "npm" : "Bun");
+      await clickButton("Update now semver");
+      const deadline = Date.now() + 30000;
+      let succeeded = false;
+      while (Date.now() < deadline) {
+        const run = globalToolUpdateRunner
+          .read()
+          .find((r) => r.rootId === item.rootId && r.name === item.name);
+        if (run?.status === "failed")
+          throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
+        if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
+          succeeded = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (!succeeded) throw new Error("Native Update now did not finish");
+      const refreshed = await waitForPc();
+      const updated = refreshed.snapshot.inventory.installations.find(
+        (i) => i.name === "semver" && i.manager === manager,
+      );
+      if (updated?.version !== item.availableVersion || updated.updateStatus !== "current")
+        throw new Error("The update did not refresh installed PC evidence");
+      const staleRejected: unknown = await window.webContents.executeJavaScript(
+        `window.versionstead.updateGlobalTool(${JSON.stringify({ installationId: item.id, expectedVersion: item.version, targetVersion: item.availableVersion })}).then(() => false, () => true)`,
+      );
+      if (staleRejected !== true) throw new Error("A stale native update request was accepted");
+      console.log(
+        `Desktop smoke: native ${manager} Update now installed and verified ${item.availableVersion} in a disposable root`,
+      );
+    }
+  }
   await window.loadURL("versionstead://app/?filter=updates");
   const notificationFilter: unknown = await window.webContents
     .executeJavaScript(`new Promise((resolve, reject) => {
@@ -475,12 +577,81 @@ async function runSmoke() {
   })`);
   if (focusReturned !== true)
     throw new Error("Closing Add Project did not restore focus to its trigger");
+  const waitSettings = async (expression: string) => {
+    if (!window) throw new Error("Smoke window unavailable");
+    await window.webContents.executeJavaScript(
+      `new Promise((resolve,reject)=>{const deadline=Date.now()+20000;const check=()=>{if(${expression})resolve(true);else if(Date.now()>deadline)reject(new Error('Native settings did not become available: ' + ${JSON.stringify(expression)} + ' ' + JSON.stringify({alerts:[...document.querySelectorAll('[role="alert"]')].map(e=>e.textContent),projectName:document.querySelector('[aria-label="Project name"]')?.value,disabled:document.querySelector('[aria-label="Project name"]')?.disabled})));else setTimeout(check,100);};check();})`,
+    );
+  };
+  await clickButton("Add project");
+  await waitSettings(
+    "document.querySelector('dialog[open] input[aria-label=\"Search project sources\"]') && [...document.querySelectorAll('.project-source-option')].some(row=>row.textContent.includes('GitHub repository')) && [...document.querySelectorAll('.project-source-option')].some(row=>row.textContent.includes('GitLab repository'))",
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    const row=[...document.querySelectorAll('.project-source-option')].find(row=>row.textContent.includes('Local folder'));
+    row.querySelector('button').click();
+  })()`);
+  await waitSettings(
+    "document.querySelector('input[aria-label=\"Local folder path\"]')===document.activeElement",
+  );
+  await window.webContents.executeJavaScript(
+    `document.querySelector('.local-project-form > button').click()`,
+  );
+  await waitSettings("document.querySelector('.project-source-picker')");
+  await window.webContents.executeJavaScript(
+    `[...document.querySelectorAll('.project-source-option')].find(row=>row.textContent.includes('Git URL')).querySelector('button').click()`,
+  );
+  await waitSettings(
+    "document.querySelector('input[aria-label=\"Repository URL\"]')===document.activeElement",
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    const input=document.querySelector('input[aria-label="Repository URL"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'https://github.com.evil.example/owner/repo');input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));
+  })()`);
+  await window.webContents.executeJavaScript(
+    `document.querySelector('.project-url-form button[type="submit"]').click()`,
+  );
+  await waitSettings(
+    "document.querySelector('.project-url-form [role=\"alert\"]')?.textContent.includes('GitHub.com or GitLab.com')",
+  );
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+  await waitSettings("document.querySelector('dialog[open] .project-source-picker')");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Set up GitHub"]').click()`,
+  );
+  await waitSettings(
+    "document.querySelector('h1')?.textContent==='Source Control' && !document.querySelector('dialog[open]')",
+  );
+  const setAppearanceMode = async (mode: "light" | "dark", destination: string) => {
+    if (!window) throw new Error("Smoke window unavailable");
+    await window.loadURL("versionstead://app/settings/appearance");
+    await waitSettings(
+      `document.querySelector('button[aria-label="${mode === "dark" ? "Dark" : "Light"} theme"]')`,
+    );
+    await window.webContents.executeJavaScript(
+      `document.querySelector('button[aria-label="${mode === "dark" ? "Dark" : "Light"} theme"]').click()`,
+    );
+    await waitSettings(`document.documentElement.dataset.theme==='${mode}'`);
+    await window.loadURL(`versionstead://app/${destination}`);
+    await waitSettings(
+      "document.querySelector('[data-testid=\"connection-state\"]')?.getAttribute('data-state')==='online'",
+    );
+  };
+  const sidebarAppearanceAbsent: unknown = await window.webContents.executeJavaScript(
+    "!document.querySelector('.sidebar-footer .theme-control') && !document.querySelector('.sidebar-footer [aria-label=\"Appearance\"]') && !document.querySelector('.sidebar-footer .theme-button')",
+  );
+  if (sidebarAppearanceAbsent !== true)
+    throw new Error("Appearance controls must live in Settings only");
+  await window.loadURL("versionstead://app/settings/appearance");
+  await waitSettings("document.querySelectorAll('.appearance-mode-card').length===3");
   const themeSpacing: unknown = await window.webContents.executeJavaScript(`(() => {
-    const buttons = [...document.querySelectorAll('.theme-button')];
+    const buttons = [...document.querySelectorAll('.appearance-mode-card')];
     const rects = buttons.map(button => button.getBoundingClientRect());
     return buttons.length === 3 && rects.every(rect => rect.width >= 36 && rect.height >= 36) && rects.slice(1).every((rect, index) => rect.x - rects[index].right >= 8);
   })()`);
-  if (themeSpacing !== true) throw new Error("Theme buttons must have separated hit targets");
+  if (themeSpacing !== true)
+    throw new Error("Appearance preview cards must have separated hit targets");
   await window.webContents.executeJavaScript(`new Promise(resolve => {
     document.querySelector('button[aria-label="Dark theme"]').click();
     setTimeout(resolve, 100);
@@ -494,6 +665,10 @@ async function runSmoke() {
     document.querySelector('button[aria-label="Light theme"]').click();
     setTimeout(resolve, 100);
   })`);
+  await window.loadURL("versionstead://app/projects");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.getAttribute('data-state')==='online'",
+  );
   const projects = (await readyCoordinator())?.snapshot.projects ?? [];
   let nativeGroupedProjects = false;
   let nativeEvidenceSheet = false;
@@ -629,20 +804,12 @@ async function runSmoke() {
             );
         }
         window.setContentSize(1440, 900);
-        await window.webContents.executeJavaScript(`new Promise(resolve => {
-          const button = document.querySelector('button[aria-label="Dark theme"]');
-          if (!button) throw new Error('Appearance control unavailable');
-          button.click();
-          setTimeout(resolve, 250);
-        })`);
+        await setAppearanceMode("dark", "projects");
         await writeFile(
           join(screenshotDirectory, "projects-dark.png"),
           (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
         );
-        await window.webContents.executeJavaScript(`new Promise(resolve => {
-          document.querySelector('button[aria-label="Light theme"]').click();
-          setTimeout(resolve, 250);
-        })`);
+        await setAppearanceMode("light", "projects");
       }
     }
     await window.loadURL("versionstead://app/projects");
@@ -660,6 +827,577 @@ async function runSmoke() {
       (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
   }
+  for (const [path, title] of [
+    ["general", "General"],
+    ["appearance", "Appearance"],
+    ["keybindings", "Keybindings"],
+    ["source-control", "Source Control"],
+    ["connections", "Connections"],
+  ]) {
+    await window.loadURL(`versionstead://app/settings/${path}`);
+    await waitSettings(
+      `document.querySelector('h1')?.textContent === ${JSON.stringify(title)} && document.querySelector('.setting-group') && document.querySelector('[data-testid="connection-state"]')?.getAttribute('data-state')==='online'`,
+    );
+    if (path === "source-control") {
+      await waitSettings(
+        "document.querySelectorAll('.source-control-row').length===7 && document.querySelectorAll('.source-control-mark svg').length===7",
+      );
+      for (const label of ["Automatically scan repositories", "Enable Git context"]) {
+        const original = await window.webContents.executeJavaScript(`(() => {
+          const control=document.querySelector('[aria-label="${label}"]');
+          if(control.disabled)return null;
+          const value=control.getAttribute('aria-checked');control.click();return value;
+        })()`);
+        if (original === null) continue;
+        const changed = original === "true" ? "false" : "true";
+        await waitSettings(
+          `document.querySelector('[aria-label="${label}"]')?.getAttribute('aria-checked')==='${changed}' && !document.querySelector('[aria-label="${label}"]').disabled`,
+        );
+        await window.loadURL("versionstead://app/settings/source-control");
+        await waitSettings(
+          `document.querySelector('[aria-label="${label}"]')?.getAttribute('aria-checked')==='${changed}' && !document.querySelector('[aria-label="${label}"]').disabled`,
+        );
+        await window.webContents.executeJavaScript(
+          `document.querySelector('[aria-label="${label}"]').click()`,
+        );
+        await waitSettings(
+          `document.querySelector('[aria-label="${label}"]')?.getAttribute('aria-checked')==='${original}' && !document.querySelector('[aria-label="${label}"]').disabled`,
+        );
+      }
+      await window.webContents.executeJavaScript(`(() => {
+        const toggle=document.querySelector('[aria-label="Toggle GitHub details"]');
+        if(toggle.getAttribute('aria-expanded')!=='false')throw new Error('Provider details must start collapsed');
+        toggle.click();
+      })()`);
+      await waitSettings(
+        "document.querySelector('[aria-label=\"Toggle GitHub details\"]').getAttribute('aria-expanded')==='true' && [...document.querySelectorAll('.source-control-details button')].some(button=>button.textContent==='Connect GitHub')",
+      );
+      await window.webContents.executeJavaScript(
+        `document.querySelector('[aria-label="Enable GitHub repository scans"]').click()`,
+      );
+      await waitSettings(
+        "document.querySelector('dialog[open] h2')?.textContent==='Connect GitHub' && document.activeElement?.type==='password'",
+      );
+      await window.webContents.executeJavaScript(`(() => {
+        if(document.querySelector('[aria-label="Enable GitHub repository scans"]').getAttribute('aria-checked')!=='false')throw new Error('Opening a connection dialog must not authenticate or enable a provider');
+        document.querySelector('dialog[open] button[aria-label="Close dialog"]').click();
+      })()`);
+      await waitSettings("!document.querySelector('dialog[open]')");
+      const originalInterval = await window.webContents.executeJavaScript(
+        `document.querySelector('button[aria-label="Repository scan interval"]')?.textContent?.trim()`,
+      );
+      await selectOption("Repository scan interval", "15 minutes");
+      await waitSettings(
+        "document.querySelector('button[aria-label=\"Repository scan interval\"]')?.textContent?.trim()==='15 minutes' && !document.querySelector('button[aria-label=\"Repository scan interval\"]').disabled",
+      );
+      await window.loadURL("versionstead://app/settings/general");
+      await waitSettings(
+        "document.querySelector('button[aria-label=\"Project scan interval\"]')?.textContent?.trim()==='15 minutes'",
+      );
+      await window.loadURL("versionstead://app/settings/source-control");
+      await waitSettings(
+        "document.querySelector('button[aria-label=\"Repository scan interval\"]')?.textContent?.trim()==='15 minutes'",
+      );
+      await selectOption("Repository scan interval", originalInterval);
+      await waitSettings(
+        `document.querySelector('button[aria-label="Repository scan interval"]')?.textContent?.trim()===${JSON.stringify(originalInterval)} && !document.querySelector('button[aria-label="Repository scan interval"]').disabled`,
+      );
+      await window.webContents.executeJavaScript(
+        `document.querySelector('[aria-label="Refresh source control tools"]').click()`,
+      );
+      await waitSettings(
+        "!document.querySelector('[aria-label=\"Refresh source control tools\"]').disabled",
+      );
+      if (screenshotDirectory) {
+        await setAppearanceMode("dark", "settings/source-control");
+        await waitSettings("document.querySelectorAll('.source-control-row').length===7");
+        window.setContentSize(1280, 1040);
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+        await writeFile(
+          join(screenshotDirectory, "source-control-dark.png"),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+      }
+      await window.webContents.executeJavaScript(
+        `document.querySelector('[aria-label="Toggle Git details"]').click();document.querySelector('[aria-label="Toggle GitHub details"]').click();document.querySelector('[aria-label="Toggle GitLab details"]').click()`,
+      );
+      await waitSettings(
+        "document.querySelectorAll('.source-control-controls [aria-expanded=\"true\"]').length===3",
+      );
+      window.setMinimumSize(320, 500);
+      window.setContentSize(390, 900);
+      await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+      const contained = await window.webContents.executeJavaScript(
+        `document.documentElement.scrollWidth<=innerWidth && [...document.querySelectorAll('.source-control-summary')].every(row=>row.scrollWidth<=row.clientWidth)`,
+      );
+      if (!contained) {
+        const dimensions = await window.webContents.executeJavaScript(
+          `({viewport:innerWidth,page:document.documentElement.scrollWidth,rows:[...document.querySelectorAll('.source-control-summary')].map(row=>({name:row.querySelector('h3')?.textContent,width:row.clientWidth,scroll:row.scrollWidth})),wide:[...document.querySelectorAll('body *')].filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(e=>({tag:e.tagName,class:e.className,width:e.getBoundingClientRect().width}))})`,
+        );
+        throw new Error(
+          "Source Control details escape the narrow window: " + JSON.stringify(dimensions),
+        );
+      }
+      if (screenshotDirectory)
+        await writeFile(
+          join(screenshotDirectory, "source-control-narrow.png"),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+      window.setContentSize(1440, 900);
+      if (screenshotDirectory) {
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+        await writeFile(
+          join(screenshotDirectory, "source-control-details.png"),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+        await setAppearanceMode("light", "settings/source-control");
+        await waitSettings("document.querySelectorAll('.source-control-row').length===7");
+      }
+    }
+    if (path === "connections") {
+      if (screenshotDirectory) await setAppearanceMode("dark", "settings/connections");
+      await window.webContents.executeJavaScript(
+        "document.querySelector('[aria-label=\"Enable network access\"]').click()",
+      );
+      await waitSettings(
+        "document.querySelector('dialog[open] [aria-label=\"Sharing network address\"]')",
+      );
+      await window.webContents.executeJavaScript(
+        "document.querySelector('[aria-label=\"Sharing network address\"]').click()",
+      );
+      await waitSettings(
+        'document.querySelector(\'dialog[open] [data-slot="select-popup"] [role="option"]\')',
+      );
+      const networkOption = await window.webContents.executeJavaScript(`(() => {
+        const item = document.querySelector('dialog[open] [role="option"]');
+        const bounds = item.getBoundingClientRect();
+        const visible = document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2)?.closest('[role="option"]') === item;
+        if (visible) item.click(); return visible;
+      })()`);
+      if (!networkOption)
+        throw new Error("Network address options must be clickable above the native dialog");
+      await clickButton("Cancel");
+      await waitSettings("!document.querySelector('dialog[open]')");
+      await waitSettings(
+        "document.querySelector('.empty-environments') && document.querySelector('[aria-label=\"Enable network access\"]')",
+      );
+      const original = await window.webContents.executeJavaScript(`(() => {
+        const control = document.querySelector('[aria-label="Local environment"]');
+        const value = control.getAttribute('aria-checked'); control.click(); return value;
+      })()`);
+      await waitSettings(
+        `document.querySelector('[aria-label="Local environment"]').getAttribute('aria-checked')!==${JSON.stringify(original)} && !document.querySelector('[aria-label="Local environment"]').disabled`,
+      );
+      await window.webContents.executeJavaScript(
+        `document.querySelector('[aria-label="Local environment"]').click()`,
+      );
+      await waitSettings(
+        `document.querySelector('[aria-label="Local environment"]').getAttribute('aria-checked')===${JSON.stringify(original)} && !document.querySelector('[aria-label="Local environment"]').disabled`,
+      );
+      await clickButton("Add environment");
+      await waitSettings(
+        "document.querySelector('dialog[open] h2')?.textContent==='Add Environment' && document.querySelector('input[placeholder=\"PAIRCODE\"]')",
+      );
+      const identity = {
+        version: 1,
+        origin: "https://100.64.1.2:4389",
+        fingerprint: "a".repeat(64),
+        deviceId: "00000000-0000-4000-8000-000000000099",
+        label: "Smoke peer",
+        code: "a".repeat(43),
+      };
+      const code = Buffer.from(JSON.stringify(identity)).toString("base64url");
+      await window.webContents.executeJavaScript(`(() => {
+        const input = document.querySelector('input[placeholder="100.100.10.20:4389"]');
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, ${JSON.stringify(identity.origin + "/#pair=" + code)});
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      })()`);
+      await waitSettings(
+        `document.querySelector('input[placeholder="100.100.10.20:4389"]').value===${JSON.stringify(identity.origin)} && document.querySelector('input[placeholder="PAIRCODE"]').value===${JSON.stringify(code)}`,
+      );
+      if (screenshotDirectory)
+        await writeFile(
+          join(screenshotDirectory, "connections-remote-link.png"),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+      await window.webContents.executeJavaScript(
+        "document.querySelector('dialog[open] .connection-mode-card:last-child').click()",
+      );
+      await waitSettings(
+        "document.querySelector('#environment-ssh-host') && document.querySelector('input[placeholder=\"root\"]') && document.querySelector('input[placeholder=\"22\"]')",
+      );
+      if (screenshotDirectory)
+        await writeFile(
+          join(screenshotDirectory, "connections-ssh.png"),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+      await clickButton("Close dialog");
+      await waitSettings("!document.querySelector('dialog[open]')");
+      window.setContentSize(560, 720);
+      await clickButton("Add environment");
+      await waitSettings("document.querySelector('dialog[open] .connection-mode-grid')");
+      const contained = await window.webContents.executeJavaScript(`(() => {
+        const dialog = document.querySelector('dialog[open]');
+        const bounds = dialog.getBoundingClientRect();
+        return dialog.scrollWidth <= dialog.clientWidth + 2 && bounds.left >= 0 && bounds.right <= innerWidth;
+      })()`);
+      if (contained !== true) throw new Error("Connections dialog escapes a narrow window");
+      await clickButton("Close dialog");
+      window.setContentSize(1280, 800);
+    }
+    if (screenshotDirectory && (path === "source-control" || path === "connections"))
+      await writeFile(
+        join(screenshotDirectory, `settings-${path}.png`),
+        (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+      );
+  }
+  await window.loadURL("versionstead://app/settings/project");
+  await waitSettings(
+    "document.querySelector('h1')?.textContent==='Project' && document.querySelector('[data-testid=\"connection-state\"]')?.getAttribute('data-state')==='online'",
+  );
+  if (projects.length > 0) {
+    const project = projects.find((p) => !p.repository);
+    if (!project) throw new Error("Project settings smoke needs the selected local checkout");
+    const selectedProject = async () =>
+      (await readyCoordinator())?.snapshot.projects.find((p) => p.id === project.id);
+    const fillProjectField = async (selector: string, value: string) => {
+      if (!window) throw new Error("Smoke window unavailable");
+      await window.webContents.executeJavaScript(`(() => {
+        const input=document.querySelector(${JSON.stringify(selector)});
+        if(!input)throw new Error('Project field unavailable');
+        const prototype=input.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+        input.focus();Object.getOwnPropertyDescriptor(prototype,'value').set.call(input,${JSON.stringify(value)});
+        input.dispatchEvent(new Event('input',{bubbles:true}));
+      })()`);
+    };
+    // Hidden smoke windows need an explicit focusout; native blur may not dispatch it.
+    const captureProject = async (name: string) => {
+      if (screenshotDirectory && window) {
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+        await writeFile(
+          join(screenshotDirectory, name),
+          (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+        );
+      }
+    };
+    await waitSettings(
+      "document.querySelector('[aria-label=\"Project name\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
+    );
+    await fillProjectField('[aria-label="Project name"]', "  Native project settings  ");
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=\"Project name\"]').dispatchEvent(new FocusEvent('focusout',{bubbles:true}))",
+    );
+    await waitSettings(
+      "document.querySelector('[aria-label=\"Project name\"]').value==='Native project settings' && !document.querySelector('[aria-label=\"Project name\"]').disabled",
+    );
+    if ((await selectedProject())?.name !== "Native project settings")
+      throw new Error("Project name must save on blur and trim whitespace");
+    await clickButton("Choose icon");
+    await waitSettings(
+      "document.querySelector('dialog[open] [aria-label=\"Search project icons\"]')",
+    );
+    await captureProject("project-icon-picker.png");
+    await clickButton("Monogram");
+    await fillProjectField('dialog[open] [aria-label="Monogram"]', "VS");
+    await clickButton("Use icon");
+    await waitSettings(
+      "!document.querySelector('dialog[open]') && document.querySelector('.project-overview .project-badge')?.textContent==='VS'",
+    );
+    if ((await selectedProject())?.icon?.kind !== "monogram")
+      throw new Error("Project icon must persist");
+    await clickButton("Reset project icon");
+    await waitSettings(
+      "!document.querySelector('[aria-label=\"Reset project icon\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
+    );
+    await window.webContents.executeJavaScript(`(async () => {
+      const canvas=document.createElement('canvas');canvas.width=48;canvas.height=48;
+      const context=canvas.getContext('2d');context.fillStyle='#3978d4';context.fillRect(0,0,48,48);
+      const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+      const transfer=new DataTransfer();transfer.items.add(new File([blob],'project.png',{type:'image/png'}));
+      const input=document.querySelector('.project-overview input[type="file"]');input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+    })()`);
+    await waitSettings(
+      "document.querySelector('.project-overview .project-badge img') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
+    );
+    if ((await selectedProject())?.icon?.kind !== "image")
+      throw new Error("Uploaded project icon must normalize and persist");
+    await clickButton("Reset project icon");
+    await waitSettings(
+      "!document.querySelector('[aria-label=\"Reset project icon\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
+    );
+    await clickButton("Add action");
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Add Action'");
+    await fillProjectField('dialog[open] input[placeholder="Test"]', "Native action");
+    await fillProjectField("dialog[open] textarea", "Write-Output 'native-action-ok'");
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=\"Action keybinding\"]').dispatchEvent(new KeyboardEvent('keydown',{key:'t',ctrlKey:true,altKey:true,bubbles:true}))",
+    );
+    await captureProject("project-action-editor.png");
+    await clickButton("Save action");
+    await waitSettings(
+      "!document.querySelector('dialog[open]') && document.querySelector('[aria-label=\"Run Native action\"]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
+    );
+    const selectedAction = (await selectedProject())?.actions?.[0];
+    if (
+      !selectedAction ||
+      selectedAction.shortcut !== "mod+alt+t" ||
+      projectActionRunner.latest(project.id, selectedAction.id)
+    )
+      throw new Error("Saving an action must persist its shortcut without running it");
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=\"Project name\"]').blur();window.dispatchEvent(new KeyboardEvent('keydown',{key:'t',ctrlKey:true,altKey:true,bubbles:true}))",
+    );
+    await waitSettings(
+      "document.querySelector('dialog[open] h2')?.textContent==='Native action' && document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='Ready to run'",
+    );
+    await clickButton("Run command");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='completed · Exit 0' && document.querySelector('[aria-label=\"Command output\"]')?.textContent.includes('native-action-ok')",
+    );
+    await captureProject("project-action-output.png");
+    await clickButton("Close dialog");
+    await waitSettings("!document.querySelector('dialog[open]')");
+    await clickButton("Run Native action");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='completed · Exit 0'",
+    );
+    await clickButton("Close dialog");
+    await waitSettings("!document.querySelector('dialog[open]')");
+    await clickButton("Edit Native action");
+    await fillProjectField("dialog[open] textarea", "Start-Sleep -Seconds 30");
+    await clickButton("Save changes");
+    await waitSettings(
+      "!document.querySelector('dialog[open]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
+    );
+    await clickButton("Run Native action");
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Native action'");
+    await clickButton("Run again");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='running'",
+    );
+    await clickButton("Stop command");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"status\"]')?.textContent.startsWith('stopped')",
+    );
+    await clickButton("Close dialog");
+    await waitSettings("!document.querySelector('dialog[open]')");
+    await clickButton("Run Native action");
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Native action'");
+    await clickButton("Run again");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='running'",
+    );
+    await clickButton("Close dialog");
+    await waitSettings("!document.querySelector('dialog[open]')");
+    await clickButton("Edit Native action");
+    await clickButton("Delete");
+    await waitSettings(
+      "document.querySelector('dialog[open] [role=\"alert\"]')?.textContent.includes('Delete this saved action')",
+    );
+    await clickButton("Confirm delete action");
+    await waitSettings(
+      "!document.querySelector('dialog[open]') && document.querySelector('.project-actions-empty')?.textContent==='No actions configured.'",
+    );
+    if ((await selectedProject())?.actions?.length !== 0)
+      throw new Error("Confirmed action deletion must persist");
+    if (projectActionRunner.latest(project.id, selectedAction.id)?.status !== "stopped")
+      throw new Error("Deleting an active action must stop its command");
+    await clickButton("Remove project");
+    await waitSettings(
+      "document.querySelector('dialog[open] h2')?.textContent==='Remove project?'",
+    );
+    await clickButton("Cancel");
+    await waitSettings("!document.querySelector('dialog[open]')");
+    if (!(await selectedProject())) throw new Error("Cancel must retain the selected project");
+    await fillProjectField('[aria-label="Project name"]', project.name);
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=\"Project name\"]').dispatchEvent(new FocusEvent('focusout',{bubbles:true}))",
+    );
+    await waitSettings(
+      `document.querySelector('[aria-label="Project name"]').value===${JSON.stringify(project.name)} && !document.querySelector('[aria-label="Project name"]').disabled`,
+    );
+    await window.webContents.executeJavaScript("document.querySelector('main').scrollTop=0");
+    await captureProject("settings-project.png");
+    window.setMinimumSize(320, 500);
+    window.setContentSize(390, 900);
+    await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+    await window.webContents.executeJavaScript("document.querySelector('main').scrollTop=0");
+    if (
+      !(await window.webContents.executeJavaScript(
+        "document.documentElement.scrollWidth<=innerWidth",
+      ))
+    )
+      throw new Error("Project settings escape the narrow window");
+    await captureProject("settings-project-narrow.png");
+    window.setContentSize(1280, 800);
+  }
+  if (screenshotDirectory) await setAppearanceMode("light", "settings/appearance");
+  await window.loadURL("versionstead://app/settings/appearance");
+  await waitSettings("document.querySelector('[aria-label=\"Compact rows\"]')");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Compact rows"]').click()`,
+  );
+  await waitSettings("document.documentElement.dataset.density==='compact'");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Compact rows"]').click();document.querySelector('[aria-label="Dark theme"]').click()`,
+  );
+  await waitSettings(
+    "document.querySelectorAll('[aria-label=\"Dark theme\"]').length===1 && document.querySelector('[aria-label=\"Dark theme\"]').getAttribute('aria-pressed')==='true' && !document.querySelector('.sidebar-footer .theme-control')",
+  );
+  await window.webContents.executeJavaScript(`
+    document.querySelector('[aria-label="Use Grove light mode"]').click();
+    document.querySelector('[aria-label="Use T3 Chat dark mode"]').click();
+  `);
+  await waitSettings(
+    `JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='grove' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='t3-chat'`,
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    for (const [label, value] of [['Contrast',150],['Glass opacity',50],['Panel animation duration',250]]) {
+      const input=document.querySelector('input[aria-label="'+label+'"]');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,String(value));
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+      input.dispatchEvent(new Event('change',{bubbles:true}));
+    }
+  })()`);
+  await waitSettings(
+    `document.documentElement.style.getPropertyValue('--glass-opacity')==='50%' && document.documentElement.style.getPropertyValue('--panel-duration')==='250ms' && document.documentElement.style.getPropertyValue('--foreground').includes('white 50%')`,
+  );
+  await selectOption("Interface font", "Segoe UI");
+  await selectOption("Interface font size", "18 px");
+  await selectOption("Monospace font", "Consolas");
+  await selectOption("Monospace font size", "16 px");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Word wrap"]').click();document.querySelector('[aria-label="Advanced typography"]').click()`,
+  );
+  await waitSettings(
+    `document.documentElement.dataset.wordWrap==='false' && document.querySelector('[aria-label="Package table font size"]')`,
+  );
+  await selectOption("Package table font size", "16 px");
+  await selectOption("Evidence panel font size", "18 px");
+  await waitSettings(
+    `document.documentElement.style.fontSize==='18px' && document.documentElement.style.getPropertyValue('--interface-font').includes('Segoe UI') && document.documentElement.style.getPropertyValue('--monospace-font').includes('Consolas') && document.documentElement.style.getPropertyValue('--table-font-size')==='16px' && JSON.parse(localStorage.getItem('versionstead.appearance')).monospaceFontSize===16 && JSON.parse(localStorage.getItem('versionstead.appearance')).evidenceFontSize===18`,
+  );
+  await clickButton("Create theme");
+  await waitSettings(`document.querySelector('dialog[open] [aria-label="Theme name"]')`);
+  await window.webContents.executeJavaScript(`(() => {
+    const input=document.querySelector('[aria-label="Theme name"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'Native smoke theme');
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  })()`);
+  await clickButton("Save theme");
+  await waitSettings(
+    `!document.querySelector('dialog[open]') && [...document.querySelectorAll('.theme-card-name')].some(button=>button.textContent==='Native smoke theme') && JSON.parse(localStorage.getItem('versionstead.theme-halves')).light===JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark`,
+  );
+  await window.loadURL("versionstead://app/settings/appearance");
+  await waitSettings(
+    `document.documentElement.style.getPropertyValue('--glass-opacity')==='50%' && [...document.querySelectorAll('.theme-card-name')].some(button=>button.textContent==='Native smoke theme') && document.querySelector('[aria-label="Package table font size"]')`,
+  );
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Remove Native smoke theme"]').click()`,
+  );
+  await waitSettings(`document.querySelector('dialog[open]')`);
+  await clickButton("Remove theme");
+  await waitSettings(
+    `!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='default' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='default'`,
+  );
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Reset contrast"]').click();document.querySelector('[aria-label="Reset glass opacity"]').click();document.querySelector('[aria-label="Reset panel animations"]').click()`,
+  );
+  await clickButton("Reset typography");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Advanced typography"]').click();document.querySelector('[aria-label="Word wrap"]').click()`,
+  );
+  await waitSettings(
+    `document.documentElement.style.fontSize==='16px' && document.documentElement.style.getPropertyValue('--glass-opacity')==='80%' && document.documentElement.dataset.wordWrap==='true'`,
+  );
+  if (screenshotDirectory) {
+    window.setContentSize(1440, 900);
+    await window.webContents.executeJavaScript(
+      `document.querySelector('.content').scrollTop=0;new Promise(resolve=>setTimeout(resolve,150))`,
+    );
+    await writeFile(
+      join(screenshotDirectory, "appearance-dark.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+    await window.webContents.executeJavaScript(
+      `document.querySelector('.typography-font-group').scrollIntoView();new Promise(resolve=>setTimeout(resolve,150))`,
+    );
+    await writeFile(
+      join(screenshotDirectory, "appearance-typography.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+    window.setMinimumSize(320, 500);
+    window.setContentSize(390, 900);
+    await window.webContents.executeJavaScript(
+      `document.querySelector('.content').scrollTop=0;new Promise(resolve=>setTimeout(resolve,150))`,
+    );
+    const contained: unknown = await window.webContents.executeJavaScript(
+      "document.documentElement.scrollWidth<=innerWidth",
+    );
+    if (contained !== true) throw new Error("Appearance page escapes a narrow window");
+    await writeFile(
+      join(screenshotDirectory, "appearance-narrow.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+    window.setContentSize(1440, 900);
+  }
+  await window.loadURL("versionstead://app/settings/keybindings");
+  await waitSettings(
+    "document.querySelector('[aria-label=\"Change shortcut for Open settings\"]')",
+  );
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Change shortcut for Open settings"]').click()`,
+  );
+  await waitSettings("document.querySelector('dialog[open] input')");
+  window.focus();
+  window.webContents.focus();
+  window.webContents.sendInputEvent({
+    type: "keyDown",
+    keyCode: "S",
+    modifiers: ["control", "shift"],
+  });
+  window.webContents.sendInputEvent({
+    type: "keyUp",
+    keyCode: "S",
+    modifiers: ["control", "shift"],
+  });
+  await waitSettings(
+    "document.querySelector('dialog [role=\"alert\"]')?.textContent.includes('Already used')",
+  );
+  window.webContents.sendInputEvent({
+    type: "keyDown",
+    keyCode: "K",
+    modifiers: ["control", "alt"],
+  });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "K", modifiers: ["control", "alt"] });
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+alt+k'",
+  );
+  await clickButton("Reset all shortcuts");
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: ",", modifiers: ["control"] });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: ",", modifiers: ["control"] });
+  await waitSettings(
+    "location.pathname==='/settings/general' && document.querySelector('[aria-label=\"Scheduled scans\"]')",
+  );
+  const scheduled = (await readyCoordinator())?.snapshot.settings.paused;
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Scheduled scans"]').click()`,
+  );
+  await waitSettings(
+    `document.querySelector('[aria-label="Scheduled scans"]').getAttribute('aria-checked') === ${JSON.stringify(String(scheduled))}`,
+  );
+  if ((await readyCoordinator())?.snapshot.settings.paused === scheduled)
+    throw new Error("Native monitoring switch did not persist");
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label="Scheduled scans"]').click();document.querySelector('[aria-label="Versionstead updates"]').click()`,
+  );
+  await waitSettings(
+    "document.querySelector('[role=\"dialog\"]')?.textContent.includes('Versionstead updates') && document.querySelector('[role=\"dialog\"]')?.textContent.includes('Check for updates')",
+  );
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+  await waitSettings("!document.querySelector('[role=\"dialog\"]')");
   console.log(
     JSON.stringify({
       ...(result as Record<string, unknown>),
@@ -676,6 +1414,15 @@ async function runSmoke() {
       nativeThemeSpacing: true,
       nativeGroupedProjects,
       nativeEvidenceSheet,
+      nativeSettings: true,
+      nativeSourceControl: true,
+      nativeProjectSources: true,
+      nativeAppearanceSync: true,
+      nativeConnectionsFlow: true,
+      nativeProjectSettings: true,
+      nativeProjectActions: true,
+      nativeKeybindings: true,
+      nativeUpdatePanel: true,
     }),
   );
   app.quit();
@@ -703,7 +1450,17 @@ if (!app.requestSingleInstanceLock()) {
     void showWindow().catch(fail);
   });
   app.on("window-all-closed", () => {});
-  app.on("before-quit", () => {
+  app.on("before-quit", (event) => {
+    if (projectActionRunner.active || globalToolUpdateRunner.active) {
+      event.preventDefault();
+      if (!closingActions) {
+        closingActions = true;
+        void Promise.all([projectActionRunner.close(), globalToolUpdateRunner.close()])
+          .then(() => app.quit())
+          .catch(fail);
+      }
+      return;
+    }
     quitting = true;
     if (notificationTimer) clearInterval(notificationTimer);
     tray?.destroy();
@@ -735,6 +1492,91 @@ if (!app.requestSingleInstanceLock()) {
           throw new Error("Select an existing directory");
         return realpath(path);
       });
+      const assertActionSender = (event: Electron.IpcMainInvokeEvent) => {
+        if (
+          !window ||
+          event.sender !== window.webContents ||
+          event.senderFrame !== window.webContents.mainFrame ||
+          !trustedLocation(event.senderFrame.url)
+        )
+          throw new Error("Unauthorized project action request");
+      };
+      for (const operation of ["start", "command"] as const)
+        ipcMain.handle(
+          `versionstead:global-tool-update-${operation}`,
+          async (event, input: unknown) => {
+            assertActionSender(event);
+            const request = decodeGlobalToolUpdateRequest(input);
+            const connected = await readyCoordinator();
+            const inventory = connected?.snapshot.inventory;
+            const item = inventory?.installations.find(
+              (candidate) => candidate.id === request.installationId,
+            );
+            if (
+              !connected ||
+              !item ||
+              item.version !== request.expectedVersion ||
+              item.availableVersion !== request.targetVersion ||
+              item.updateStatus !== "available"
+            )
+              throw new Error("This update changed. Scan this PC and review the current version.");
+            if (
+              inventory?.evidence.status === "scanning" ||
+              connected.snapshot.scanProgress?.active?.kind === "pc" ||
+              connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
+            )
+              throw new Error("Wait for the PC scan to finish before updating.");
+            if (
+              inventory?.evidence.status === "failed" ||
+              inventory?.updateEvidence?.status === "failed"
+            )
+              throw new Error("Scan this PC successfully before updating a previous result.");
+            return operation === "command"
+              ? (await globalToolUpdateDependencies.resolve(item)).command
+              : decodeGlobalToolUpdateRun(globalToolUpdateRunner.start(item));
+          },
+        );
+      ipcMain.handle("versionstead:global-tool-update-status", (event) => {
+        assertActionSender(event);
+        return decodeGlobalToolUpdateRuns(globalToolUpdateRunner.read());
+      });
+      ipcMain.handle("versionstead:run-project-action", async (event, input: unknown) => {
+        assertActionSender(event);
+        let request;
+        try {
+          request = decodeRunActionRequest(input);
+        } catch {
+          throw new Error("Invalid project action request.");
+        }
+        const { projectId, actionId, expectedCommand } = request;
+        const connected = await readyCoordinator();
+        const project = connected?.snapshot.projects.find((p) => p.id === projectId);
+        if (!project) throw new Error("This selected project is unavailable. Refresh and retry.");
+        if (project.actions?.find((a) => a.id === actionId)?.command !== expectedCommand)
+          throw new Error("This command changed. Refresh and review it before running.");
+        return decodeActionRun(await projectActionRunner.start(project, actionId));
+      });
+      for (const operation of ["status", "stop"] as const)
+        ipcMain.handle(`versionstead:project-action-${operation}`, async (event, id: unknown) => {
+          assertActionSender(event);
+          if (operation === "status" && typeof id === "object" && id !== null) {
+            let request;
+            try {
+              request = decodeActionRequest(id);
+            } catch {
+              throw new Error("Invalid project action status request.");
+            }
+            const latest = projectActionRunner.latest(request.projectId, request.actionId);
+            return latest ? decodeActionRun(latest) : null;
+          }
+          if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id))
+            throw new Error("Invalid command identifier.");
+          return decodeActionRun(
+            operation === "stop"
+              ? await projectActionRunner.stop(id)
+              : projectActionRunner.read(id),
+          );
+        });
       runtime = (await ensureCoordinator()).runtime;
       if (smoke) console.log("Desktop smoke: coordinator ready");
       protocol.handle("versionstead", async (request) => {
@@ -749,6 +1591,11 @@ if (!app.requestSingleInstanceLock()) {
           return new Response("Forbidden", { status: 403 });
         if (!runtime) runtime = (await readyCoordinator())?.runtime ?? null;
         if (!runtime) return new Response("Coordinator disconnected", { status: 503 });
+        const removingProject =
+          request.method === "DELETE"
+            ? /^\/api\/projects\/([a-zA-Z0-9-]{1,100})$/.exec(url.pathname)?.[1]
+            : undefined;
+        if (removingProject) await projectActionRunner.stopProject(removingProject);
         const body =
           request.method === "GET" || request.method === "HEAD"
             ? undefined
@@ -756,7 +1603,7 @@ if (!app.requestSingleInstanceLock()) {
         if (body && body.byteLength > 64 * 1024)
           return new Response("Request too large", { status: 413 });
         try {
-          return await net.fetch(`${runtime.origin}${url.pathname}${url.search}`, {
+          const response = await net.fetch(`${runtime.origin}${url.pathname}${url.search}`, {
             method: request.method,
             headers: {
               Authorization: `Bearer ${runtime.token}`,
@@ -765,6 +1612,14 @@ if (!app.requestSingleInstanceLock()) {
             ...(body ? { body } : {}),
             signal: AbortSignal.timeout(15_000),
           });
+          if (
+            response.ok &&
+            request.method === "PATCH" &&
+            /^\/api\/projects\/[a-zA-Z0-9-]{1,100}$/.test(url.pathname)
+          ) {
+            await updateTray();
+          }
+          return response;
         } catch {
           runtime = null;
           return new Response("Coordinator disconnected", { status: 503 });

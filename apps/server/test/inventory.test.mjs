@@ -376,9 +376,19 @@ test("owner source boundary validates both managers, local roots, versions and b
 });
 
 test("manager discovery reports independent not-installed results without constrained executables", async () => {
-  const path = process.env.PATH;
+  const names = [
+    "PATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "BUN_INSTALL",
+    "VOLTA_HOME",
+    "PNPM_HOME",
+    "ProgramFiles",
+  ];
+  const original = new Map(names.map((name) => [name, process.env[name]]));
   try {
-    process.env.PATH = "";
+    for (const name of names) delete process.env[name];
     const sources = await discoverGlobalToolSources();
     assert.deepEqual(
       sources.map(({ manager, status, root, version }) => ({ manager, status, root, version })),
@@ -390,7 +400,9 @@ test("manager discovery reports independent not-installed results without constr
       })),
     );
   } finally {
-    if (path === undefined) delete process.env.PATH;
-    else process.env.PATH = path;
+    for (const [name, value] of original) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });

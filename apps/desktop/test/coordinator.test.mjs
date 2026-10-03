@@ -24,7 +24,7 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
   const desktop = await import("../dist/coordinator.js");
   let fixture;
 
-  async function legacy(mode, host, withProgress = false, withCollector = false) {
+  async function legacy(mode, host, withProgress = false, withCollector = false, features) {
     const release = acquireCoordinatorLock(dataDir);
     const core = new MonitoringCoordinator({ dataDir, mode, host, lookup: false });
     core.changeSettings({
@@ -43,6 +43,8 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
       }
       delete value.inventory.updateEvidence;
       delete value.notificationSummary;
+      if (features) value.features = features;
+      else delete value.features;
       return value;
     };
     let closing;
@@ -176,6 +178,30 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
     await fixture.close();
     fixture = undefined;
     await stopDetached();
+
+    for (const features of [
+      "settings-repositories-connections-v1",
+      "settings-repositories-connections-v2",
+      "settings-repositories-connections-v3",
+      "settings-repositories-connections-v4",
+      "settings-repositories-connections-v5",
+    ]) {
+      fixture = await legacy("interactive", "session", true, true, features);
+      assert.equal((await desktop.readyCoordinator()).snapshot.features, features);
+      const refreshedBuild = await desktop.ensureCoordinator();
+      assert.notEqual(
+        refreshedBuild.runtime.pid,
+        fixture.runtime.pid,
+        "Previous settings builds must load the current connections flow",
+      );
+      assert.equal(refreshedBuild.snapshot.features, "settings-repositories-connections-v6");
+      assert.deepEqual(refreshedBuild.snapshot.projects, before.projects);
+      assert.deepEqual(refreshedBuild.snapshot.settings, before.settings);
+      assert.equal(fixture.shutdowns(), 1);
+      await fixture.close();
+      fixture = undefined;
+      await stopDetached();
+    }
 
     for (const [mode, host] of [
       ["background", "boot-task"],

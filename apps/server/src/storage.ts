@@ -53,6 +53,22 @@ export class MonitoringStorage {
     return { snapshot, due: due as Record<string, number>, notified: notified as string[] };
   }
 
+  readApplication(): unknown {
+    this.database.exec(
+      "CREATE TABLE IF NOT EXISTS application_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)",
+    );
+    const row = this.database.prepare("SELECT value FROM application_state WHERE id=1").get();
+    return row ? JSON.parse(String(row.value)) : null;
+  }
+
+  writeApplication(value: unknown) {
+    this.database
+      .prepare(
+        "INSERT INTO application_state(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+      )
+      .run(JSON.stringify(value));
+  }
+
   write(state: StoredMonitoring) {
     // ponytail: one bounded personal-scale snapshot is written atomically; split tables when writes or size measurably exceed this ceiling.
     this.database

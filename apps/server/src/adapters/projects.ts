@@ -4,6 +4,8 @@ import { open, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { parseDocument } from "yaml";
 import semver from "semver";
+import { parseTree, getNodeValue, type ParseError } from "jsonc-parser";
+import { decodeBunConfiguration } from "./bun-config.ts";
 import type { Dependency, Project } from "@versionstead/contracts/monitoring";
 
 export const identity = (...parts: string[]) =>
@@ -194,6 +196,8 @@ function dependency(
 }
 
 export type ProjectInputs = {
+  repositoryCommit?: string;
+  git?: Project["git"];
   packageManager: Project["packageManager"];
   manifestPath: string;
   lockfilePath: string;
@@ -211,8 +215,10 @@ function parseJson(text: string) {
   }
 }
 
+export type ProjectReader = (name: string, limit?: number) => Promise<string | null>;
+
 async function npmInputs(
-  root: string,
+  read: ProjectReader,
   manifest: Record<string, unknown>,
   text: string,
 ): Promise<ProjectInputs> {
@@ -231,7 +237,7 @@ async function npmInputs(
     object(value);
     if (importers.size >= 100)
       throw new InputError("The project exceeds 100 workspace importers.", "unsupported");
-    const input = await readSelectedFile(root, `${path}/package.json`, 1024 * 1024);
+    const input = await read(`${path}/package.json`, 1024 * 1024);
     if (input === null) errors.push("A workspace importer has no readable package.json.");
     else importers.set(path, declarations(parseJson(input), path));
   }
@@ -335,7 +341,7 @@ function pnpmIdentity(key: string) {
   return { name: match[1], version: match[2], reference: key.slice(match[1].length + 1) };
 }
 
-async function pnpmInputs(root: string, text: string): Promise<ProjectInputs> {
+async function pnpmInputs(read: ProjectReader, text: string): Promise<ProjectInputs> {
   const lock = parseYaml(text);
   if (String(lock.lockfileVersion) !== "9.0" && lock.lockfileVersion !== 9) {
     throw new InputError("Only pnpm lockfile version 9 is supported.", "unsupported");
@@ -357,7 +363,7 @@ async function pnpmInputs(root: string, text: string): Promise<ProjectInputs> {
   const direct = new Set<string>();
   for (const [importer, value] of Object.entries(importers)) {
     const importerPath = importer === "." ? "package.json" : `${importer}/package.json`;
-    const manifest = await readSelectedFile(root, importerPath, 1024 * 1024);
+    const manifest = await read(importerPath, 1024 * 1024);
     if (manifest === null) errors.push("A workspace importer has no readable package.json.");
     const declared = manifest === null ? [] : declarations(parseJson(manifest), importer);
     const importerEntry = object(value);
@@ -449,32 +455,254 @@ async function pnpmInputs(root: string, text: string): Promise<ProjectInputs> {
   };
 }
 
+async function bunInputs(
+  read: ProjectReader,
+  manifest: Record<string, unknown>,
+  text: string,
+): Promise<ProjectInputs> {
+  let lock: Record<string, unknown>;
+  try {
+    const errors: ParseError[] = [];
+    const tree = parseTree(text, errors, { allowTrailingComma: true });
+    if (!tree || errors.length) throw new Error();
+    // getNodeValue uses null-prototype objects; repository keys cannot set prototypes.
+    lock = object(getNodeValue(tree));
+  } catch {
+    throw new InputError("The Bun text lockfile is malformed.");
+  }
+  if (lock.lockfileVersion !== 0 && lock.lockfileVersion !== 1)
+    throw new InputError("Only Bun text lockfile versions 0 and 1 are supported.", "unsupported");
+  const workspaces = object(lock.workspaces);
+  const packages = object(lock.packages);
+  const workspaceEntries = Object.entries(workspaces);
+  if (workspaceEntries.length > 100 || Object.keys(packages).length > 10000)
+    throw new InputError("The lockfile exceeds 100 importers or 10,000 packages.", "unsupported");
+  if (!Object.hasOwn(workspaces, ""))
+    throw new InputError("The Bun lockfile has no root workspace.");
+  // Check all workspace paths before asking either the filesystem or provider to read them.
+  for (const [path] of workspaceEntries)
+    if (
+      path &&
+      (isAbsolute(path) ||
+        path.includes("\\") ||
+        path.split("/").some((p) => !p || p === "." || p === ".."))
+    )
+      throw new InputError("A Bun workspace path escapes the selected project.");
+
+  const resolved = new Map<
+    string,
+    { name: string; version: string; registry: string | null; alias: string }
+  >();
+  for (const [location, raw] of Object.entries(packages)) {
+    const parts = location.split("/");
+    const names: string[] = [];
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index]!;
+      const name = part.startsWith("@") ? `${part}/${parts[++index] ?? ""}` : part;
+      if (!packageName(name) || name === "." || name === "..")
+        throw new InputError("A Bun package location is malformed.");
+      names.push(name);
+    }
+    if (!Array.isArray(raw) || !raw.length || raw.length > 4)
+      throw new InputError("A Bun package resolution is malformed.");
+    const resolution = string(raw[0])?.match(/^((?:@[^/]+\/)?[^@]+)@(.+)$/);
+    if (!resolution || !packageName(resolution[1]!))
+      throw new InputError("A Bun resolved package identity is malformed.");
+    const version = resolution[2]!;
+    const registry = semver.valid(version) ? string(raw[1]) : null;
+    if (semver.valid(version)) {
+      if (raw.length !== 4 || registry === null || string(raw[3]) === null)
+        throw new InputError("A Bun registry resolution is malformed.");
+      object(raw[2]);
+    } else if (raw.length > 1) object(raw[1]);
+    resolved.set(location, {
+      name: resolution[1]!,
+      version,
+      registry: registry || null,
+      alias: names.at(-1)!,
+    });
+  }
+  const workspaceConfig =
+    manifest.workspaces && !Array.isArray(manifest.workspaces) ? object(manifest.workspaces) : {};
+  const currentCatalogs = {
+    catalog: manifest.catalog ?? workspaceConfig.catalog,
+    catalogs: manifest.catalogs ?? workspaceConfig.catalogs,
+  };
+  const catalogRange = (source: Record<string, unknown>, requested: string, name: string) => {
+    const group = requested.slice("catalog:".length).trim();
+    const catalogs = object(source.catalogs ?? {});
+    const selected =
+      !group || group === "default" ? (source.catalog ?? catalogs.default) : catalogs[group];
+    return selected === undefined ? null : string(object(selected)[name]);
+  };
+  const dependencies: Dependency[] = [];
+  const errors: string[] = [];
+  const direct = new Set<string>();
+  const add = (record: Dependency) => {
+    if (dependencies.length >= 10000)
+      throw new InputError("The project exceeds 10,000 dependency records.", "unsupported");
+    dependencies.push(record);
+  };
+  for (const [path, value] of workspaceEntries) {
+    const importer = path || ".";
+    const metadata = object(value);
+    const workspaceName = string(metadata.name);
+    if (path && (!workspaceName || !packageName(workspaceName)))
+      throw new InputError("A Bun workspace identity is malformed.");
+    const input = path ? await read(`${path}/package.json`, 1024 * 1024) : null;
+    if (path && input === null) errors.push("A workspace importer has no readable package.json.");
+    const actual = path ? (input === null ? null : parseJson(input)) : manifest;
+    const locked = declarations(metadata, importer);
+    const declared = actual ? declarations(actual, importer) : locked;
+    if (
+      actual &&
+      (declared.length !== locked.length ||
+        declared.some((d) => locked.find((l) => l.name === d.name)?.requested !== d.requested))
+    )
+      errors.push("A manifest dependency differs from the Bun workspace declaration.");
+    for (const declaration of declared) {
+      const location =
+        path && resolved.has(`${workspaceName}/${declaration.name}`)
+          ? `${workspaceName}/${declaration.name}`
+          : declaration.name;
+      const entry = resolved.get(location);
+      if (!entry) errors.push("A requested dependency is missing from the Bun lockfile.");
+      const catalog = declaration.requested.startsWith("catalog:");
+      const effective = catalog
+        ? catalogRange(currentCatalogs, declaration.requested, declaration.name)
+        : declaration.requested;
+      if (
+        catalog &&
+        (!effective || effective !== catalogRange(lock, declaration.requested, declaration.name))
+      )
+        errors.push(
+          "A Bun catalog dependency is missing or differs from the root manifest catalog.",
+        );
+      const expected = alias(effective, declaration.name);
+      if (entry && expected.packageName !== entry.name)
+        errors.push("A Bun alias target differs between manifest and lockfile.");
+      if (
+        entry &&
+        expected.range &&
+        semver.validRange(expected.range) &&
+        semver.valid(entry.version) &&
+        !semver.satisfies(entry.version, expected.range)
+      )
+        errors.push("A resolved Bun version does not satisfy the current manifest range.");
+      const record = dependency(
+        `bun:${importer}/${location}`,
+        declaration.name,
+        entry?.version ?? null,
+        entry?.registry ?? null,
+        { ...declaration, requested: effective ?? declaration.requested },
+        entry?.name ?? expected.packageName,
+        entry?.version.startsWith("workspace:") ?? false,
+      );
+      add({
+        ...record,
+        requested: declaration.requested,
+        ...(catalog
+          ? {
+              requestedRange:
+                expected.range && semver.validRange(expected.range) ? expected.range : null,
+            }
+          : {}),
+      });
+      if (entry) direct.add(location);
+    }
+  }
+  for (const [location, entry] of resolved)
+    if (!direct.has(location))
+      add(
+        dependency(
+          `bun:${location}`,
+          entry.alias,
+          entry.version,
+          entry.registry,
+          undefined,
+          entry.name,
+          entry.version.startsWith("workspace:"),
+        ),
+      );
+
+  const bunfig = await read("bunfig.toml", 100 * 1024);
+  if (bunfig !== null) {
+    let configuration;
+    try {
+      configuration = decodeBunConfiguration(bunfig);
+    } catch {
+      throw new InputError("Bun project registry configuration cannot be read safely.");
+    }
+    const privateRegistry = configuration.registry !== null && configuration.registry !== "public";
+    const blocked = new Set(configuration.blockedScopes);
+    for (let index = 0; index < dependencies.length; index++) {
+      const dep = dependencies[index]!;
+      if (
+        dep.origin === "registry" &&
+        (privateRegistry || blocked.has(dep.packageName.split("/")[0]!))
+      )
+        dependencies[index] = {
+          ...dep,
+          origin: "unknown",
+          advisoryStatus: "unsupported",
+          versionStatus: "unsupported",
+        };
+    }
+  }
+  return {
+    packageManager: "bun",
+    manifestPath: "package.json",
+    lockfilePath: "bun.lock",
+    dependencies,
+    errors,
+    // Configuration content stays out of persisted evidence; its digest affects freshness.
+    inputFingerprint: createHash("sha256")
+      .update(bunfig ?? "")
+      .digest("hex"),
+    coverage: [
+      `Bun text lockfile v${lock.lockfileVersion}: workspace, catalog, and resolved package evidence`,
+      `${workspaceEntries.length} selected workspace importer(s)`,
+      "Lockfile evidence only; node_modules is not inspected",
+      "Bun registry classification uses lockfile resolutions and selected-root bunfig.toml; user/global/environment configuration is not inspected",
+    ],
+  };
+}
+
 export async function inspectProject(root: string): Promise<ProjectInputs> {
   const canonical = await selectDirectory(root);
   if (canonical !== root)
     throw new InputError("The selected directory identity changed; select it again.");
-  const manifestText = await readSelectedFile(root, "package.json", 1024 * 1024);
+  return inspectProjectFiles((name, limit) => readSelectedFile(root, name, limit));
+}
+
+export async function inspectProjectFiles(read: ProjectReader): Promise<ProjectInputs> {
+  const manifestText = await read("package.json", 1024 * 1024);
   if (manifestText === null)
     throw new InputError(
       "No package.json was found. Other ecosystems are not supported yet.",
       "unsupported",
     );
   const manifest = parseJson(manifestText);
-  const npm = await readSelectedFile(root, "package-lock.json");
-  const pnpm = await readSelectedFile(root, "pnpm-lock.yaml");
-  if (npm !== null && pnpm !== null)
+  const npm = await read("package-lock.json");
+  const pnpm = await read("pnpm-lock.yaml");
+  const bun = await read("bun.lock");
+  if ([npm, pnpm, bun].filter((text) => text !== null).length > 1)
     throw new InputError(
-      "Both npm and pnpm lockfiles exist; select one package manager.",
+      "Multiple package-manager lockfiles exist; select one package manager.",
       "unsupported",
     );
-  if (npm === null && pnpm === null)
+  if (npm === null && pnpm === null && bun === null)
     throw new InputError(
-      "No supported lockfile was found. A manifest alone cannot establish resolved dependencies.",
+      "No supported lockfile (package-lock.json, pnpm-lock.yaml, or bun.lock) was found. Binary bun.lockb is not supported. A manifest alone cannot establish resolved dependencies.",
       "unsupported",
     );
   const inputs =
-    npm !== null ? await npmInputs(root, manifest, npm) : await pnpmInputs(root, pnpm!);
-  const npmrc = await readSelectedFile(root, ".npmrc", 100 * 1024);
+    npm !== null
+      ? await npmInputs(read, manifest, npm)
+      : pnpm !== null
+        ? await pnpmInputs(read, pnpm)
+        : await bunInputs(read, manifest, bun!);
+  const npmrc = await read(".npmrc", 100 * 1024);
   const blockedScopes = new Set<string>();
   let privateRegistry = false;
   if (npmrc) {
@@ -500,12 +728,22 @@ export async function inspectProject(root: string): Promise<ProjectInputs> {
     }
     return dep;
   });
+  const internal = inputs.dependencies.filter(
+    (d) => d.origin === "workspace" || d.origin === "local",
+  );
+  if (internal.length)
+    inputs.coverage.push(
+      `${internal.length} internal workspace/local dependency records: public-registry updates and OSV npm queries are not applicable`,
+    );
   const excluded = inputs.dependencies.filter(
-    (d) => d.origin !== "registry" || !d.resolved || !semver.valid(d.resolved),
+    (d) =>
+      d.origin !== "workspace" &&
+      d.origin !== "local" &&
+      (d.origin !== "registry" || !d.resolved || !semver.valid(d.resolved)),
   );
   if (excluded.length)
     inputs.errors.push(
-      `${excluded.length} workspace, local, Git, private, or unresolved dependencies cannot use public-registry checks.`,
+      `${excluded.length} Git, private, unknown, or unresolved dependencies cannot use public-registry checks.`,
     );
   inputs.errors = [...new Set(inputs.errors)];
   inputs.coverage.push(
@@ -515,8 +753,9 @@ export async function inspectProject(root: string): Promise<ProjectInputs> {
     .update(
       JSON.stringify([
         manifestText,
-        npm ?? pnpm,
+        npm ?? pnpm ?? bun,
         npmrc,
+        inputs.inputFingerprint,
         inputs.dependencies.map((dep) => [
           dep.id,
           dep.name,
@@ -534,4 +773,7 @@ export async function inspectProject(root: string): Promise<ProjectInputs> {
 }
 
 export const projectLabel = (path: string) => basename(path) || "Selected project";
-export const requestedRange = (dep: Dependency) => alias(dep.requested, dep.packageName).range;
+export const requestedRange = (dep: Dependency) =>
+  dep.requestedRange !== undefined
+    ? dep.requestedRange
+    : alias(dep.requested, dep.packageName).range;

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
+import { validateProjectChanges } from "@versionstead/contracts/project-settings";
 import {
   type ActiveScan,
   type Finding,
@@ -19,8 +20,10 @@ import {
   inspectProject,
   projectLabel,
   selectDirectory,
+  type ProjectInputs,
 } from "./adapters/projects.ts";
 import { inspectInventory, validateGlobalToolSources } from "./adapters/inventory.ts";
+import { checkNativeVersions } from "./adapters/outdated.ts";
 import {
   lookupDependencies,
   type DependencyLookup,
@@ -50,9 +53,13 @@ export type MonitoringOptions = {
   lookup?: boolean;
   dependencyLookup?: DependencyLookup;
   inventoryLookup?: typeof inspectInventory;
+  nativeVersionLookup?: typeof checkNativeVersions | false;
 };
 
 export class MonitoringCoordinator {
+  private projectInspection = (project: Project, _signal?: AbortSignal) =>
+    inspectProject(project.path);
+  private automaticProjectAllowed = (_project: Project) => true;
   private readonly storage: MonitoringStorage;
   private state: Mutable<MonitoringSnapshot>;
   private due: Record<string, number>;
@@ -77,12 +84,32 @@ export class MonitoringCoordinator {
     this.storage = new MonitoringStorage(options.dataDir);
     const stored = this.storage.read();
     const platform = options.platform ?? process.platform;
+    const nativeVersionLookup =
+      options.nativeVersionLookup === false
+        ? null
+        : (options.nativeVersionLookup ?? checkNativeVersions);
     this.lookup =
       options.lookup === false
         ? null
         : (options.dependencyLookup ??
-          ((dependencies, signal, onProgress) =>
-            lookupDependencies(dependencies, fetch, signal, onProgress)));
+          ((dependencies, signal, onProgress, localProject) =>
+            lookupDependencies(
+              dependencies,
+              fetch,
+              signal,
+              onProgress,
+              localProject && nativeVersionLookup
+                ? () =>
+                    nativeVersionLookup(
+                      localProject.root,
+                      localProject.packageManager,
+                      dependencies,
+                      signal,
+                      (completed, total) =>
+                        onProgress?.({ stage: "native-versions", completed, total }),
+                    )
+                : undefined,
+            )));
     this.inventoryLookup = options.inventoryLookup ?? inspectInventory;
     this.state = stored
       ? (structuredClone(stored.snapshot) as Mutable<MonitoringSnapshot>)
@@ -182,6 +209,7 @@ export class MonitoringCoordinator {
     this.updateNextDue();
     return structuredClone({
       ...this.state,
+      features: "settings-repositories-connections-v6" as const,
       scanProgress: {
         active: this.progress,
         queued: [...this.queue.keys()].flatMap<ScanTarget>((id) => {
@@ -201,6 +229,59 @@ export class MonitoringCoordinator {
       },
       notificationSummary: this.prepareNotificationSummary(),
     });
+  }
+
+  configureProjectInspection(
+    inspect: (project: Project, signal?: AbortSignal) => Promise<ProjectInputs>,
+    automatic: (project: Project) => boolean,
+  ) {
+    this.projectInspection = inspect;
+    this.automaticProjectAllowed = automatic;
+  }
+
+  readApplication(): unknown {
+    return this.storage.readApplication();
+  }
+  writeApplication(value: unknown) {
+    this.storage.writeApplication(value);
+  }
+
+  addRepository(
+    repository: NonNullable<Project["repository"]>,
+    mode: "maintained" | "watch",
+    automatic: boolean,
+  ): Project {
+    this.assertOpen();
+    const existing = this.state.projects.find(
+      (p) =>
+        p.repository?.provider === repository.provider &&
+        p.repository.repositoryId === repository.repositoryId &&
+        p.repository.ref === repository.ref,
+    );
+    if (existing) return structuredClone(existing);
+    if (this.state.projects.length >= 50)
+      throw new InputError("A maximum of 50 selected projects is supported.");
+    const project: Mutable<Project> = {
+      id: randomUUID(),
+      name: repository.name,
+      path: repository.url,
+      mode,
+      packageManager: "unknown",
+      manifestPath: null,
+      lockfilePath: null,
+      evidence: emptyEvidence(),
+      dependencies: [],
+      createdAt: timestamp(),
+      repository: { ...repository },
+    };
+    this.state.projects.push(project);
+    this.due[project.id] = Date.now();
+    this.persist();
+    if (automatic) {
+      this.enqueue(project.id, false);
+      this.runQueue();
+    }
+    return structuredClone(project);
   }
 
   async addProject(input: { path: string; mode: "maintained" | "watch" }): Promise<Project> {
@@ -232,12 +313,29 @@ export class MonitoringCoordinator {
     return structuredClone(project);
   }
 
-  changeProject(id: string, input: { mode: "maintained" | "watch" }): Project {
+  changeProject(id: string, input: unknown): Project {
     this.assertOpen();
-    if (input.mode !== "maintained" && input.mode !== "watch")
-      throw new InputError("Invalid project mode.");
     const project = this.project(id);
-    project.mode = input.mode;
+    let changes;
+    try {
+      changes = validateProjectChanges(input);
+    } catch {
+      throw new InputError(
+        "Invalid project settings. Check the name, icon, commands, and shortcuts.",
+      );
+    }
+    if (project.repository && changes.actions?.length)
+      throw new InputError("Custom commands require a local project checkout.");
+    if (changes.mode !== undefined) project.mode = changes.mode;
+    if (changes.name !== undefined) {
+      project.name = changes.name.trim();
+      for (const finding of this.state.findings)
+        if (finding.subjectId === id) finding.subjectLabel = project.name;
+    }
+    if (changes.icon !== undefined)
+      project.icon = structuredClone(changes.icon) as Mutable<Project>["icon"];
+    if (changes.actions !== undefined)
+      project.actions = structuredClone(changes.actions) as Mutable<Project>["actions"];
     this.persist();
     return structuredClone(project);
   }
@@ -386,7 +484,11 @@ export class MonitoringCoordinator {
   }
   private schedule() {
     if (this.closed || this.state.settings.paused) return;
-    for (const [id, due] of Object.entries(this.due)) if (due <= Date.now()) this.enqueue(id);
+    for (const [id, due] of Object.entries(this.due)) {
+      const project = this.state.projects.find((p) => p.id === id);
+      if (due <= Date.now() && (!project || this.automaticProjectAllowed(project)))
+        this.enqueue(id);
+    }
     this.runQueue();
   }
   private runQueue() {
@@ -394,7 +496,14 @@ export class MonitoringCoordinator {
     this.worker = (async () => {
       while (this.queue.size && !this.closed) {
         const id = this.queue.keys().next().value!;
+        const manual = this.queue.get(id);
         this.queue.delete(id);
+        const project = this.state.projects.find((p) => p.id === id);
+        if (
+          !manual &&
+          (this.state.settings.paused || (project && !this.automaticProjectAllowed(project)))
+        )
+          continue;
         this.active = id;
         await this.scan(id);
         this.active = null;
@@ -456,7 +565,7 @@ export class MonitoringCoordinator {
     let inventoryStatus: "complete" | "partial" | "failed" | null = null;
     try {
       if (project) {
-        const inputs = await inspectProject(project.path);
+        const inputs = await this.projectInspection(project, this.shutdown.signal);
         attempt.inputFingerprint = inputs.inputFingerprint;
         let lookedUp: LookupResult = {
           dependencies: inputs.dependencies,
@@ -465,8 +574,13 @@ export class MonitoringCoordinator {
           errors: [],
         };
         if (this.lookup)
-          lookedUp = await this.lookup(inputs.dependencies, this.shutdown.signal, (progress) =>
-            this.reportProgress(progress),
+          lookedUp = await this.lookup(
+            inputs.dependencies,
+            this.shutdown.signal,
+            (progress) => this.reportProgress(progress),
+            !project.repository && this.state.runtime.mode === "interactive"
+              ? { root: project.path, packageManager: inputs.packageManager }
+              : undefined,
           );
         else
           inputs.errors.push(
@@ -481,6 +595,10 @@ export class MonitoringCoordinator {
         project.manifestPath = inputs.manifestPath;
         project.lockfilePath = inputs.lockfilePath;
         project.inputFingerprint = inputs.inputFingerprint;
+        if (inputs.git) project.git = inputs.git;
+        else delete project.git;
+        if (project.repository && inputs.repositoryCommit)
+          project.repository.commit = inputs.repositoryCommit;
         const previous = new Map(project.dependencies.map((d) => [d.id, d]));
         freshUpdates =
           this.lookup !== null &&
@@ -496,6 +614,7 @@ export class MonitoringCoordinator {
         project.dependencies = lookedUp.dependencies.map((d) => {
           const old = previous.get(d.id);
           const checkedVersion = lookedUp.versionChecked?.has(d.id) ?? freshUpdates;
+          const versionSource = old && !checkedVersion ? old.versionSource : d.versionSource;
           if (old) {
             for (const finding of previousFindings.get(identity(d.packageName, d.resolved ?? "")) ??
               []) {
@@ -534,6 +653,7 @@ export class MonitoringCoordinator {
                 : [...d.advisoryIds],
             availableVersion: old && !checkedVersion ? old.availableVersion : d.availableVersion,
             latestVersion: old && !checkedVersion ? old.latestVersion : d.latestVersion,
+            ...(versionSource ? { versionSource } : {}),
           };
         });
         attempt.coverage = [...inputs.coverage, ...lookedUp.coverage];
@@ -557,9 +677,11 @@ export class MonitoringCoordinator {
                 dep.resolved,
                 available,
                 "info",
-                "npm registry",
+                dep.versionSource ?? "npm registry",
                 dep.availableVersion
-                  ? "A newer version satisfies the requested range."
+                  ? dep.versionSource?.includes(" outdated ")
+                    ? "A newer version is compatible with the package manager's configuration."
+                    : "A newer version satisfies the requested range."
                   : "A newer latest release requires reviewing the requested range.",
                 null,
               ),
@@ -724,7 +846,7 @@ export class MonitoringCoordinator {
           findings.push(
             this.finding(
               subjectId,
-              attempt.targetLabel,
+              project?.name ?? attempt.targetLabel,
               "coverage",
               "coverage",
               "Incomplete checks",

@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { access, realpath } from "node:fs/promises";
 import { constants } from "node:fs";
-import { delimiter, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,6 +12,7 @@ import {
 } from "@versionstead/contracts/monitoring";
 import { decodeStatus } from "@versionstead/contracts/status";
 import { discoverGlobalToolSources } from "../../server/dist/adapters/inventory.js";
+import { toolDirectories } from "../../server/dist/adapters/tool-paths.js";
 
 const run = promisify(execFile);
 export const dataDir = resolveDataDir();
@@ -57,10 +58,9 @@ async function nodeExecutable() {
     throw new Error("VERSIONSTEAD_NODE_EXECUTABLE must be absolute");
   const candidates = configured
     ? [configured]
-    : (process.env.PATH ?? "")
-        .split(delimiter)
-        .filter(Boolean)
-        .map((directory) => join(directory, process.platform === "win32" ? "node.exe" : "node"));
+    : toolDirectories().map((directory) =>
+        join(directory, process.platform === "win32" ? "node.exe" : "node"),
+      );
   for (const candidate of candidates) {
     try {
       await access(candidate, constants.X_OK);
@@ -137,6 +137,7 @@ async function connectCoordinator(restart: boolean) {
     const session = existing.runtime.host === "session" && existing.runtime.mode === "interactive";
     const current =
       existing.snapshot.scanProgress &&
+      existing.snapshot.features === "settings-repositories-connections-v6" &&
       existing.snapshot.inventory.collector === "npm-bun-global-v1";
     if (!restart && (current || !session)) return existing;
     if (!session) throw new Error("Restart this coordinator through its Windows background host.");

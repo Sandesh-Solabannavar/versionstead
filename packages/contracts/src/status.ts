@@ -15,7 +15,7 @@ export const Status = Schema.Struct({
     inventory: Schema.Boolean,
     updates: Schema.Boolean,
     vulnerabilities: Schema.Boolean,
-    remoteAgents: Schema.Literal(false),
+    remoteAgents: Schema.Boolean,
   }),
 });
 

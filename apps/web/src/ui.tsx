@@ -11,6 +11,7 @@ import { Badge as ShadcnBadge, type BadgeProps } from "./components/ui/badge";
 import { Table as ShadcnTable } from "./components/ui/table";
 import { Sheet, SheetPopup, SheetHeader, SheetTitle } from "./components/ui/sheet";
 import { cn } from "./lib/utils";
+import { DialogPortalContainer } from "./components/ui/dialog-portal";
 
 export {
   Collapsible,
@@ -317,19 +318,31 @@ export function Dialog({
   children,
   onClose,
   drawer = false,
+  description,
+  className,
+  dismissible = true,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   drawer?: boolean;
+  description?: string;
+  className?: string;
+  dismissible?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const [trigger] = useState(() =>
     document.activeElement instanceof HTMLElement ? document.activeElement : null,
   );
   const titleId = useId();
+  const descriptionId = useId();
   useEffect(() => {
-    if (!drawer) ref.current?.showModal();
+    if (!drawer) {
+      ref.current?.showModal();
+      ref.current
+        ?.querySelector<HTMLElement>("input:not([disabled]),textarea:not([disabled])")
+        ?.focus();
+    }
     return () => {
       // Wait for the commit: a filter or successful removal can remove the original trigger.
       queueMicrotask(() => {
@@ -362,17 +375,46 @@ export function Dialog({
     <dialog
       ref={ref}
       aria-labelledby={titleId}
-      className="form-dialog"
-      onCancel={onClose}
+      aria-describedby={description ? descriptionId : undefined}
+      className={cn("form-dialog", className)}
+      onCancel={(e) => {
+        if (!dismissible) e.preventDefault();
+        else onClose();
+      }}
       onClose={onClose}
+      onClick={(e) => {
+        if (!dismissible || e.target !== e.currentTarget) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        if (
+          e.clientX < rect.left ||
+          e.clientX > rect.right ||
+          e.clientY < rect.top ||
+          e.clientY > rect.bottom
+        )
+          onClose();
+      }}
     >
-      <div className="dialog-head">
-        <h2 id={titleId}>{title}</h2>
-        <Button variant="ghost" onClick={onClose} aria-label="Close dialog">
-          <X aria-hidden className="size-4" />
-        </Button>
-      </div>
-      <div className="dialog-body">{children}</div>
+      <DialogPortalContainer value={ref}>
+        <div className="dialog-head">
+          <div>
+            <h2 id={titleId}>{title}</h2>
+            {description && (
+              <p id={descriptionId} className="muted small">
+                {description}
+              </p>
+            )}
+          </div>
+          <Button
+            variant="ghost"
+            onClick={onClose}
+            aria-label="Close dialog"
+            disabled={!dismissible}
+          >
+            <X aria-hidden className="size-4" />
+          </Button>
+        </div>
+        <div className="dialog-body">{children}</div>
+      </DialogPortalContainer>
     </dialog>
   );
 }

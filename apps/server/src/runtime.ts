@@ -87,6 +87,18 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
   });
 }
 
+export async function protectSecret(value: string): Promise<string> {
+  if (process.platform !== "win32")
+    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
+  return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+}
+
+export async function unprotectSecret(value: string): Promise<string> {
+  if (process.platform !== "win32")
+    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
+  return Buffer.from(await dpapi(value, "Unprotect"), "base64").toString("utf8");
+}
+
 function validateDescriptor(runtime: RuntimeFile): void {
   const url = new URL(runtime.origin);
   if (

@@ -1,0 +1,41 @@
+# Package-manager update and advisory checks
+
+## Local update checks
+
+Local projects scanned by an interactive owner coordinator try their installed package manager before public npm metadata lookups. The selected lockfile determines npm, pnpm, or Bun. The supported CLI families are npm 11, pnpm 10, and Bun 1.4; other versions, shell/Corepack wrappers, missing managers, and repository-local manager binaries use the existing registry fallback. The independent owner coordinator keeps this behavior when the UI is closed. LocalService and other noninteractive hosts use file/registry checks after sign-out.
+
+The adapter checks each selected workspace separately and passes only eligible direct public-registry dependency names. Batches of at most 40 names bound Windows argument size without imposing a project-wide lookup cutoff. Every remaining eligible record still reaches the registry stage. Provider-only GitHub/GitLab repositories continue reading files at immutable commits; nothing is cloned or installed to run a CLI.
+
+| Manager | Read-only command shape                                                                    | Interpretation                                                                                                                                                                                                                                              |
+| ------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm 11  | `npm outdated <names> --json --prefix <workspace>`                                         | JSON wanted is the newest version compatible with the current manifest; latest is the dist-tag. Aliases retain their requested and canonical identities. Duplicate workspace rows match their actual package location; ambiguous/hoisted rows use fallback. |
+| pnpm 10 | `pnpm outdated <names> --format json --dir <workspace>`, then the same with `--compatible` | JSON wanted is the lockfile target, not the newest compatible release. The second report's latest supplies the compatible candidate. Per-workspace calls avoid recursive JSON collisions.                                                                   |
+| Bun 1.4 | `bun outdated <names>` in the workspace                                                    | Parse verified ASCII/box tables and their Current/Update/Latest columns. Unknown columns, incomplete rows, and unfamiliar output use fallback.                                                                                                              |
+
+The actual commands add verified script-suppression, retry/timeout, and output flags. pnpm requires the `--config.<setting>=<value>` form for settings not accepted as direct outdated options: ignore scripts/pnpmfile, disable automatic package-manager downloads, disable strict manager-version selection, and bound registry retries. pnpm configuration plugins can install or execute during CLI startup even with ignored hooks, so configuration-dependency declarations in selected/ancestor metadata cause fallback before invocation.
+
+Exit codes 0 and 1 are accepted only with recognized output and no stderr diagnostic. Manager executable/version, workspace identity, and report identities are checked. Compatible/latest candidates retain original lockfile-resolved versions; commands never replace inventory or security identities with installed versions. A CLI omission does not establish that a lockfile dependency is current: unreported, missing, ambiguous, malformed, unsupported, or failed records use public-registry checks. Ordinary workspace/local records are retained with not-applicable coverage and do not create an incomplete-check finding by themselves. Git/private/unknown/unresolved external records remain limitations.
+
+Each invocation has a 30-second timeout, 4 MiB output limit, cancellation, argument arrays, and hidden Windows execution. Raw manager output is transient and not stored or logged. npm user/global config is isolated; private registry credentials are not added to Versionstead. No restore, install, upgrade, lifecycle command, or custom project Action is launched. Existing input mismatch errors remain separate from update results.
+
+Progress has separate package-manager and registry stages. Native results record a source such as `pnpm outdated 10.14.0`; remaining checks record `npm registry`. Existing evidence, grouped findings, notifications, and failure retention consume both through the same coordinator flow. The `settings-repositories-connections-v6` startup marker reloads older interactive coordinators; boot-host ownership and restart rules are preserved.
+
+## Vulnerability checks
+
+Project vulnerability checks are independent of `outdated` and use the existing OSV adapter:
+
+1. Read exact resolved public npm package names/versions from supported lockfiles, including direct and transitive records.
+2. Deduplicate identical name/version queries and send batches of 100 to OSV's `POST /v1/querybatch` API. Only package identity/version are sent, not source files or full lockfiles.
+3. Retrieve each returned advisory's details through `GET /v1/vulns/{id}` and retain IDs, summaries, available severity, advisory links, and provider-listed fixed boundaries.
+4. Persist findings with scan timestamps and coverage. Failed batches, pagination, unavailable details, private origins, unsupported inputs, and missing resolutions stay explicitly unverified. Failed rescans retain previous findings with their age.
+
+These are known dependency advisory checks. They do not analyze source code, detect secrets or malware, prove runtime exploitability, or guarantee safety. Listed fixed boundaries do not prove that one upgrade resolves every advisory. PC global tools currently receive version checks only; global-tool vulnerability scanning is not implemented.
+
+## Verification and references
+
+Run `pnpm check` for fixtures, lookup/coordinator regressions, format/lint/type checks and all builds. Live CLI verification uses isolated fixtures with installed npm 11.7.0, pnpm 10.14.0, and Bun 1.4.0. It verifies normalized update results and unchanged project input files, including a pnpm hook that would create a marker if executed. Native Electron smoke covers the existing progress and source evidence workflows.
+
+- [npm outdated](https://docs.npmjs.com/cli/v11/commands/npm-outdated/)
+- [pnpm 10 outdated](https://pnpm.io/10.x/cli/outdated), [pnpm hooks](https://pnpm.io/10.x/pnpmfile), and [manager-version behavior](https://pnpm.io/10.x/settings#managepackagemanagerversions)
+- [Bun outdated](https://bun.com/docs/pm/cli/outdated)
+- [OSV querybatch](https://google.github.io/osv.dev/post-v1-querybatch/) and [advisory details](https://google.github.io/osv.dev/get-v1-vulns/)

@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { ProjectIcon, ProjectActions, ProjectChanges } from "./project-settings.ts";
 
 export const EvidenceStatus = Schema.Literals([
   "not-scanned",
@@ -52,12 +53,14 @@ export const Dependency = Schema.Struct({
   name: Schema.String,
   packageName: Schema.String,
   requested: NullableString,
+  requestedRange: Schema.optional(NullableString),
   resolved: NullableString,
   origin: Schema.Literals(["registry", "workspace", "git", "local", "unknown"]),
   role: Schema.Literals(["production", "development", "optional", "transitive"]),
   importer: Schema.String,
   availableVersion: NullableString,
   latestVersion: NullableString,
+  versionSource: Schema.optional(Schema.String),
   versionStatus: Schema.optional(
     Schema.Literals(["not-checked", "checked", "failed", "unsupported"]),
   ),
@@ -69,12 +72,27 @@ export type Dependency = typeof Dependency.Type;
 export const Project = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
+  icon: Schema.optional(Schema.NullOr(ProjectIcon)),
+  actions: Schema.optional(ProjectActions),
   path: Schema.String,
   mode: Schema.Literals(["maintained", "watch"]),
-  packageManager: Schema.Literals(["npm", "pnpm", "unknown"]),
+  packageManager: Schema.Literals(["npm", "pnpm", "bun", "unknown"]),
   manifestPath: NullableString,
   lockfilePath: NullableString,
   inputFingerprint: Schema.optional(NullableString),
+  repository: Schema.optional(
+    Schema.Struct({
+      provider: Schema.Literals(["github", "gitlab"]),
+      repositoryId: Schema.String,
+      name: Schema.String,
+      ref: Schema.String,
+      commit: NullableString,
+      url: Schema.String,
+    }),
+  ),
+  git: Schema.optional(
+    Schema.Struct({ branch: NullableString, commit: NullableString, dirty: Schema.Boolean }),
+  ),
   evidence: ScanEvidence,
   dependencies: Schema.Array(Dependency),
   createdAt: Schema.String,
@@ -135,6 +153,7 @@ export const ScanStage = Schema.Literals([
   "project-inputs",
   "advisories",
   "advisory-details",
+  "native-versions",
   "versions",
   "saving",
 ]);
@@ -178,6 +197,16 @@ export type MonitoringSettings = typeof MonitoringSettings.Type;
 
 export const MonitoringSnapshot = Schema.Struct({
   protocolVersion: Schema.Literal(1),
+  features: Schema.optional(
+    Schema.Literals([
+      "settings-repositories-connections-v1",
+      "settings-repositories-connections-v2",
+      "settings-repositories-connections-v3",
+      "settings-repositories-connections-v4",
+      "settings-repositories-connections-v5",
+      "settings-repositories-connections-v6",
+    ]),
+  ),
   runtime: Schema.Struct({
     startedAt: Schema.String,
     mode: Schema.Literals(["interactive", "background"]),
@@ -213,7 +242,7 @@ export const AddProject = Schema.Struct({
   path: Schema.String,
   mode: Schema.Literals(["maintained", "watch"]),
 });
-export const ChangeProject = Schema.Struct({ mode: Schema.Literals(["maintained", "watch"]) });
+export const ChangeProject = ProjectChanges;
 export const RequestScan = Schema.Struct({
   target: Schema.Literals(["pc", "projects", "all"]),
   projectId: Schema.optional(Schema.String),
