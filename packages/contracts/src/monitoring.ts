@@ -257,3 +257,4 @@ export const ChangeGlobalToolSources = Schema.Struct({ sources: Schema.Array(Glo
 export const AcknowledgeNotificationSummary = Schema.Struct({
   summaryId: Schema.String,
 });
+export const decodeNotificationSummary = Schema.decodeUnknownSync(NotificationSummary);

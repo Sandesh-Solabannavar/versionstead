@@ -16,6 +16,10 @@ Local owner-session update scans prefer bounded installed-manager `outdated` che
 
 Project settings now includes persistent display names/icons, confirmed removal, and owner-authored commands for local checkouts, launched explicitly through Windows Electron. The desktop supervises command output/cancellation; the coordinator only stores settings and continues read-only scans. Paired-PC grants do not allow remote settings edits or commands. See [Project settings](docs/project-settings.md).
 
+The settings shell and native title bar follow T3 Code's caption geometry, native theme synchronization, searchable settings navigation, and return-to-workspace behavior. Sidebar visibility and normal window bounds/maximized state persist per device. Confirmed Restore device defaults resets UI preferences and shortcuts while retaining monitoring configuration and sources. See [Settings and connections](docs/settings-and-connections.md).
+
+Shared shadcn/Base UI toasts show action feedback, errors, and one count summary for new findings. Review opens the relevant Needs attention filter; a bounded device-local identity history prevents replay across polls and reloads. Native notifications retain their existing delivery receipts. Needs attention and Projects start with every group collapsed and retain manual expansion during refresh. The shared V mark appears in web and native app surfaces. See [Design and interaction](docs/design.md).
+
 | Term         | Meaning                                                                                         |
 | ------------ | ----------------------------------------------------------------------------------------------- |
 | Coordinator  | Stores evidence, schedules work, correlates findings, and owns notification decisions.          |

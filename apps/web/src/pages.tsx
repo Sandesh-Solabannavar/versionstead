@@ -118,12 +118,10 @@ function SelectControl({
   );
 }
 
-function useGroupExpansion(firstId?: string) {
-  const [initialId, setInitialId] = useState<string | null>(firstId ?? null);
+function useGroupExpansion() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  if (initialId === null && firstId) setInitialId(firstId);
   return {
-    isOpen: (id: string) => expanded[id] ?? id === initialId,
+    isOpen: (id: string) => expanded[id] ?? false,
     setOpen: (id: string, open: boolean) =>
       setExpanded((previous) => ({ ...previous, [id]: open })),
   };
@@ -159,6 +157,9 @@ function FindingCounts({ counts }: { counts: ReturnType<typeof findingCounts> })
 declare global {
   interface Window {
     versionstead?: {
+      platform: string;
+      onNotificationSummary: (listener: (summary: unknown) => void) => () => void;
+      setWindowTheme: (theme: unknown) => Promise<void>;
       selectProjectDirectory: () => Promise<string | null>;
       runProjectAction: (
         projectId: string,
@@ -309,9 +310,7 @@ export function Attention() {
   const findings = snapshot?.findings ?? [];
   const allGroups = snapshot ? attentionGroups(snapshot) : [];
   const groups = snapshot ? attentionGroups(snapshot, filter, query) : [];
-  const expansion = useGroupExpansion(
-    (groups.find((group) => group.findings.length > 0) ?? groups[0])?.id,
-  );
+  const expansion = useGroupExpansion();
   const selected = findings.find((finding) => finding.id === selectedId);
   const counts = allGroups.reduce(
     (total, group) => ({
@@ -1118,13 +1117,7 @@ export function Projects() {
   const visibleProjects = (filter === "all" ? projects : attentionProjects).filter(
     (project) => matchesProject(project) || project.dependencies.some(matchesDependency),
   );
-  const expansion = useGroupExpansion(
-    (
-      visibleProjects.find((project) =>
-        findings.some((finding) => finding.subjectId === project.id),
-      ) ?? visibleProjects[0]
-    )?.id,
-  );
+  const expansion = useGroupExpansion();
   const removing = projects.find((project) => project.id === removingId);
   const selectedProject = projects.find((project) => project.id === selectedDependency?.projectId);
   const dependency = selectedProject?.dependencies.find(

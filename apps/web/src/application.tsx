@@ -13,6 +13,7 @@ import {
   type SshTarget,
 } from "@versionstead/contracts/application";
 import { request, useMonitoring } from "./monitoring";
+import { toast } from "./components/ui/toast";
 
 const Context = createContext<{
   snapshot: ApplicationSnapshot | null;
@@ -48,6 +49,11 @@ export function ApplicationProvider({ children }: { children: ReactNode }) {
         });
         setSnapshot(value);
         setError(null);
+        toast.add({
+          id: "action-feedback",
+          title: "Source control status refreshed.",
+          type: "success",
+        });
       } catch (failure) {
         setError(
           failure instanceof Error ? failure.message : "Source control could not be refreshed.",
@@ -115,6 +121,7 @@ export function ApplicationProvider({ children }: { children: ReactNode }) {
     });
     setSnapshot(result);
     setError(null);
+    toast.add({ id: "action-feedback", title: "Remote environment connected.", type: "success" });
   }, []);
   return (
     <Context value={{ snapshot, error, refresh, change, discover, discovering, connectComputer }}>

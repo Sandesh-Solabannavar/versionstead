@@ -2,6 +2,12 @@
 
 Open Settings from the sidebar gear. Its six pages follow T3 Code's grouped settings and icon navigation. Project adds name/icon editing, manually launched local commands, and confirmed removal; see [Project settings](project-settings.md). The Update icon beside it checks stable Versionstead releases and shows release notes. No published release, a failed check, and a verified current build are distinct outcomes. Installer download/apply is not implemented for this source checkout.
 
+The settings shell adapts T3 Code's compact Settings / Section breadcrumb and searchable sidebar. `/` focuses settings search and reveals a collapsed sidebar. Search covers available pages and ordinary setting rows; Arrow keys and Enter select a match, scroll to it, and focus it. Escape clears a search first, then returns to the last workspace page, preserving its filters. Back to workspace uses the same destination. Editing fields, selectors, and dialogs keep their keyboard behavior. The sidebar toggle remembers its visibility on this device.
+
+Versionstead uses one integrated title bar. Windows retains native caption buttons with T3 Code's 40 px overlay and reserved control space; empty header areas drag the window and interactive controls remain clickable. Appearance mode also updates the native window theme. Normal window bounds and maximized state are saved in `window-settings.json` under Electron's user-data directory; saved bounds outside connected display work areas fall back to the default window. Browser headers use 52 px and remain ordinary page controls. Native macOS/Linux caption behavior still needs platform acceptance testing.
+
+General's Restore device defaults asks for confirmation and resets appearance, keyboard shortcuts, and sidebar visibility on this device. It keeps custom themes, monitoring schedules, selected projects, accounts, and paired PCs. It does not reset the window's saved geometry.
+
 ## General, Appearance, and Keybindings
 
 General controls scheduled scanning, PC/project intervals, automatic repository scans, summary notifications, and optional daily release checks. Pausing schedules leaves manual scans available. Background-host installation still uses the Windows setup script; a preference does not register a Windows task.

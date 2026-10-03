@@ -33,7 +33,7 @@ import { useMonitoring } from "./monitoring";
 import { useApplication } from "./application";
 import { useAppearance } from "./theme";
 import { keyChord } from "./keybindings";
-import { Button, Dialog, Input, EmptyState } from "./ui";
+import { Button, Dialog, Input, EmptyState, hasOpenModal } from "./ui";
 import { Choice, SettingGroup, SettingRow } from "./components/settings-controls";
 import { ProjectBadge, projectIdentity, iconComponents, readProjectIcon } from "./project-icons";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
@@ -60,7 +60,7 @@ export function ProjectCommands({ project }: { project: Project }) {
       if (
         event.repeat ||
         event.isComposing ||
-        document.querySelector("dialog[open]") ||
+        hasOpenModal() ||
         !window.versionstead?.runProjectAction ||
         !(event.target instanceof HTMLElement) ||
         event.target.closest('input,textarea,select,[contenteditable="true"]') ||
@@ -613,7 +613,7 @@ function ProjectDetail({ members }: { members: Member[] }) {
       if (
         event.repeat ||
         event.isComposing ||
-        document.querySelector("dialog[open]") ||
+        hasOpenModal() ||
         (event.target instanceof HTMLElement &&
           event.target.closest('input,textarea,select,[contenteditable="true"]'))
       )
@@ -748,6 +748,7 @@ function ProjectDetail({ members }: { members: Member[] }) {
               <SettingRow
                 key={action.id}
                 label={action.name}
+                searchable={false}
                 mark={<Glyph size={15} />}
                 description={action.command}
               >

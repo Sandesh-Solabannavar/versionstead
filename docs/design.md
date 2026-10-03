@@ -4,11 +4,13 @@ Versionstead should make evidence easy to understand and follow up. Use a compac
 
 ## Present monitoring interface
 
+The shared header follows T3 Code's native caption geometry, theme synchronization, and settings breadcrumbs. Settings uses compact icon navigation and searchable, focusable rows; it returns to the previous workspace rather than always opening Needs attention. Sidebar visibility is persistent. Device-default restoration is confirmed and limited to UI preferences and shortcuts.
+
 The interface has four real workflows: Needs attention, This PC, Projects, and Background service. It separates connection health, scan freshness, coverage, update checks, and known-advisory results. Project selection, maintenance mode, manual scans, pause, schedules, and notification preferences invoke validated coordinator APIs. Windows host installation remains an explicit elevated command with lifecycle verification. A planned feature belongs in documentation or clearly labeled explanatory text, not a button that appears functional.
 
 The shared web/desktop interface offers System, Light, and Dark appearance. System follows `prefers-color-scheme`; explicit choices use local storage and survive restart within the same origin. The Electron renderer uses a stable `versionstead://app/` origin. Browser and desktop choices remain independent, and unavailable browser storage limits a choice to the current session. Native window chrome and OS integration still require platform-specific visual verification.
 
-The approved design is implemented with source-owned shadcn Base UI components, matching T3 Code's `base-mira` configuration. A 44 px brand bar, 205 px sidebar, and 52 px page header frame the workspace. Shared buttons, badges, selectors, collapsibles, tables, and evidence sheets use semantic tokens. Appearance preview cards, paired palette orbs, interface sliders, motion preview, and typography previews adapt the T3 Code implementation. The T3 MIT notice ships with the built assets.
+The approved design is implemented with source-owned shadcn Base UI components, matching T3 Code's `base-mira` configuration. An integrated 40 px Windows caption (52 px browser header) and 205 px collapsible sidebar frame the workspace. Shared buttons, badges, selectors, collapsibles, tables, evidence sheets, and toasts use semantic tokens. The existing Versionstead V mark is shared by the title bar and update panel, with corresponding favicon, native window, tray, and notification icons. Appearance preview cards, paired palette orbs, interface sliders, motion preview, and typography previews adapt the T3 Code implementation. T3 and shadcn MIT notices ship with the built assets.
 
 ## Information hierarchy
 
@@ -29,6 +31,8 @@ Needs attention groups findings by stable PC/project identity; URL filters for u
 Projects initially shows selected folders with findings, incomplete evidence, failed checks, or active/queued scans. All projects restores the complete selected-folder list. Each expandable group initially shows dependencies needing attention; All dependencies exposes retained inventory and source exclusions. Intentional transitive version exclusions alone do not classify a complete project as needing attention. Search filters targets and package rows. Expansion choices survive snapshot refreshes, and header scan actions sit outside the disclosure button. Add, remove, maintenance mode, and scan actions use the existing validated APIs.
 
 ## Status semantics
+
+Needs attention and Projects start with every accordion closed on entry. Expanding one group does not close another; manual choices survive snapshot refreshes and filter changes while that page remains mounted. Evidence panels and scan buttons keep their separate interactions.
 
 | State               | Presentation rule                                                                          |
 | ------------------- | ------------------------------------------------------------------------------------------ |
@@ -61,6 +65,8 @@ This PC begins with an empty Scan this PC prompt. npm and Bun have independent d
 One shared scan progress control shows the active target/stage, measured stage-local counts when known, queued targets, and terminal outcome/elapsed time. Unknown totals remain indeterminate; disconnected information freezes with a last-observed label. A completed stage does not imply complete coverage.
 
 Notifications show one count summary after a scan cycle settles, combine the signed-out backlog, and use a persisted five-minute cooldown. Unchanged findings stay quiet. Update and security-advisory counts remain distinct, and a summary click opens the appropriate Needs attention filter. Snooze and daily-digest preferences remain deferred.
+
+One app-wide shadcn/Base UI toaster presents these summaries, successful actions, and action/connection errors. A summary offers Review and Close; its opaque identity is saved in a bounded 200-entry device-local history so polling, native delivery, and reloads do not replay it. Routine status polling produces no success toast. At most three toasts remain visible in the stack. Toasts support keyboard dismissal, F6 focus, hover/focus pause, swipe dismissal, reduced motion, and narrow windows. Persistent connection and compatibility banners remain visible for conditions requiring ongoing attention. Native OS notifications retain their existing receipt behavior when the UI is hidden.
 
 ## T3-inspired settings
 

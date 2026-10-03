@@ -32,6 +32,15 @@ export {
 export { Input } from "./components/ui/input";
 export { TableHeader, TableBody, TableRow, TableHead, TableCell } from "./components/ui/table";
 
+// Toasts are accessible non-modal dialogs and must not block workspace shortcuts.
+export function hasOpenModal() {
+  return (
+    document.querySelector(
+      'dialog[open], [role="dialog"]:not([aria-modal="false"]), [role="alertdialog"]:not([aria-modal="false"])',
+    ) !== null
+  );
+}
+
 const buttonAliases = {
   default: "outline",
   primary: "default",

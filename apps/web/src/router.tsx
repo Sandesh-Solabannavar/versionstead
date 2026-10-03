@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CircleAlert, Folder, Monitor, RefreshCw, ShieldCheck, Timer } from "lucide-react";
+import { CircleAlert, Folder, Monitor, RefreshCw, PanelLeft, Timer } from "lucide-react";
 import {
   createRootRoute,
   createRoute,
@@ -13,19 +13,29 @@ import { Attention, Projects, Service, ThisPc } from "./pages";
 import { MonitoringProvider, useMonitoring } from "./monitoring";
 import { AppearanceProvider, useAppearance } from "./theme";
 import { ApplicationProvider, useApplication } from "./application";
-import { SettingsNavigation, SettingsPage, UtilityControls, ComputerPage } from "./settings";
+import {
+  SettingsNavigation,
+  SettingsPage,
+  UtilityControls,
+  ComputerPage,
+  RestoreDeviceDefaults,
+} from "./settings";
+import { settingsSections } from "./settings-navigation";
+import { WorkspaceChromeProvider, useWorkspaceChrome } from "./workspace-chrome";
 import { commands, keyChord } from "./keybindings";
 import {
   decodeAcceptedResponse,
   decodeMonitoringSettings,
 } from "@versionstead/contracts/monitoring";
-import { Button } from "./ui";
+import { Button, hasOpenModal } from "./ui";
 import { Input } from "./components/ui/input";
 import { attentionGroups, attentionSearch } from "./monitoring-view";
+import { Toaster } from "./components/ui/toast";
+import { InAppNotifications } from "./in-app-notifications";
+import { AppLogo } from "./components/app-logo";
 
 function ConnectionNotice() {
-  const { connection, snapshot, busy, error, notice, refreshing, refresh, authenticate } =
-    useMonitoring();
+  const { connection, snapshot, busy, error, refreshing, refresh, authenticate } = useMonitoring();
   const [token, setToken] = useState("");
   if (connection === "unauthorized")
     return (
@@ -120,16 +130,11 @@ function ConnectionNotice() {
         </div>
       </div>
     );
-  if (notice)
-    return (
-      <div className="connection-banner" role="status">
-        {notice}
-      </div>
-    );
   return null;
 }
 
 function ShellContent() {
+  const { collapsed, setCollapsed } = useWorkspaceChrome();
   const { snapshot, connection, refreshing, refresh } = useMonitoring();
   const path = useLocation({ select: (location) => location.pathname });
   const settings = path.startsWith("/settings/");
@@ -146,7 +151,7 @@ function ShellContent() {
       0,
     ) ?? 0);
   const title = settings
-    ? "Settings"
+    ? (settingsSections.find((section) => section.path === path)?.label ?? "Settings")
     : path.startsWith("/computers/")
       ? "Connected PC"
       : path === "/pc"
@@ -165,31 +170,82 @@ function ShellContent() {
           ? "Boot host connected"
           : "Session coordinator running";
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-sidebar-collapsed={collapsed}>
       <a className="skip-link" href="#content">
         Skip to content
       </a>
-      <div className="app-titlebar">
-        <Link to="/" className="brand" aria-label="Versionstead home">
-          <span className="brand-mark" aria-hidden="true">
-            v.
-          </span>
-          <span>Versionstead</span>
-        </Link>
-        <span className="titlebar-context">
-          <ShieldCheck size={13} aria-hidden="true" />
-          Read-only monitoring
-        </span>
-      </div>
-      <aside className="sidebar">
-        <div className="sidebar-inner">
-          <div className="device-summary">
-            <Monitor size={18} aria-hidden="true" />
-            <div>
-              <h2>{snapshot?.device.label ?? "This PC"}</h2>
-              <p className="muted small">{snapshot?.device.platform ?? "Local computer"}</p>
-            </div>
+      <header className="app-titlebar">
+        <div className="titlebar-leading">
+          <AppLogo />
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={collapsed ? "Show sidebar" : "Hide sidebar"}
+            aria-expanded={!collapsed}
+            aria-controls="workspace-sidebar"
+            onClick={() => setCollapsed(!collapsed)}
+          >
+            <PanelLeft size={16} aria-hidden />
+          </Button>
+          <div className="breadcrumb">
+            {settings ? (
+              <span className="muted">Settings</span>
+            ) : (
+              <Link to="/" className="brand" aria-label="Versionstead home">
+                Versionstead
+              </Link>
+            )}
+            <span className="muted" aria-hidden>
+              /
+            </span>
+            <span className="breadcrumb-current">{title}</span>
           </div>
+        </div>
+        <div className="titlebar-trailing">
+          {path === "/settings/general" && <RestoreDeviceDefaults />}
+          <div
+            className="topbar-status"
+            data-testid="connection-state"
+            data-state={connection === "connected" ? "online" : connection}
+          >
+            <span
+              className={`status-dot ${connection === "connected" ? "" : "unknown"}`}
+              aria-hidden
+            />
+            <span className="connection-label">
+              {connection === "connected"
+                ? "UI connected"
+                : connection === "connecting"
+                  ? "Connecting"
+                  : connection === "unauthorized"
+                    ? "Access code required"
+                    : "UI disconnected"}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              disabled={refreshing}
+              aria-label="Refresh coordinator state"
+              onClick={() => {
+                void refresh();
+              }}
+            >
+              <RefreshCw size={14} aria-hidden />
+            </Button>
+          </div>
+        </div>
+      </header>
+      <aside className="sidebar" id="workspace-sidebar">
+        <div className="sidebar-inner">
+          {!settings && (
+            <div className="device-summary">
+              <Monitor size={18} aria-hidden="true" />
+              <div>
+                <h2>{snapshot?.device.label ?? "This PC"}</h2>
+                <p className="muted small">{snapshot?.device.platform ?? "Local computer"}</p>
+              </div>
+            </div>
+          )}
           {settings ? (
             <SettingsNavigation />
           ) : (
@@ -261,42 +317,6 @@ function ShellContent() {
         </div>
       </aside>
       <div className="workspace">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span className="muted">Personal workspace</span>
-            <span className="muted" aria-hidden="true">
-              /
-            </span>
-            <span>{title}</span>
-          </div>
-          <div
-            className="topbar-status"
-            data-testid="connection-state"
-            data-state={connection === "connected" ? "online" : connection}
-          >
-            <span
-              className={`status-dot ${connection === "connected" ? "" : "unknown"}`}
-              aria-hidden="true"
-            />
-            {connection === "connected"
-              ? "UI connected"
-              : connection === "connecting"
-                ? "Connecting"
-                : connection === "unauthorized"
-                  ? "Access code required"
-                  : "UI disconnected"}
-            <Button
-              variant="ghost"
-              disabled={refreshing}
-              aria-label="Refresh coordinator state"
-              onClick={() => {
-                void refresh();
-              }}
-            >
-              <RefreshCw size={14} aria-hidden="true" />
-            </Button>
-          </div>
-        </header>
         <main id="content" tabIndex={-1} className="content">
           <ConnectionNotice />
           <div className="page">
@@ -313,8 +333,13 @@ function Shell() {
     <MonitoringProvider>
       <ApplicationProvider>
         <AppearanceProvider>
-          <Shortcuts />
-          <ShellContent />
+          <Toaster>
+            <WorkspaceChromeProvider>
+              <InAppNotifications />
+              <Shortcuts />
+              <ShellContent />
+            </WorkspaceChromeProvider>
+          </Toaster>
         </AppearanceProvider>
       </ApplicationProvider>
     </MonitoringProvider>
@@ -322,19 +347,14 @@ function Shell() {
 }
 
 function Shortcuts() {
+  const { focusSettingsSearch } = useWorkspaceChrome();
   const { bindings } = useAppearance();
   const { snapshot, connection, busy, refresh, mutate } = useMonitoring();
   const { refresh: refreshApplication } = useApplication();
   const navigate = useNavigate();
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.repeat ||
-        event.isComposing ||
-        document.querySelector('dialog[open], [role="dialog"]')
-      )
-        return;
+      if (event.defaultPrevented || event.repeat || event.isComposing || hasOpenModal()) return;
       if (
         event.target instanceof HTMLElement &&
         event.target.closest(
@@ -358,7 +378,11 @@ function Shortcuts() {
         return;
       }
       if (command === "search") {
-        document.querySelector<HTMLInputElement>('#content input[type="search"]')?.focus();
+        const search = document.querySelector<HTMLInputElement>(
+          '#settings-search, #content input[type="search"]',
+        );
+        if (search?.id === "settings-search") focusSettingsSearch();
+        else search?.focus();
         return;
       }
       if (command === "refresh") {
@@ -385,7 +409,17 @@ function Shortcuts() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [bindings, snapshot, connection, busy, refresh, refreshApplication, mutate, navigate]);
+  }, [
+    bindings,
+    snapshot,
+    connection,
+    busy,
+    refresh,
+    refreshApplication,
+    mutate,
+    navigate,
+    focusSettingsSearch,
+  ]);
   return null;
 }
 

@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./desktop": {
+      "types": "./dist/desktop.d.ts",
+      "default": "./dist/desktop.js"
+    },
     "./global-tool-updates": {
       "types": "./dist/global-tool-updates.d.ts",
       "default": "./dist/global-tool-updates.js"

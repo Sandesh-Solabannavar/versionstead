@@ -13,6 +13,7 @@
     "@tanstack/react-router": "1.170.41",
     "@versionstead/contracts": "workspace:*",
     "class-variance-authority": "0.7.1",
+    "cn": "0.4.0",
     "lucide-react": "0.564.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",

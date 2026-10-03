@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import { defaultBindings, readBindings, type Bindings } from "./keybindings";
 import {
   appearanceVariables,
+  defaultAppearance,
   readAppearance,
   readCustomThemes,
   readTheme,
@@ -32,6 +33,7 @@ const Preferences = createContext<{
   setCustomThemes: (value: ThemeDefinition[]) => void;
   themeHalves: ThemeHalves;
   setThemeHalf: (mode: ThemeMode, id: string) => void;
+  restoreDeviceDefaults: () => void;
 } | null>(null);
 function readLocal(key: string) {
   try {
@@ -69,6 +71,11 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     () => matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const resolvedTheme = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+  useEffect(() => {
+    void window.versionstead?.setWindowTheme(theme).catch(() => {
+      console.error("Native window appearance could not be saved.");
+    });
+  }, [theme]);
   useEffect(() => {
     const media = matchMedia("(prefers-color-scheme: dark)");
     const change = () => setSystemDark(media.matches);
@@ -135,6 +142,14 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
         setCustomThemes,
         themeHalves: readThemeHalves(themeHalves, themes),
         setThemeHalf: (mode, id) => setThemeHalves((previous) => ({ ...previous, [mode]: id })),
+        restoreDeviceDefaults: () => {
+          setTheme("system");
+          setCompact(false);
+          setReducedMotion(false);
+          setBindings(defaultBindings);
+          setAppearance(defaultAppearance);
+          setThemeHalves(readThemeHalves(null, themes));
+        },
       }}
     >
       {children}

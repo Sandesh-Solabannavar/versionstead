@@ -1,5 +1,13 @@
-import type { ReactNode } from "react";
+import { createContext, useCallback, useContext, type ReactNode } from "react";
+import { useLocation } from "@tanstack/react-router";
+import { settingTargetId } from "../settings-navigation";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
+
+const SearchTarget = createContext<string | null>(null);
+export function SettingsSearchTargets({ children }: { children: ReactNode }) {
+  const hash = useLocation({ select: (location) => location.hash });
+  return <SearchTarget value={hash.replace(/^#/, "")}>{children}</SearchTarget>;
+}
 
 export function SettingRow({
   label,
@@ -7,15 +15,28 @@ export function SettingRow({
   children,
   mark,
   version,
+  searchable = true,
 }: {
   label: string;
   description: string;
   children: ReactNode;
   mark?: ReactNode;
   version?: string | null;
+  searchable?: boolean;
 }) {
+  const target = useContext(SearchTarget);
+  const id = searchable && target !== null ? settingTargetId(label) : undefined;
+  const focusTarget = useCallback(
+    (element: HTMLDivElement | null) => {
+      if (element && target && id === target) {
+        element.scrollIntoView({ block: "center" });
+        element.focus({ preventScroll: true });
+      }
+    },
+    [id, target],
+  );
   return (
-    <div className="preference-row">
+    <div className="preference-row" id={id} tabIndex={id ? -1 : undefined} ref={focusTarget}>
       <div className="setting-description">
         <h3>
           {mark}

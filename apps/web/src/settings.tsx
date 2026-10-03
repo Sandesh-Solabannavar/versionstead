@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useLocation } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
   Download,
@@ -11,6 +11,8 @@ import {
   Link2,
   ExternalLink,
   FolderCog,
+  Search,
+  RotateCcw,
 } from "lucide-react";
 import { type ProviderKind } from "@versionstead/contracts/application";
 import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
@@ -50,15 +52,25 @@ import {
   timestamp,
 } from "./ui";
 import { attentionGroups } from "./monitoring-view";
+import { settingsSections, searchSettings } from "./settings-navigation";
+import { useWorkspaceChrome } from "./workspace-chrome";
+import { SettingsSearchTargets } from "./components/settings-controls";
+import { defaultAppearance, readThemeHalves } from "./appearance";
+import { AppLogo } from "./components/app-logo";
+import { toast } from "./components/ui/toast";
 
-const sections = [
-  { path: "/settings/general", label: "General", icon: Settings2 },
-  { path: "/settings/project", label: "Project", icon: FolderCog },
-  { path: "/settings/appearance", label: "Appearance", icon: Palette },
-  { path: "/settings/keybindings", label: "Keybindings", icon: Keyboard },
-  { path: "/settings/source-control", label: "Source Control", icon: GitBranch },
-  { path: "/settings/connections", label: "Connections", icon: Link2 },
-] as const;
+const sectionIcons = {
+  General: Settings2,
+  Project: FolderCog,
+  Appearance: Palette,
+  Keybindings: Keyboard,
+  "Source Control": GitBranch,
+  Connections: Link2,
+};
+const sections = settingsSections.map((section) => ({
+  ...section,
+  icon: sectionIcons[section.label],
+}));
 function scanIntervals(current: number) {
   return [...new Set([15, 60, 360, 720, 1440, current])]
     .sort((a, b) => a - b)
@@ -69,21 +81,157 @@ function scanIntervals(current: number) {
 }
 
 export function SettingsNavigation() {
+  const { back } = useWorkspaceChrome();
+  const { bindings } = useAppearance();
+  const navigate = useNavigate();
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const results = searchSettings(query);
+  const selected = Math.min(active, Math.max(0, results.length - 1));
+  const choose = (result: (typeof results)[number]) => {
+    setQuery("");
+    void navigate({ to: result.path, hash: result.target ?? "" });
+  };
   return (
     <>
-      <Link to="/" className="settings-back">
+      <Button variant="ghost" className="settings-back" onClick={back}>
         <ArrowLeft size={15} aria-hidden />
         Back to workspace
-      </Link>
-      <p className="nav-heading eyebrow">Settings</p>
-      <nav aria-label="Settings navigation">
-        {sections.map(({ path, label, icon: Icon }) => (
-          <Link key={path} to={path}>
-            <Icon size={16} aria-hidden />
-            {label}
-          </Link>
-        ))}
-      </nav>
+      </Button>
+      <div className="settings-search">
+        <Search size={14} aria-hidden />
+        <Input
+          id="settings-search"
+          type="search"
+          aria-label="Search settings"
+          placeholder="Search settings…"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded={query.trim().length > 0}
+          aria-controls="settings-search-results"
+          aria-activedescendant={results.length ? `settings-result-${selected}` : undefined}
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setActive(0);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && query) {
+              event.preventDefault();
+              event.stopPropagation();
+              setQuery("");
+            } else if ((event.key === "ArrowDown" || event.key === "ArrowUp") && results.length) {
+              event.preventDefault();
+              setActive(
+                (selected + (event.key === "ArrowDown" ? 1 : results.length - 1)) % results.length,
+              );
+            } else if (event.key === "Enter" && results[selected]) {
+              event.preventDefault();
+              choose(results[selected]);
+            }
+          }}
+        />
+        {!query && bindings.search === "/" && <kbd aria-hidden>/</kbd>}
+      </div>
+      {query.trim() ? (
+        <div
+          className="settings-search-results"
+          id="settings-search-results"
+          role="listbox"
+          aria-label="Matching settings"
+        >
+          {results.map((result, index) => (
+            <button
+              type="button"
+              key={result.id}
+              id={`settings-result-${index}`}
+              role="option"
+              aria-selected={index === selected}
+              onClick={() => choose(result)}
+            >
+              <span>{result.label}</span>
+              <small>{sections.find((section) => section.path === result.path)!.label}</small>
+            </button>
+          ))}
+          {!results.length && (
+            <p className="muted small" role="status">
+              No matching settings
+            </p>
+          )}
+        </div>
+      ) : (
+        <nav aria-label="Settings navigation">
+          {sections.map(({ path, label, icon: Icon }) => (
+            <Link key={path} to={path}>
+              <Icon size={16} aria-hidden />
+              {label}
+            </Link>
+          ))}
+        </nav>
+      )}
+    </>
+  );
+}
+export function RestoreDeviceDefaults() {
+  const [open, setOpen] = useState(false);
+  const {
+    theme,
+    compact,
+    reducedMotion,
+    bindings,
+    appearance,
+    themeHalves,
+    themes,
+    restoreDeviceDefaults,
+  } = useAppearance();
+  const { collapsed, setCollapsed } = useWorkspaceChrome();
+  const changed =
+    collapsed ||
+    theme !== "system" ||
+    compact ||
+    reducedMotion ||
+    JSON.stringify(appearance) !== JSON.stringify(defaultAppearance) ||
+    commands.some((command) => bindings[command.id] !== defaultBindings[command.id]) ||
+    JSON.stringify(themeHalves) !== JSON.stringify(readThemeHalves(null, themes));
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="compact"
+        className="restore-device-defaults"
+        aria-label="Restore device defaults"
+        disabled={!changed}
+        onClick={() => setOpen(true)}
+      >
+        <RotateCcw size={13} aria-hidden />
+        <span>Restore device defaults</span>
+      </Button>
+      {open && (
+        <Dialog
+          title="Restore device defaults?"
+          description="Reset appearance, keyboard shortcuts, and sidebar visibility on this device. Custom themes, monitoring schedules, projects, and connections are kept."
+          onClose={() => setOpen(false)}
+        >
+          <div className="dialog-actions">
+            <Button onClick={() => setOpen(false)}>Cancel</Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                restoreDeviceDefaults();
+                setCollapsed(false);
+                setOpen(false);
+                toast.add({
+                  id: "action-feedback",
+                  title: "Device defaults restored.",
+                  type: "success",
+                });
+              }}
+            >
+              Restore defaults
+            </Button>
+          </div>
+        </Dialog>
+      )}
     </>
   );
 }
@@ -674,40 +822,42 @@ function SourceControlSettings() {
 export function SettingsPage() {
   const path = useLocation({ select: (l) => l.pathname });
   const { snapshot, error, refresh } = useApplication();
-  const section = sections.find((s) => s.path === path) ?? sections[0];
+  const section = settingsSections.find((s) => s.path === path) ?? settingsSections[0];
   return (
-    <div className="settings-page">
-      <PageHeading title={section.label} description="Versionstead settings" />
-      {error && (
-        <div className="connection-banner warning" role="alert">
-          {error}
-          <Button
-            onClick={() => {
-              void refresh();
-            }}
-          >
-            Retry
-          </Button>
-        </div>
-      )}
-      {!snapshot ? (
-        <EmptyState title="Loading settings">
-          Connect to your local coordinator to read its preferences.
-        </EmptyState>
-      ) : path.endsWith("appearance") ? (
-        <AppearanceSettings />
-      ) : path.endsWith("keybindings") ? (
-        <KeybindingsSettings />
-      ) : path.endsWith("source-control") ? (
-        <SourceControlSettings />
-      ) : path.endsWith("connections") ? (
-        <ConnectionsSettings />
-      ) : path.endsWith("project") ? (
-        <ProjectSettings />
-      ) : (
-        <GeneralSettings />
-      )}
-    </div>
+    <SettingsSearchTargets>
+      <div className="settings-page">
+        <h1 className="sr-only">{section.label}</h1>
+        {error && (
+          <div className="connection-banner warning" role="alert">
+            {error}
+            <Button
+              onClick={() => {
+                void refresh();
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+        {!snapshot ? (
+          <EmptyState title="Loading settings">
+            Connect to your local coordinator to read its preferences.
+          </EmptyState>
+        ) : path.endsWith("appearance") ? (
+          <AppearanceSettings />
+        ) : path.endsWith("keybindings") ? (
+          <KeybindingsSettings />
+        ) : path.endsWith("source-control") ? (
+          <SourceControlSettings />
+        ) : path.endsWith("connections") ? (
+          <ConnectionsSettings />
+        ) : path.endsWith("project") ? (
+          <ProjectSettings />
+        ) : (
+          <GeneralSettings />
+        )}
+      </div>
+    </SettingsSearchTargets>
   );
 }
 
@@ -752,6 +902,10 @@ export function UtilityControls() {
       </div>
       {open && (
         <Dialog drawer title="Versionstead updates" onClose={() => setOpen(false)}>
+          <div className="app-identity">
+            <AppLogo />
+            <strong>Versionstead</strong>
+          </div>
           <p className="muted">Installed source build: {update?.currentVersion ?? "Unknown"}</p>
           <h3>
             {update?.status === "checking"

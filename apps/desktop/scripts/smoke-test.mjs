@@ -113,6 +113,14 @@ async function launch(capture = false) {
       result.trayClose &&
       result.trayReopen &&
       result.nativePauseResume &&
+      result.nativeTitleBar &&
+      result.nativeSettingsSearch &&
+      result.nativeSettingsBack &&
+      result.nativeDeviceDefaults &&
+      result.nativeWindowPreferences &&
+      result.nativeToasts &&
+      result.nativeClosedAccordions &&
+      result.nativeLogo &&
       result.nativeDialogEscape &&
       result.nativeDialogFocusReturn &&
       result.nativePcFilters &&
@@ -307,6 +315,14 @@ try {
       nativeProjectActions: true,
       nativeKeybindings: true,
       nativeUpdatePanel: true,
+      nativeTitleBar: true,
+      nativeSettingsSearch: true,
+      nativeSettingsBack: true,
+      nativeDeviceDefaults: true,
+      nativeWindowPreferences: true,
+      nativeToasts: true,
+      nativeClosedAccordions: true,
+      nativeLogo: true,
     }),
   );
 } finally {

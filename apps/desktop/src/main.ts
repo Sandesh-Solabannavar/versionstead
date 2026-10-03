@@ -5,10 +5,12 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   net,
   Notification,
   protocol,
   session,
+  screen,
   shell,
   Tray,
 } from "electron";
@@ -36,6 +38,18 @@ import {
   decodeGlobalToolUpdateRuns,
 } from "@versionstead/contracts/global-tool-updates";
 import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
+import {
+  decodeWindowTheme,
+  decodeWindowPreferences,
+  type WindowPreferences,
+} from "@versionstead/contracts/desktop";
+import {
+  defaultWindowPreferences,
+  initialWindowBounds,
+  loadWindowPreferences,
+  saveWindowPreferences,
+  titleBarOptions,
+} from "./window.js";
 
 const smoke = process.argv.includes("--smoke-test");
 let runtime: CoordinatorRuntime | null = null;
@@ -63,6 +77,44 @@ const globalToolUpdateRunner = new GlobalToolUpdateRunner({
 });
 let closingActions = false;
 let notificationRuntimePid: number | null = null;
+let windowPreferences: WindowPreferences = defaultWindowPreferences;
+let preferencesWrite: Promise<void> = Promise.resolve();
+let preferencesTimer: ReturnType<typeof setTimeout> | undefined;
+
+function captureWindowPreferences() {
+  if (!window || window.isDestroyed()) return;
+  try {
+    windowPreferences = decodeWindowPreferences({
+      ...windowPreferences,
+      bounds: window.getNormalBounds(),
+      maximized: window.isMaximized(),
+    });
+  } catch {
+    /* Ignore transient/undersized geometry, including the narrow smoke viewport. */
+  }
+}
+function persistWindowPreferences() {
+  const value = windowPreferences;
+  preferencesWrite = preferencesWrite
+    .catch(() => {})
+    .then(() => saveWindowPreferences(app.getPath("userData"), value));
+  return preferencesWrite;
+}
+function scheduleWindowPreferences() {
+  if (preferencesTimer) clearTimeout(preferencesTimer);
+  preferencesTimer = setTimeout(() => {
+    captureWindowPreferences();
+    void persistWindowPreferences().catch(() =>
+      console.error("Window preferences could not be saved."),
+    );
+  }, 250);
+}
+function syncWindowAppearance() {
+  if (!window || window.isDestroyed()) return;
+  window.setBackgroundColor(nativeTheme.shouldUseDarkColors ? "#0c0c0c" : "#f8f8fa");
+  const overlay = titleBarOptions(nativeTheme.shouldUseDarkColors).titleBarOverlay;
+  if (overlay && typeof overlay === "object") window.setTitleBarOverlay(overlay);
+}
 
 app.setName("Versionstead");
 app.setAppUserModelId("Versionstead.Desktop");
@@ -92,11 +144,16 @@ async function showWindow(path = "/") {
 
 async function createWindow() {
   window = new BrowserWindow({
-    width: 1280,
-    height: 860,
+    ...initialWindowBounds(
+      windowPreferences,
+      screen.getAllDisplays().map((display) => display.workArea),
+    ),
+    ...titleBarOptions(nativeTheme.shouldUseDarkColors),
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#0c0c0c" : "#f8f8fa",
     minWidth: 680,
     minHeight: 520,
     title: "Versionstead",
+    icon: trayIcon(),
     show: !smoke,
     autoHideMenuBar: true,
     webPreferences: {
@@ -107,6 +164,11 @@ async function createWindow() {
       preload: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
     },
   });
+  if (windowPreferences.maximized) window.maximize();
+  window.on("move", scheduleWindowPreferences);
+  window.on("resize", scheduleWindowPreferences);
+  window.on("maximize", scheduleWindowPreferences);
+  window.on("unmaximize", scheduleWindowPreferences);
   window.webContents.setWindowOpenHandler(({ url }) => {
     const destination = externalApplicationUrl(url);
     if (destination && window && trustedLocation(window.webContents.getURL())) {
@@ -144,9 +206,13 @@ function trayIcon() {
         y >= 9 &&
         y <= 23 &&
         (Math.abs(x - (9 + (y - 9) * 0.5)) < 2 || Math.abs(x - (23 - (y - 9) * 0.5)) < 2);
-      pixels[index] = letter ? 255 : 70;
-      pixels[index + 1] = letter ? 255 : 140;
-      pixels[index + 2] = letter ? 255 : 42;
+      const cornerX = x < 9 ? 9 - x : x > 22 ? x - 22 : 0;
+      const cornerY = y < 9 ? 9 - y : y > 22 ? y - 22 : 0;
+      if (cornerX * cornerX + cornerY * cornerY > 36) continue;
+      // Electron's native Windows bitmap uses BGRA byte order.
+      pixels[index] = letter ? 255 : 245;
+      pixels[index + 1] = letter ? 255 : 104;
+      pixels[index + 2] = letter ? 255 : 48;
       pixels[index + 3] = 255;
     }
   }
@@ -286,6 +352,8 @@ async function pollNotifications() {
     });
     notifications.set(summary.id, notification);
     notification.once("show", () => {
+      if (window && !window.isDestroyed() && trustedLocation(window.webContents.getURL()))
+        window.webContents.send("versionstead:notification-summary", summary);
       presented.add(summary.id);
       pendingReceipts.add(summary.id);
       if (presented.size > 200) presented.delete(presented.values().next().value!);
@@ -580,7 +648,7 @@ async function runSmoke() {
   const waitSettings = async (expression: string) => {
     if (!window) throw new Error("Smoke window unavailable");
     await window.webContents.executeJavaScript(
-      `new Promise((resolve,reject)=>{const deadline=Date.now()+20000;const check=()=>{if(${expression})resolve(true);else if(Date.now()>deadline)reject(new Error('Native settings did not become available: ' + ${JSON.stringify(expression)} + ' ' + JSON.stringify({alerts:[...document.querySelectorAll('[role="alert"]')].map(e=>e.textContent),projectName:document.querySelector('[aria-label="Project name"]')?.value,disabled:document.querySelector('[aria-label="Project name"]')?.disabled})));else setTimeout(check,100);};check();})`,
+      `new Promise((resolve,reject)=>{const deadline=Date.now()+20000;const check=()=>{if(${expression})resolve(true);else if(Date.now()>deadline)reject(new Error('Native settings did not become available: ' + ${JSON.stringify(expression)} + ' ' + JSON.stringify({alerts:[...document.querySelectorAll('[role="alert"]')].map(e=>e.textContent),projectName:document.querySelector('[aria-label="Project name"]')?.value,disabled:document.querySelector('[aria-label="Project name"]')?.disabled,active:document.activeElement?.id,collapsed:document.querySelector('.app-shell')?.dataset.sidebarCollapsed,key:window.__smokeKey})));else setTimeout(check,100);};check();})`,
     );
   };
   await clickButton("Add project");
@@ -593,6 +661,18 @@ async function runSmoke() {
   })()`);
   await waitSettings(
     "document.querySelector('input[aria-label=\"Local folder path\"]')===document.activeElement",
+  );
+  const missingProject = join(app.getPath("temp"), `versionstead-missing-project-${Date.now()}`);
+  await window.webContents.executeJavaScript(`(() => {
+    const input=document.querySelector('input[aria-label="Local folder path"]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(missingProject)});
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  })()`);
+  await window.webContents.executeJavaScript(
+    "document.querySelector('.local-project-form form').requestSubmit()",
+  );
+  await waitSettings(
+    "[...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].some(item=>item.textContent.includes('Versionstead needs attention')) && document.querySelector('.local-project-form [role=\"alert\"]')",
   );
   await window.webContents.executeJavaScript(
     `document.querySelector('.local-project-form > button').click()`,
@@ -680,6 +760,10 @@ async function runSmoke() {
     }, 100))`);
     if (projectGroups !== projects.length)
       throw new Error("All projects must retain selected folders");
+    const initiallyClosed = await window.webContents.executeJavaScript(
+      "[...document.querySelectorAll('[data-testid=\"project-disclosure\"]')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
+    );
+    if (!initiallyClosed) throw new Error("Project accordions must start closed");
     const wasOpen: unknown = await window.webContents.executeJavaScript(`(() => {
       const trigger = document.querySelector('[data-testid="project-disclosure"]');
       trigger.focus(); return trigger.getAttribute('aria-expanded') === 'true';
@@ -752,6 +836,7 @@ async function runSmoke() {
     if (!isAbsolute(screenshotDirectory))
       throw new Error("Smoke screenshot directory must be absolute");
     await mkdir(screenshotDirectory, { recursive: true });
+    await writeFile(join(screenshotDirectory, "app-icon.png"), trayIcon().toPNG());
     window.setContentSize(1440, 900);
     window.showInactive();
     for (const [name, path] of [
@@ -772,6 +857,12 @@ async function runSmoke() {
       })`);
       if (name === "projects" && projects.length > 0) {
         await clickButton("All projects");
+        await window.webContents.executeJavaScript(
+          "document.querySelector('[data-testid=\"project-disclosure\"]').click()",
+        );
+        await waitSettings(
+          "document.querySelector('[data-testid=\"project-disclosure\"]')?.getAttribute('aria-expanded')==='true'",
+        );
         if (projects[0]?.dependencies.length) await clickButton("All dependencies");
         await window.webContents.executeJavaScript(
           "new Promise(resolve => setTimeout(resolve, 250))",
@@ -1393,11 +1484,245 @@ async function runSmoke() {
     `document.querySelector('[aria-label="Scheduled scans"]').click();document.querySelector('[aria-label="Versionstead updates"]').click()`,
   );
   await waitSettings(
-    "document.querySelector('[role=\"dialog\"]')?.textContent.includes('Versionstead updates') && document.querySelector('[role=\"dialog\"]')?.textContent.includes('Check for updates')",
+    "document.querySelector('[data-slot=\"sheet-popup\"]')?.textContent.includes('Versionstead updates') && document.querySelector('[data-slot=\"sheet-popup\"]')?.textContent.includes('Check for updates')",
+  );
+  await waitSettings(
+    'document.querySelector(\'[data-slot="sheet-popup"] [data-slot="app-logo"]\')',
   );
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
-  await waitSettings("!document.querySelector('[role=\"dialog\"]')");
+  await waitSettings("!document.querySelector('[data-slot=\"sheet-popup\"]')");
+  // Exercise the shared title bar/settings shell in the real sandboxed renderer.
+  await window.loadURL("versionstead://app/pc");
+  await waitSettings(
+    "document.querySelector('[aria-label=\"Settings\"]') && document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  await window.webContents.executeJavaScript(
+    "document.querySelector('[aria-label=\"Settings\"]').click()",
+  );
+  await waitSettings(
+    "location.pathname==='/settings/general' && document.getElementById('settings-search')",
+  );
+  if (process.platform === "win32" || process.platform === "linux") {
+    const chrome = await window.webContents.executeJavaScript(`(() => {
+      const bar=document.querySelector('.app-titlebar');
+      const last=document.querySelector('.titlebar-trailing').getBoundingClientRect();
+      const area=navigator.windowControlsOverlay?.getTitlebarAreaRect();
+      return navigator.windowControlsOverlay?.visible && Math.round(bar.getBoundingClientRect().height)===40 && area && last.right<=area.x+area.width && getComputedStyle(bar).getPropertyValue('app-region')==='drag' && getComputedStyle(bar.querySelector('button')).getPropertyValue('app-region')==='no-drag';
+    })()`);
+    if (chrome !== true)
+      throw new Error("Native title bar geometry or draggable controls are incorrect");
+  }
+  const key = (keyCode: string) => {
+    window?.webContents.focus();
+    window?.webContents.sendInputEvent({ type: "keyDown", keyCode });
+    window?.webContents.sendInputEvent({ type: "keyUp", keyCode });
+  };
+  await clickButton("Hide sidebar");
+  key("/");
+  await waitSettings(
+    "document.activeElement?.id==='settings-search' && document.querySelector('.app-shell').dataset.sidebarCollapsed==='false'",
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    const input=document.getElementById('settings-search');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'appearance font');
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  })()`);
+  await waitSettings(
+    "document.querySelectorAll('#settings-search-results [role=\"option\"]').length===2",
+  );
+  if (screenshotDirectory)
+    await writeFile(
+      join(screenshotDirectory, "settings-search.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+  key("Down");
+  key("Enter");
+  await waitSettings(
+    "location.pathname==='/settings/appearance' && document.activeElement?.id==='setting-monospace-font'",
+  );
+  key("Escape");
+  await waitSettings("location.pathname==='/pc'");
+  await window.webContents.executeJavaScript(
+    "document.querySelector('[aria-label=\"Settings\"]').click()",
+  );
+  await waitSettings(
+    "location.pathname==='/settings/general' && document.getElementById('settings-search')",
+  );
+  await window.webContents.executeJavaScript(`(() => {
+    const input=document.getElementById('settings-search');input.focus();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'contrast');
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+  })()`);
+  await waitSettings("document.querySelector('#settings-search-results [role=\"option\"]')");
+  key("Escape");
+  await waitSettings(
+    "document.getElementById('settings-search').value==='' && location.pathname==='/settings/general'",
+  );
+  await window.webContents.executeJavaScript(
+    "document.getElementById('content').focus();document.querySelector('a[href=\"/settings/appearance\"]').click()",
+  );
+  await waitSettings("document.querySelector('[aria-label=\"Dark theme\"]')");
+  await clickButton("Dark theme");
+  await waitSettings("document.documentElement.dataset.theme==='dark'");
+  for (let i = 0; i < 50 && nativeTheme.themeSource !== "dark"; i++)
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  if (nativeTheme.themeSource !== "dark")
+    throw new Error("Appearance did not update the native theme");
+  await window.webContents.executeJavaScript(
+    "document.querySelector('a[href=\"/settings/general\"]').click()",
+  );
+  await clickButton("Restore device defaults");
+  await waitSettings(
+    "document.querySelector('dialog[open]')?.textContent.includes('Restore device defaults?')",
+  );
+  key("Escape");
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && location.pathname==='/settings/general' && document.documentElement.dataset.theme==='dark'",
+  );
+  const settingsBeforeReset = (await readyCoordinator())?.snapshot.settings;
+  await clickButton("Restore device defaults");
+  if (screenshotDirectory)
+    await writeFile(
+      join(screenshotDirectory, "restore-device-defaults.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+  await clickButton("Restore defaults");
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && document.documentElement.dataset.theme==='system' && document.querySelector('[aria-label=\"Restore device defaults\"]').disabled",
+  );
+  if (screenshotDirectory)
+    await writeFile(
+      join(screenshotDirectory, "settings-general.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+  if (
+    JSON.stringify((await readyCoordinator())?.snapshot.settings) !==
+    JSON.stringify(settingsBeforeReset)
+  )
+    throw new Error("Device reset changed monitoring settings");
+  const invalidTheme = await window.webContents.executeJavaScript(
+    "window.versionstead.setWindowTheme({theme:'dark'}).then(()=>false,()=>true)",
+  );
+  if (invalidTheme !== true) throw new Error("Window appearance IPC accepted invalid input");
+  captureWindowPreferences();
+  await persistWindowPreferences();
+  const persistedWindow = await loadWindowPreferences(app.getPath("userData"));
+  if (!persistedWindow.bounds || persistedWindow.theme !== "system")
+    throw new Error("Window preferences were not persisted");
+  console.log("Desktop smoke: checking notification logo and dismissal");
+  await waitSettings(
+    "[...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].some(item=>item.textContent.includes('Device defaults restored.'))",
+  );
+  const logo = await window.webContents.executeJavaScript(
+    "document.querySelector('.app-titlebar [data-slot=\"app-logo\"]') && fetch(document.querySelector('link[rel=\"icon\"]').href).then(response=>response.ok && response.headers.get('content-type')==='image/svg+xml' && response.text()).then(source=>typeof source==='string' && source.includes('viewBox=\"0 0 32 32\"'))",
+  );
+  if (logo !== true) throw new Error("App header logo or favicon is unavailable");
+  const nativeIconColor = await window.webContents.executeJavaScript(`new Promise(resolve => {
+    const icon=new Image();icon.onload=()=>{
+      const canvas=document.createElement('canvas');canvas.width=32;canvas.height=32;
+      const context=canvas.getContext('2d');context.drawImage(icon,0,0);
+      const rgba=context.getImageData(16,6,1,1).data;
+      resolve(rgba[0]===48 && rgba[1]===104 && rgba[2]===245 && rgba[3]===255);
+    };icon.onerror=()=>resolve(false);icon.src=${JSON.stringify(trayIcon().toDataURL())};
+  })`);
+  if (nativeIconColor !== true) throw new Error("Native app icon does not match the blue V mark");
+  await window.webContents.executeJavaScript(
+    "[...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].find(item=>item.textContent.includes('Device defaults restored.')).querySelector('[data-slot=\"toast-close\"]').focus()",
+  );
+  window.webContents.focus();
+  key("Escape");
+  await waitSettings(
+    "location.pathname==='/settings/general' && ![...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].some(item=>item.textContent.includes('Device defaults restored.'))",
+  );
+  await window.webContents.executeJavaScript(
+    "document.querySelectorAll('[data-slot=\"toast-close\"]').forEach(button=>button.click())",
+  );
+  const summary = {
+    id: `smoke-toast-${Date.now()}`,
+    updateCount: 3,
+    newUpdateCount: 3,
+    projectCount: 1,
+    pcCount: 0,
+    advisoryCount: 0,
+    newAdvisoryCount: 0,
+    title: "3 updates available",
+    body: "Verification summary: 3 new updates across 1 project.",
+    filter: "updates",
+  };
+  console.log("Desktop smoke: checking validated notification summary");
+  window.webContents.send("versionstead:notification-summary", { ...summary, filter: "invalid" });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const invalidSummaryShown = await window.webContents.executeJavaScript(
+    `document.querySelector('[data-slot="toast-viewport"]')?.textContent.includes(${JSON.stringify(summary.body)})`,
+  );
+  if (invalidSummaryShown) throw new Error("An invalid native notification was displayed");
+  window.webContents.send("versionstead:notification-summary", summary);
+  const summarySelector = `[...document.querySelectorAll('[data-slot="toast"]:not([data-ending-style])')].filter(item=>item.textContent.includes(${JSON.stringify(summary.body)}))`;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  if (await window.webContents.executeJavaScript(`${summarySelector}.length>0`))
+    throw new Error("Disabled finding notifications still displayed a summary");
+  await window.webContents.executeJavaScript(
+    "document.querySelector('[aria-label=\"Notify about new findings\"]').click()",
+  );
+  await waitSettings(
+    "document.querySelector('[aria-label=\"Notify about new findings\"]')?.getAttribute('aria-checked')==='true' && !document.querySelector('[aria-label=\"Notify about new findings\"]').disabled",
+  );
+  window.webContents.send("versionstead:notification-summary", summary);
+  await waitSettings(`${summarySelector}.length===1`);
+  console.log("Desktop smoke: checking notification keyboard focus");
+  window.webContents.send("versionstead:notification-summary", summary);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitSettings(`${summarySelector}.length===1`);
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
+  window.webContents.focus();
+  key("F6");
+  await waitSettings(
+    "document.querySelector('[data-slot=\"toast-viewport\"]')?.contains(document.activeElement)",
+  );
+  key("Escape");
+  await waitSettings(`location.pathname==='/settings/general' && ${summarySelector}.length===1`);
+  if (screenshotDirectory) {
+    window.setMinimumSize(320, 500);
+    window.setContentSize(390, 900);
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    const contained = await window.webContents.executeJavaScript(`(() => {
+      const rect=${summarySelector}[0].getBoundingClientRect();
+      return rect.left>=0 && rect.right<=innerWidth && document.documentElement.scrollWidth<=innerWidth;
+    })()`);
+    if (!contained) throw new Error("Toast escapes a narrow window");
+    await writeFile(
+      join(screenshotDirectory, "notification-narrow.png"),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
+    );
+    window.setContentSize(1440, 900);
+  }
+  await window.webContents.executeJavaScript(
+    `${summarySelector}[0].querySelector('[data-slot="toast-action"]').click()`,
+  );
+  console.log("Desktop smoke: checking notification Review destination");
+  await waitSettings(
+    "location.pathname==='/' && location.search==='?filter=updates' && [...document.querySelectorAll('.tabs button')].some(button=>button.textContent.includes('Updates') && button.getAttribute('aria-pressed')==='true')",
+  );
+  await clickButton("All findings");
+  const attentionClosed = await window.webContents.executeJavaScript(
+    "[...document.querySelectorAll('.target-group-trigger')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
+  );
+  if (!attentionClosed) throw new Error("Needs attention accordions must start closed");
+  await window.loadURL("versionstead://app/settings/general");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  window.webContents.send("versionstead:notification-summary", summary);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  if (await window.webContents.executeJavaScript(`${summarySelector}.length>0`))
+    throw new Error("Reload replayed an already-reviewed notification");
+  await window.webContents.executeJavaScript(
+    "document.querySelector('[aria-label=\"Notify about new findings\"]').click()",
+  );
+  await waitSettings(
+    "document.querySelector('[aria-label=\"Notify about new findings\"]')?.getAttribute('aria-checked')==='false' && !document.querySelector('[aria-label=\"Notify about new findings\"]').disabled",
+  );
   console.log(
     JSON.stringify({
       ...(result as Record<string, unknown>),
@@ -1423,6 +1748,14 @@ async function runSmoke() {
       nativeProjectActions: true,
       nativeKeybindings: true,
       nativeUpdatePanel: true,
+      nativeTitleBar: true,
+      nativeSettingsSearch: true,
+      nativeSettingsBack: true,
+      nativeDeviceDefaults: true,
+      nativeWindowPreferences: true,
+      nativeToasts: true,
+      nativeClosedAccordions: true,
+      nativeLogo: true,
     }),
   );
   app.quit();
@@ -1451,14 +1784,20 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.on("window-all-closed", () => {});
   app.on("before-quit", (event) => {
-    if (projectActionRunner.active || globalToolUpdateRunner.active) {
+    if (!closingActions) {
       event.preventDefault();
-      if (!closingActions) {
-        closingActions = true;
-        void Promise.all([projectActionRunner.close(), globalToolUpdateRunner.close()])
-          .then(() => app.quit())
-          .catch(fail);
-      }
+      closingActions = true;
+      if (preferencesTimer) clearTimeout(preferencesTimer);
+      captureWindowPreferences();
+      void Promise.all([
+        projectActionRunner.close(),
+        globalToolUpdateRunner.close(),
+        persistWindowPreferences().catch(() =>
+          console.error("Window preferences could not be saved."),
+        ),
+      ])
+        .then(() => app.quit())
+        .catch(fail);
       return;
     }
     quitting = true;
@@ -1469,6 +1808,9 @@ if (!app.requestSingleInstanceLock()) {
   void app
     .whenReady()
     .then(async () => {
+      windowPreferences = await loadWindowPreferences(app.getPath("userData"));
+      nativeTheme.themeSource = windowPreferences.theme;
+      nativeTheme.on("updated", syncWindowAppearance);
       if (smoke) console.log("Desktop smoke: native ready");
       session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
         callback(false),
@@ -1499,8 +1841,16 @@ if (!app.requestSingleInstanceLock()) {
           event.senderFrame !== window.webContents.mainFrame ||
           !trustedLocation(event.senderFrame.url)
         )
-          throw new Error("Unauthorized project action request");
+          throw new Error("Unauthorized desktop request");
       };
+      ipcMain.handle("versionstead:window-theme", async (event, input: unknown) => {
+        assertActionSender(event);
+        const theme = decodeWindowTheme(input);
+        nativeTheme.themeSource = theme;
+        windowPreferences = { ...windowPreferences, theme };
+        syncWindowAppearance();
+        await persistWindowPreferences();
+      });
       for (const operation of ["start", "command"] as const)
         ipcMain.handle(
           `versionstead:global-tool-update-${operation}`,

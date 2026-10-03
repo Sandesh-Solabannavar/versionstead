@@ -686,6 +686,7 @@ export function ConnectionsSettings() {
               <SettingRow
                 key={client.id}
                 label={client.label}
+                searchable={false}
                 description={`Paired ${timestamp(client.createdAt)}`}
               >
                 <Button
