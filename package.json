@@ -16,12 +16,19 @@
     "lint": "vp lint",
     "fmt": "vp fmt",
     "fmt:check": "vp fmt --check",
-    "check": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test"
+    "check": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test",
+    "test:e2e": "e2e run"
   },
   "devDependencies": {
+    "@ai-sdk/openai": "^4.0.0",
+    "@ai-sdk/openai-compatible": "^3.0.0",
+    "@e2e-dev/web": "^0.13.0",
     "@types/node": "24.19.1",
+    "ai": "^7.0.0",
+    "e2e": "^0.18.0",
     "typescript": "7.0.2",
-    "vite-plus": "1.0.0"
+    "vite-plus": "1.0.0",
+    "zod": "^4.1.8"
   },
   "engines": {
     "node": ">=24.13.1 <25"
