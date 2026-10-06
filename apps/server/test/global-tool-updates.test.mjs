@@ -1,20 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  mkdtemp,
-  mkdir,
-  realpath,
-  rm,
-  readFile,
-  writeFile,
-  symlink,
-} from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, readFile, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import {
-  toolDirectories,
-  toolExecutable,
-} from "../dist/adapters/tool-paths.js";
+import { toolDirectories, toolExecutable } from "../dist/adapters/tool-paths.js";
 import { readGlobalInstallation } from "../dist/adapters/inventory.js";
 import {
   resolveGlobalToolUpdate,
@@ -23,15 +12,8 @@ import {
 } from "../dist/adapters/global-tool-updates.js";
 import { decodeGlobalToolUpdateRequest } from "@versionstead/contracts/global-tool-updates";
 
-async function fixture(
-  t,
-  manager = "npm",
-  alias = "@scope/tool",
-  name = alias,
-) {
-  const base = await realpath(
-    await mkdtemp(join(tmpdir(), "versionstead-updates-")),
-  );
+async function fixture(t, manager = "npm", alias = "@scope/tool", name = alias) {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "versionstead-updates-")));
   t.after(() => rm(base, { recursive: true, force: true }));
   const root = join(
     base,
@@ -65,11 +47,7 @@ async function fixture(
     ...(await readGlobalInstallation(
       source,
       alias,
-      manager === "bun"
-        ? alias === name
-          ? "1.0.0"
-          : `npm:${name}@1.0.0`
-        : null,
+      manager === "bun" ? (alias === name ? "1.0.0" : `npm:${name}@1.0.0`) : null,
     )),
     availableVersion: "2.0.0",
     updateStatus: "available",
@@ -179,10 +157,7 @@ test("Bun update pins the global directory and preserves aliases in executable a
   ]);
   assert(plan.command.includes("BUN_INSTALL_GLOBAL_DIR="));
   assert(plan.command.includes(dirname(f.root)));
-  await writeFile(
-    f.manifest,
-    JSON.stringify({ name: "@scope/tool", version: "2.0.0" }),
-  );
+  await writeFile(f.manifest, JSON.stringify({ name: "@scope/tool", version: "2.0.0" }));
   await verifyGlobalToolUpdate(plan, f.item);
 });
 
@@ -206,10 +181,7 @@ test("Bun refuses a missing exact global manifest or declaration before resolvin
     /global dependency manifest is missing/,
   );
   await writeFile(globalManifest, JSON.stringify({ dependencies: {} }));
-  await assert.rejects(
-    resolveGlobalToolUpdate(f.item, undefined, options),
-    /no longer declared/,
-  );
+  await assert.rejects(resolveGlobalToolUpdate(f.item, undefined, options), /no longer declared/);
   assert.equal(resolved, 0);
   assert.equal(await readFile(parent, "utf8"), contents);
 });
@@ -226,9 +198,7 @@ test("update refuses stale versions, roots, private sources, prereleases and mal
     { origin: "local" },
     { updateStatus: "unknown" },
   ])
-    await assert.rejects(
-      resolveGlobalToolUpdate({ ...f.item, ...changes }, undefined, f.options),
-    );
+    await assert.rejects(resolveGlobalToolUpdate({ ...f.item, ...changes }, undefined, f.options));
   for (const changes of [
     { registry: "unsupported" },
     { blockedScopes: ["@scope"] },
@@ -240,14 +210,8 @@ test("update refuses stale versions, roots, private sources, prereleases and mal
         discover: async () => [{ ...f.source, ...changes }],
       }),
     );
-  await writeFile(
-    f.manifest,
-    JSON.stringify({ name: f.item.name, version: "1.1.0" }),
-  );
-  await assert.rejects(
-    resolveGlobalToolUpdate(f.item, undefined, f.options),
-    /changed/,
-  );
+  await writeFile(f.manifest, JSON.stringify({ name: f.item.name, version: "1.1.0" }));
+  await assert.rejects(resolveGlobalToolUpdate(f.item, undefined, f.options), /changed/);
   for (const targetVersion of ["latest", "2.0.0;echo", "2.0.0-beta.1"])
     assert.throws(() =>
       decodeGlobalToolUpdateRequest({
@@ -261,23 +225,11 @@ test("update refuses stale versions, roots, private sources, prereleases and mal
 test("update verification requires the requested identity/version, not just a successful exit", async (t) => {
   const f = await fixture(t);
   const plan = await resolveGlobalToolUpdate(f.item, undefined, f.options);
-  await assert.rejects(
-    verifyGlobalToolUpdate(plan, f.item),
-    /could not be verified/,
-  );
-  await writeFile(
-    f.manifest,
-    JSON.stringify({ name: f.item.name, version: "2.0.0" }),
-  );
+  await assert.rejects(verifyGlobalToolUpdate(plan, f.item), /could not be verified/);
+  await writeFile(f.manifest, JSON.stringify({ name: f.item.name, version: "2.0.0" }));
   await verifyGlobalToolUpdate(plan, f.item);
-  await writeFile(
-    f.manifest,
-    JSON.stringify({ name: "different", version: "2.0.0" }),
-  );
-  await assert.rejects(
-    verifyGlobalToolUpdate(plan, f.item),
-    /could not be verified/,
-  );
+  await writeFile(f.manifest, JSON.stringify({ name: "different", version: "2.0.0" }));
+  await assert.rejects(verifyGlobalToolUpdate(plan, f.item), /could not be verified/);
 });
 
 test("installed package symlinks outside the observed root cannot become update targets", async (t) => {
@@ -289,15 +241,8 @@ test("installed package symlinks outside the observed root cannot become update 
     JSON.stringify({ name: "tool", version: "1.0.0" }),
   );
   await rm(join(f.root, "tool"), { recursive: true });
-  await symlink(
-    external,
-    join(f.root, "tool"),
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  await assert.rejects(
-    resolveGlobalToolUpdate(f.item, undefined, f.options),
-    /symlink escapes/,
-  );
+  await symlink(external, join(f.root, "tool"), process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(resolveGlobalToolUpdate(f.item, undefined, f.options), /symlink escapes/);
 });
 
 test("manual update subprocesses have sanitized failures, cancellation, output and runtime bounds", async (t) => {
@@ -315,15 +260,11 @@ test("manual update subprocesses have sanitized failures, cancellation, output a
     executeGlobalToolUpdate(
       {
         ...plan,
-        args: [
-          "-e",
-          "process.stderr.write('EPERM secret credential'); process.exit(1)",
-        ],
+        args: ["-e", "process.stderr.write('EPERM secret credential'); process.exit(1)"],
       },
       new AbortController().signal,
     ),
-    (error) =>
-      /not writable/.test(error.message) && !error.message.includes("secret"),
+    (error) => /not writable/.test(error.message) && !error.message.includes("secret"),
   );
   await assert.rejects(
     executeGlobalToolUpdate(
@@ -337,10 +278,7 @@ test("manual update subprocesses have sanitized failures, cancellation, output a
     executeGlobalToolUpdate(
       {
         ...plan,
-        args: [
-          "-e",
-          "process.stdout.write('x'.repeat(2*1024*1024)); setInterval(()=>{}, 1000)",
-        ],
+        args: ["-e", "process.stdout.write('x'.repeat(2*1024*1024)); setInterval(()=>{}, 1000)"],
       },
       new AbortController().signal,
     ),

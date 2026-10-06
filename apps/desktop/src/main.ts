@@ -37,10 +37,7 @@ import {
   decodeGlobalToolUpdateRun,
   decodeGlobalToolUpdateRuns,
 } from "@versionstead/contracts/global-tool-updates";
-import {
-  GlobalToolUpdateRunner,
-  globalToolUpdateDependencies,
-} from "./global-tool-updates.js";
+import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
 import {
   decodeWindowTheme,
   decodeWindowPreferences,
@@ -114,20 +111,14 @@ function scheduleWindowPreferences() {
 }
 function syncWindowAppearance() {
   if (!window || window.isDestroyed()) return;
-  window.setBackgroundColor(
-    nativeTheme.shouldUseDarkColors ? "#0c0c0c" : "#f8f8fa",
-  );
-  const overlay = titleBarOptions(
-    nativeTheme.shouldUseDarkColors,
-  ).titleBarOverlay;
-  if (overlay && typeof overlay === "object")
-    window.setTitleBarOverlay(overlay);
+  window.setBackgroundColor(nativeTheme.shouldUseDarkColors ? "#0c0c0c" : "#f8f8fa");
+  const overlay = titleBarOptions(nativeTheme.shouldUseDarkColors).titleBarOverlay;
+  if (overlay && typeof overlay === "object") window.setTitleBarOverlay(overlay);
 }
 
 app.setName("Versionstead");
 app.setAppUserModelId("Versionstead.Desktop");
-if (process.env.VERSIONSTEAD_USER_DATA)
-  app.setPath("userData", process.env.VERSIONSTEAD_USER_DATA);
+if (process.env.VERSIONSTEAD_USER_DATA) app.setPath("userData", process.env.VERSIONSTEAD_USER_DATA);
 app.enableSandbox();
 protocol.registerSchemesAsPrivileged([
   {
@@ -217,8 +208,7 @@ function trayIcon() {
       const letter =
         y >= 9 &&
         y <= 23 &&
-        (Math.abs(x - (9 + (y - 9) * 0.5)) < 2 ||
-          Math.abs(x - (23 - (y - 9) * 0.5)) < 2);
+        (Math.abs(x - (9 + (y - 9) * 0.5)) < 2 || Math.abs(x - (23 - (y - 9) * 0.5)) < 2);
       const cornerX = x < 9 ? 9 - x : x > 22 ? x - 22 : 0;
       const cornerY = y < 9 ? 9 - y : y > 22 ? y - 22 : 0;
       if (cornerX * cornerX + cornerY * cornerY > 36) continue;
@@ -234,8 +224,7 @@ function trayIcon() {
 
 async function updateTray() {
   const connected = await readyCoordinator();
-  if (connected)
-    await projectActionRunner.reconcile(connected.snapshot.projects);
+  if (connected) await projectActionRunner.reconcile(connected.snapshot.projects);
   runtime = connected?.runtime ?? null;
   const paused = connected?.snapshot.settings.paused ?? false;
   tray?.setToolTip(
@@ -351,12 +340,10 @@ async function pollNotifications() {
       notifications.clear();
       notificationRuntimePid = connected.runtime.pid;
     }
-    for (const id of pendingReceipts)
-      await acknowledgeSummary(connected.runtime, id);
+    for (const id of pendingReceipts) await acknowledgeSummary(connected.runtime, id);
     if (!connected.snapshot.settings.notifyNewFindings) return;
     const summary = connected.snapshot.notificationSummary;
-    if (!summary || presented.has(summary.id) || notifications.has(summary.id))
-      return;
+    if (!summary || presented.has(summary.id) || notifications.has(summary.id)) return;
     notifications.clear();
     const notification = new Notification({
       id: "versionstead-summary",
@@ -368,16 +355,11 @@ async function pollNotifications() {
     });
     notifications.set(summary.id, notification);
     notification.once("show", () => {
-      if (
-        window &&
-        !window.isDestroyed() &&
-        trustedLocation(window.webContents.getURL())
-      )
+      if (window && !window.isDestroyed() && trustedLocation(window.webContents.getURL()))
         window.webContents.send("versionstead:notification-summary", summary);
       presented.add(summary.id);
       pendingReceipts.add(summary.id);
-      if (presented.size > 200)
-        presented.delete(presented.values().next().value!);
+      if (presented.size > 200) presented.delete(presented.values().next().value!);
       void acknowledgeSummary(connected.runtime, summary.id).catch(() => {});
     });
     notification.once("failed", () => notifications.delete(summary.id));
@@ -394,14 +376,10 @@ async function pollNotifications() {
 }
 
 async function acknowledgeSummary(coordinator: CoordinatorRuntime, id: string) {
-  const response = await coordinatorRequest(
-    coordinator,
-    "/api/notifications/summary/ack",
-    {
-      method: "POST",
-      body: JSON.stringify({ summaryId: id }),
-    },
-  );
+  const response = await coordinatorRequest(coordinator, "/api/notifications/summary/ack", {
+    method: "POST",
+    body: JSON.stringify({ summaryId: id }),
+  });
   if (!response.ok) {
     // A resolved summary or restarted coordinator no longer needs a retry.
     if (response.status === 400) pendingReceipts.delete(id);
@@ -431,19 +409,15 @@ async function runSmoke() {
     .executeJavaScript(`fetch('/api/settings', {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false })
   }).then(response => response.ok)`);
-  if (rendererWrite !== true)
-    throw new Error("Authenticated renderer mutation failed");
+  if (rendererWrite !== true) throw new Error("Authenticated renderer mutation failed");
   const currentBuild: unknown = await window.webContents.executeJavaScript(
     "!document.body.textContent.includes('Monitoring is running an older build')",
   );
   if (currentBuild !== true)
-    throw new Error(
-      "The current coordinator must not display a legacy-build warning",
-    );
+    throw new Error("The current coordinator must not display a legacy-build warning");
   const clickButton = async (label: string, click = true) => {
     if (!window) throw new Error("Smoke window unavailable");
-    await window.webContents
-      .executeJavaScript(`new Promise((resolve, reject) => {
+    await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const deadline = Date.now() + 15000;
       const check = () => {
         const button = [...document.querySelectorAll('button')].find(button => (button.textContent?.includes(${JSON.stringify(label)}) || button.getAttribute('aria-label')===${JSON.stringify(label)}) && !button.disabled);
@@ -456,8 +430,7 @@ async function runSmoke() {
   const initialPc = (await readyCoordinator())?.snapshot.inventory;
   const selectOption = async (label: string, option: string) => {
     if (!window) throw new Error("Smoke window unavailable");
-    await window.webContents
-      .executeJavaScript(`new Promise((resolve, reject) => {
+    await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const trigger = document.querySelector('button[aria-label=' + ${JSON.stringify(JSON.stringify(label))} + ']');
       if (!trigger) return reject(new Error('Native select unavailable'));
       trigger.click();
@@ -484,12 +457,10 @@ async function runSmoke() {
     const empty: unknown = await window.webContents.executeJavaScript(`(() => {
       return document.body.textContent.includes('Scan this PC to check your global tools') && !document.querySelector('tbody tr') && !document.body.textContent.includes('Not checked');
     })()`);
-    if (empty !== true)
-      throw new Error("First PC view must invite an explicit scan");
+    if (empty !== true) throw new Error("First PC view must invite an explicit scan");
     await clickButton("Scan this PC");
   } else {
-    const defaultFilter: unknown = await window.webContents
-      .executeJavaScript(`(() => {
+    const defaultFilter: unknown = await window.webContents.executeJavaScript(`(() => {
       const filter = document.querySelector('button[aria-label="Global tool update filter"]');
       return { filter: filter?.textContent.trim(), rows: document.querySelectorAll('tbody tr').length };
     })()`);
@@ -497,9 +468,7 @@ async function runSmoke() {
     if (
       defaults.filter !== "Updates available" ||
       defaults.rows !==
-        initialPc?.installations.filter(
-          (item) => item.updateStatus === "available",
-        ).length
+        initialPc?.installations.filter((item) => item.updateStatus === "available").length
     )
       throw new Error("This PC must default to confirmed update rows");
     await selectOption("Global tool update filter", "All global tools");
@@ -516,8 +485,7 @@ async function runSmoke() {
       }
     });
     await selectOption("Global package manager", "Bun");
-    const managerState: unknown = await window.webContents
-      .executeJavaScript(`(() => {
+    const managerState: unknown = await window.webContents.executeJavaScript(`(() => {
       const managers = document.querySelector('section[aria-label="Global package managers"]');
       return { managerCards: managers?.querySelectorAll('h2').length, rows: document.querySelectorAll('tbody tr').length, text: managers?.textContent };
     })()`);
@@ -528,12 +496,9 @@ async function runSmoke() {
     };
     if (
       managerView.managerCards !== initialPc.managers?.length ||
-      managerView.rows !==
-        initialPc.installations.filter((item) => item.manager === "bun").length
+      managerView.rows !== initialPc.installations.filter((item) => item.manager === "bun").length
     )
-      throw new Error(
-        "Native manager status and Bun filter must reflect actual inventory",
-      );
+      throw new Error("Native manager status and Bun filter must reflect actual inventory");
     for (const manager of initialPc.managers ?? []) {
       const label =
         manager.status === "detected"
@@ -542,9 +507,7 @@ async function runSmoke() {
             ? "Not installed"
             : "Unavailable";
       if (!managerView.text.includes(label))
-        throw new Error(
-          "Native package manager detection must show its actual state",
-        );
+        throw new Error("Native package manager detection must show its actual state");
     }
     await selectOption("Global package manager", "npm and Bun");
     await selectOption("Global tool update filter", "Updates available");
@@ -567,12 +530,9 @@ async function runSmoke() {
   };
   if (
     !meter.label ||
-    (meter.value !== null &&
-      (!meter.max || Number(meter.value) > Number(meter.max)))
+    (meter.value !== null && (!meter.max || Number(meter.value) > Number(meter.max)))
   )
-    throw new Error(
-      "Scan progress must be labeled and use bounded real counts",
-    );
+    throw new Error("Scan progress must be labeled and use bounded real counts");
   if (process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT) {
     // Only the smoke harness's two disposable roots may be updated by this test.
     const base = await realpath(process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT);
@@ -583,9 +543,7 @@ async function runSmoke() {
         if (
           connected &&
           connected.snapshot.inventory.evidence.status !== "scanning" &&
-          !connected.snapshot.scanProgress?.queued.some(
-            (target) => target.kind === "pc",
-          )
+          !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
         )
           return connected;
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -595,16 +553,9 @@ async function runSmoke() {
     await waitForPc();
     for (const manager of ["npm", "bun"] as const) {
       const connected = await readyCoordinator();
-      const source = connected?.snapshot.inventory.managers?.find(
-        (s) => s.manager === manager,
-      );
+      const source = connected?.snapshot.inventory.managers?.find((s) => s.manager === manager);
       const path = source?.root ? relative(base, source.root) : "..";
-      if (
-        !path ||
-        path === ".." ||
-        path.startsWith(`..${sep}`) ||
-        isAbsolute(path)
-      )
+      if (!path || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path))
         throw new Error(
           `Live ${manager} update fixture is outside its disposable directory or unavailable (${source?.status}, root present: ${Boolean(source?.root)}): ${source?.error ?? "no source error"}`,
         );
@@ -618,10 +569,7 @@ async function runSmoke() {
       }
       await window.loadURL("versionstead://app/pc");
       await clickButton("Update now semver", false);
-      await selectOption(
-        "Global package manager",
-        manager === "npm" ? "npm" : "Bun",
-      );
+      await selectOption("Global package manager", manager === "npm" ? "npm" : "Bun");
       await clickButton("Update now semver");
       const deadline = Date.now() + 30000;
       let succeeded = false;
@@ -630,9 +578,7 @@ async function runSmoke() {
           .read()
           .find((r) => r.rootId === item.rootId && r.name === item.name);
         if (run?.status === "failed")
-          throw new Error(
-            `Live ${manager} fixture update failed: ${run.message}`,
-          );
+          throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
         if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
           succeeded = true;
           break;
@@ -644,16 +590,12 @@ async function runSmoke() {
       const updated = refreshed.snapshot.inventory.installations.find(
         (i) => i.name === "semver" && i.manager === manager,
       );
-      if (
-        updated?.version !== item.availableVersion ||
-        updated.updateStatus !== "current"
-      )
+      if (updated?.version !== item.availableVersion || updated.updateStatus !== "current")
         throw new Error("The update did not refresh installed PC evidence");
       const staleRejected: unknown = await window.webContents.executeJavaScript(
         `window.versionstead.updateGlobalTool(${JSON.stringify({ installationId: item.id, expectedVersion: item.version, targetVersion: item.availableVersion })}).then(() => false, () => true)`,
       );
-      if (staleRejected !== true)
-        throw new Error("A stale native update request was accepted");
+      if (staleRejected !== true) throw new Error("A stale native update request was accepted");
       console.log(
         `Desktop smoke: native ${manager} Update now installed and verified ${item.availableVersion} in a disposable root`,
       );
@@ -670,8 +612,7 @@ async function runSmoke() {
       else setTimeout(check, 100);
     }; check();
   })`);
-  if (notificationFilter !== true)
-    throw new Error("Summary click route must filter updates");
+  if (notificationFilter !== true) throw new Error("Summary click route must filter updates");
   await window.loadURL("versionstead://app/service");
   for (const [label, paused] of [
     ["Pause schedules", true],
@@ -688,10 +629,7 @@ async function runSmoke() {
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    if (!changed)
-      throw new Error(
-        "Native schedule action did not update coordinator state",
-      );
+    if (!changed) throw new Error("Native schedule action did not update coordinator state");
     await clickButton(paused ? "Resume schedules" : "Pause schedules", false);
   }
   await window.loadURL("versionstead://app/projects");
@@ -703,8 +641,7 @@ async function runSmoke() {
     const rect = dialog?.getBoundingClientRect();
     resolve(Boolean(rect && Math.abs(rect.x + rect.width / 2 - innerWidth / 2) <= 1 && Math.abs(rect.y + rect.height / 2 - innerHeight / 2) <= 1));
   }, 100))`);
-  if (centered !== true)
-    throw new Error("Native Add Project dialog is not centered");
+  if (centered !== true) throw new Error("Native Add Project dialog is not centered");
   window.webContents.focus();
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
@@ -736,10 +673,7 @@ async function runSmoke() {
   await waitSettings(
     "document.querySelector('input[aria-label=\"Local folder path\"]')===document.activeElement",
   );
-  const missingProject = join(
-    app.getPath("temp"),
-    `versionstead-missing-project-${Date.now()}`,
-  );
+  const missingProject = join(app.getPath("temp"), `versionstead-missing-project-${Date.now()}`);
   await window.webContents.executeJavaScript(`(() => {
     const input=document.querySelector('input[aria-label="Local folder path"]');
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,${JSON.stringify(missingProject)});
@@ -773,19 +707,14 @@ async function runSmoke() {
   );
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
-  await waitSettings(
-    "document.querySelector('dialog[open] .project-source-picker')",
-  );
+  await waitSettings("document.querySelector('dialog[open] .project-source-picker')");
   await window.webContents.executeJavaScript(
     `document.querySelector('[aria-label="Set up GitHub"]').click()`,
   );
   await waitSettings(
     "document.querySelector('h1')?.textContent==='Source Control' && !document.querySelector('dialog[open]')",
   );
-  const setAppearanceMode = async (
-    mode: "light" | "dark",
-    destination: string,
-  ) => {
+  const setAppearanceMode = async (mode: "light" | "dark", destination: string) => {
     if (!window) throw new Error("Smoke window unavailable");
     await window.loadURL("versionstead://app/settings/appearance");
     await waitSettings(
@@ -800,18 +729,14 @@ async function runSmoke() {
       "document.querySelector('[data-testid=\"connection-state\"]')?.getAttribute('data-state')==='online'",
     );
   };
-  const sidebarAppearanceAbsent: unknown =
-    await window.webContents.executeJavaScript(
-      "!document.querySelector('.sidebar-footer .theme-control') && !document.querySelector('.sidebar-footer [aria-label=\"Appearance\"]') && !document.querySelector('.sidebar-footer .theme-button')",
-    );
+  const sidebarAppearanceAbsent: unknown = await window.webContents.executeJavaScript(
+    "!document.querySelector('.sidebar-footer .theme-control') && !document.querySelector('.sidebar-footer [aria-label=\"Appearance\"]') && !document.querySelector('.sidebar-footer .theme-button')",
+  );
   if (sidebarAppearanceAbsent !== true)
     throw new Error("Appearance controls must live in Settings only");
   await window.loadURL("versionstead://app/settings/appearance");
-  await waitSettings(
-    "document.querySelectorAll('.appearance-mode-card').length===3",
-  );
-  const themeSpacing: unknown = await window.webContents
-    .executeJavaScript(`(() => {
+  await waitSettings("document.querySelectorAll('.appearance-mode-card').length===3");
+  const themeSpacing: unknown = await window.webContents.executeJavaScript(`(() => {
     const buttons = [...document.querySelectorAll('.appearance-mode-card')];
     const rects = buttons.map(button => button.getBoundingClientRect());
     return buttons.length === 3 && rects.every(rect => rect.width >= 36 && rect.height >= 36) && rects.slice(1).every((rect, index) => rect.x - rects[index].right >= 8);
@@ -849,10 +774,8 @@ async function runSmoke() {
     const initiallyClosed = await window.webContents.executeJavaScript(
       "[...document.querySelectorAll('[data-testid=\"project-disclosure\"]')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
     );
-    if (!initiallyClosed)
-      throw new Error("Project accordions must start closed");
-    const wasOpen: unknown = await window.webContents
-      .executeJavaScript(`(() => {
+    if (!initiallyClosed) throw new Error("Project accordions must start closed");
+    const wasOpen: unknown = await window.webContents.executeJavaScript(`(() => {
       const trigger = document.querySelector('[data-testid="project-disclosure"]');
       trigger.focus(); return trigger.getAttribute('aria-expanded') === 'true';
     })()`);
@@ -869,9 +792,7 @@ async function runSmoke() {
       const focus: unknown = await window.webContents.executeJavaScript(
         "({ documentFocused: document.hasFocus(), disclosureFocused: document.activeElement?.getAttribute('data-testid') === 'project-disclosure' })",
       );
-      throw new Error(
-        `Enter must toggle project disclosure (${JSON.stringify(focus)})`,
-      );
+      throw new Error(`Enter must toggle project disclosure (${JSON.stringify(focus)})`);
     }
     if (!toggled) {
       window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Enter" });
@@ -886,9 +807,7 @@ async function runSmoke() {
         resolve(document.querySelector('[data-testid="project-group"]').querySelectorAll('tbody tr').length);
       }, 250))`);
       if (rows !== firstProject.dependencies.length)
-        throw new Error(
-          "All dependencies must expose retained dependency records",
-        );
+        throw new Error("All dependencies must expose retained dependency records");
       await window.webContents.executeJavaScript(`(() => {
         const trigger = document.querySelector('.project-detail .item-label');
         trigger.focus(); trigger.click();
@@ -898,23 +817,20 @@ async function runSmoke() {
         const popup = document.querySelector('[data-slot="sheet-popup"][role="dialog"]');
         resolve(Boolean(popup?.contains(document.activeElement)));
       }, 250))`);
-      if (sheetFocus !== true)
-        throw new Error("Evidence Sheet must receive focus");
+      if (sheetFocus !== true) throw new Error("Evidence Sheet must receive focus");
       window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Tab" });
       window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Tab" });
       const focusTrapped: unknown = await window.webContents.executeJavaScript(
         "document.querySelector('[data-slot=\"sheet-popup\"]').contains(document.activeElement)",
       );
-      if (focusTrapped !== true)
-        throw new Error("Evidence Sheet must contain keyboard focus");
+      if (focusTrapped !== true) throw new Error("Evidence Sheet must contain keyboard focus");
       window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
       window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
       const sheetClosed: unknown = await window.webContents
         .executeJavaScript(`new Promise(resolve => setTimeout(() => {
         resolve(!document.querySelector('[data-slot="sheet-popup"]') && document.activeElement?.classList.contains('item-label'));
       }, 300))`);
-      if (sheetClosed !== true)
-        throw new Error("Evidence Sheet Escape must restore package focus");
+      if (sheetClosed !== true) throw new Error("Evidence Sheet Escape must restore package focus");
       nativeEvidenceSheet = true;
     }
     nativeGroupedProjects = true;
@@ -925,17 +841,13 @@ async function runSmoke() {
   await showWindow();
   if (!window.isVisible()) throw new Error("Tray reopen failed");
   window.hide();
-  if (!(await readyCoordinator()))
-    throw new Error("Coordinator stopped when the UI hid");
+  if (!(await readyCoordinator())) throw new Error("Coordinator stopped when the UI hid");
   const screenshotDirectory = process.env.VERSIONSTEAD_SMOKE_SCREENSHOT_DIR;
   if (screenshotDirectory) {
     if (!isAbsolute(screenshotDirectory))
       throw new Error("Smoke screenshot directory must be absolute");
     await mkdir(screenshotDirectory, { recursive: true });
-    await writeFile(
-      join(screenshotDirectory, "app-icon.png"),
-      trayIcon().toPNG(),
-    );
+    await writeFile(join(screenshotDirectory, "app-icon.png"), trayIcon().toPNG());
     window.setContentSize(1440, 900);
     window.showInactive();
     for (const [name, path] of [
@@ -945,8 +857,7 @@ async function runSmoke() {
       ["service", "/service"],
     ]) {
       await window.loadURL(`versionstead://app${path}`);
-      await window.webContents
-        .executeJavaScript(`new Promise((resolve, reject) => {
+      await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
         const deadline = Date.now() + 20000;
         const check = () => {
           if (document.querySelector('[data-testid="connection-state"]')?.getAttribute('data-state') === 'online') {
@@ -963,17 +874,14 @@ async function runSmoke() {
         await waitSettings(
           "document.querySelector('[data-testid=\"project-disclosure\"]')?.getAttribute('aria-expanded')==='true'",
         );
-        if (projects[0]?.dependencies.length)
-          await clickButton("All dependencies");
+        if (projects[0]?.dependencies.length) await clickButton("All dependencies");
         await window.webContents.executeJavaScript(
           "new Promise(resolve => setTimeout(resolve, 250))",
         );
       }
       await writeFile(
         join(screenshotDirectory, `${name}.png`),
-        (
-          await window.webContents.capturePage(undefined, { stayHidden: true })
-        ).toPNG(),
+        (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
       );
       if (name === "projects") {
         for (const width of [1440, 390]) {
@@ -982,8 +890,7 @@ async function runSmoke() {
           await window.webContents.executeJavaScript(
             "new Promise(resolve => setTimeout(resolve, 250))",
           );
-          const dimensions: unknown = await window.webContents
-            .executeJavaScript(`(() => {
+          const dimensions: unknown = await window.webContents.executeJavaScript(`(() => {
             const wrapper = document.querySelector('.project-detail .table-wrap');
             const row = wrapper?.querySelector('tbody tr');
             return { wrapperWidth: wrapper?.clientWidth ?? null, tableWidth: wrapper?.querySelector('table')?.getBoundingClientRect().width ?? null, columns: row ? [...row.cells].map(cell => cell.getBoundingClientRect().width) : [], pageWidth: document.documentElement.scrollWidth, viewport: innerWidth };
@@ -994,9 +901,7 @@ async function runSmoke() {
             columns: number[];
           };
           if (sizes.pageWidth > sizes.viewport || (sizes.columns[0] ?? 0) > 320)
-            throw new Error(
-              "Project table escapes its horizontal scroll container",
-            );
+            throw new Error("Project table escapes its horizontal scroll container");
           console.log(JSON.stringify({ nativeProjectTable: dimensions }));
           if (width === 390)
             await writeFile(
@@ -1022,8 +927,7 @@ async function runSmoke() {
       }
     }
     await window.loadURL("versionstead://app/projects");
-    await window.webContents
-      .executeJavaScript(`new Promise((resolve, reject) => {
+    await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const deadline = Date.now() + 20000;
       const check = () => {
         const button = [...document.querySelectorAll('button')].find(button => button.textContent?.includes('Add project') && !button.disabled);
@@ -1034,9 +938,7 @@ async function runSmoke() {
     })`);
     await writeFile(
       join(screenshotDirectory, "add-project.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
   }
   for (const [path, title] of [
@@ -1054,10 +956,7 @@ async function runSmoke() {
       await waitSettings(
         "document.querySelectorAll('.source-control-row').length===7 && document.querySelectorAll('.source-control-mark svg').length===7",
       );
-      for (const label of [
-        "Automatically scan repositories",
-        "Enable Git context",
-      ]) {
+      for (const label of ["Automatically scan repositories", "Enable Git context"]) {
         const original = await window.webContents.executeJavaScript(`(() => {
           const control=document.querySelector('[aria-label="${label}"]');
           if(control.disabled)return null;
@@ -1125,13 +1024,9 @@ async function runSmoke() {
       );
       if (screenshotDirectory) {
         await setAppearanceMode("dark", "settings/source-control");
-        await waitSettings(
-          "document.querySelectorAll('.source-control-row').length===7",
-        );
+        await waitSettings("document.querySelectorAll('.source-control-row').length===7");
         window.setContentSize(1280, 1040);
-        await window.webContents.executeJavaScript(
-          "new Promise(resolve=>setTimeout(resolve,150))",
-        );
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
         await writeFile(
           join(screenshotDirectory, "source-control-dark.png"),
           (
@@ -1149,9 +1044,7 @@ async function runSmoke() {
       );
       window.setMinimumSize(320, 500);
       window.setContentSize(390, 900);
-      await window.webContents.executeJavaScript(
-        "new Promise(resolve=>setTimeout(resolve,150))",
-      );
+      await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
       const contained = await window.webContents.executeJavaScript(
         `document.documentElement.scrollWidth<=innerWidth && [...document.querySelectorAll('.source-control-summary')].every(row=>row.scrollWidth<=row.clientWidth)`,
       );
@@ -1160,8 +1053,7 @@ async function runSmoke() {
           `({viewport:innerWidth,page:document.documentElement.scrollWidth,rows:[...document.querySelectorAll('.source-control-summary')].map(row=>({name:row.querySelector('h3')?.textContent,width:row.clientWidth,scroll:row.scrollWidth})),wide:[...document.querySelectorAll('body *')].filter(e=>e.getBoundingClientRect().right>innerWidth+1).slice(0,12).map(e=>({tag:e.tagName,class:e.className,width:e.getBoundingClientRect().width}))})`,
         );
         throw new Error(
-          "Source Control details escape the narrow window: " +
-            JSON.stringify(dimensions),
+          "Source Control details escape the narrow window: " + JSON.stringify(dimensions),
         );
       }
       if (screenshotDirectory)
@@ -1175,9 +1067,7 @@ async function runSmoke() {
         );
       window.setContentSize(1440, 900);
       if (screenshotDirectory) {
-        await window.webContents.executeJavaScript(
-          "new Promise(resolve=>setTimeout(resolve,150))",
-        );
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
         await writeFile(
           join(screenshotDirectory, "source-control-details.png"),
           (
@@ -1187,14 +1077,11 @@ async function runSmoke() {
           ).toPNG(),
         );
         await setAppearanceMode("light", "settings/source-control");
-        await waitSettings(
-          "document.querySelectorAll('.source-control-row').length===7",
-        );
+        await waitSettings("document.querySelectorAll('.source-control-row').length===7");
       }
     }
     if (path === "connections") {
-      if (screenshotDirectory)
-        await setAppearanceMode("dark", "settings/connections");
+      if (screenshotDirectory) await setAppearanceMode("dark", "settings/connections");
       await window.webContents.executeJavaScript(
         "document.querySelector('[aria-label=\"Enable network access\"]').click()",
       );
@@ -1214,9 +1101,7 @@ async function runSmoke() {
         if (visible) item.click(); return visible;
       })()`);
       if (!networkOption)
-        throw new Error(
-          "Network address options must be clickable above the native dialog",
-        );
+        throw new Error("Network address options must be clickable above the native dialog");
       await clickButton("Cancel");
       await waitSettings("!document.querySelector('dialog[open]')");
       await waitSettings(
@@ -1284,28 +1169,20 @@ async function runSmoke() {
       await waitSettings("!document.querySelector('dialog[open]')");
       window.setContentSize(560, 720);
       await clickButton("Add environment");
-      await waitSettings(
-        "document.querySelector('dialog[open] .connection-mode-grid')",
-      );
+      await waitSettings("document.querySelector('dialog[open] .connection-mode-grid')");
       const contained = await window.webContents.executeJavaScript(`(() => {
         const dialog = document.querySelector('dialog[open]');
         const bounds = dialog.getBoundingClientRect();
         return dialog.scrollWidth <= dialog.clientWidth + 2 && bounds.left >= 0 && bounds.right <= innerWidth;
       })()`);
-      if (contained !== true)
-        throw new Error("Connections dialog escapes a narrow window");
+      if (contained !== true) throw new Error("Connections dialog escapes a narrow window");
       await clickButton("Close dialog");
       window.setContentSize(1280, 800);
     }
-    if (
-      screenshotDirectory &&
-      (path === "source-control" || path === "connections")
-    )
+    if (screenshotDirectory && (path === "source-control" || path === "connections"))
       await writeFile(
         join(screenshotDirectory, `settings-${path}.png`),
-        (
-          await window.webContents.capturePage(undefined, { stayHidden: true })
-        ).toPNG(),
+        (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
       );
   }
   await window.loadURL("versionstead://app/settings/project");
@@ -1314,14 +1191,9 @@ async function runSmoke() {
   );
   if (projects.length > 0) {
     const project = projects.find((p) => !p.repository);
-    if (!project)
-      throw new Error(
-        "Project settings smoke needs the selected local checkout",
-      );
+    if (!project) throw new Error("Project settings smoke needs the selected local checkout");
     const selectedProject = async () =>
-      (await readyCoordinator())?.snapshot.projects.find(
-        (p) => p.id === project.id,
-      );
+      (await readyCoordinator())?.snapshot.projects.find((p) => p.id === project.id);
     const fillProjectField = async (selector: string, value: string) => {
       if (!window) throw new Error("Smoke window unavailable");
       await window.webContents.executeJavaScript(`(() => {
@@ -1335,9 +1207,7 @@ async function runSmoke() {
     // Hidden smoke windows need an explicit focusout; native blur may not dispatch it.
     const captureProject = async (name: string) => {
       if (screenshotDirectory && window) {
-        await window.webContents.executeJavaScript(
-          "new Promise(resolve=>setTimeout(resolve,150))",
-        );
+        await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
         await writeFile(
           join(screenshotDirectory, name),
           (
@@ -1351,10 +1221,7 @@ async function runSmoke() {
     await waitSettings(
       "document.querySelector('[aria-label=\"Project name\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
     );
-    await fillProjectField(
-      '[aria-label="Project name"]',
-      "  Native project settings  ",
-    );
+    await fillProjectField('[aria-label="Project name"]', "  Native project settings  ");
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Project name\"]').dispatchEvent(new FocusEvent('focusout',{bubbles:true}))",
     );
@@ -1397,17 +1264,9 @@ async function runSmoke() {
       "!document.querySelector('[aria-label=\"Reset project icon\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
     );
     await clickButton("Add action");
-    await waitSettings(
-      "document.querySelector('dialog[open] h2')?.textContent==='Add Action'",
-    );
-    await fillProjectField(
-      'dialog[open] input[placeholder="Test"]',
-      "Native action",
-    );
-    await fillProjectField(
-      "dialog[open] textarea",
-      "Write-Output 'native-action-ok'",
-    );
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Add Action'");
+    await fillProjectField('dialog[open] input[placeholder="Test"]', "Native action");
+    await fillProjectField("dialog[open] textarea", "Write-Output 'native-action-ok'");
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Action keybinding\"]').dispatchEvent(new KeyboardEvent('keydown',{key:'t',ctrlKey:true,altKey:true,bubbles:true}))",
     );
@@ -1422,9 +1281,7 @@ async function runSmoke() {
       selectedAction.shortcut !== "mod+alt+t" ||
       projectActionRunner.latest(project.id, selectedAction.id)
     )
-      throw new Error(
-        "Saving an action must persist its shortcut without running it",
-      );
+      throw new Error("Saving an action must persist its shortcut without running it");
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Project name\"]').blur();window.dispatchEvent(new KeyboardEvent('keydown',{key:'t',ctrlKey:true,altKey:true,bubbles:true}))",
     );
@@ -1451,9 +1308,7 @@ async function runSmoke() {
       "!document.querySelector('dialog[open]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
     );
     await clickButton("Run Native action");
-    await waitSettings(
-      "document.querySelector('dialog[open] h2')?.textContent==='Native action'",
-    );
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Native action'");
     await clickButton("Run again");
     await waitSettings(
       "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='running'",
@@ -1465,9 +1320,7 @@ async function runSmoke() {
     await clickButton("Close dialog");
     await waitSettings("!document.querySelector('dialog[open]')");
     await clickButton("Run Native action");
-    await waitSettings(
-      "document.querySelector('dialog[open] h2')?.textContent==='Native action'",
-    );
+    await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Native action'");
     await clickButton("Run again");
     await waitSettings(
       "document.querySelector('dialog[open] [role=\"status\"]')?.textContent==='running'",
@@ -1485,10 +1338,7 @@ async function runSmoke() {
     );
     if ((await selectedProject())?.actions?.length !== 0)
       throw new Error("Confirmed action deletion must persist");
-    if (
-      projectActionRunner.latest(project.id, selectedAction.id)?.status !==
-      "stopped"
-    )
+    if (projectActionRunner.latest(project.id, selectedAction.id)?.status !== "stopped")
       throw new Error("Deleting an active action must stop its command");
     await clickButton("Remove project");
     await waitSettings(
@@ -1496,8 +1346,7 @@ async function runSmoke() {
     );
     await clickButton("Cancel");
     await waitSettings("!document.querySelector('dialog[open]')");
-    if (!(await selectedProject()))
-      throw new Error("Cancel must retain the selected project");
+    if (!(await selectedProject())) throw new Error("Cancel must retain the selected project");
     await fillProjectField('[aria-label="Project name"]', project.name);
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Project name\"]').dispatchEvent(new FocusEvent('focusout',{bubbles:true}))",
@@ -1505,18 +1354,12 @@ async function runSmoke() {
     await waitSettings(
       `document.querySelector('[aria-label="Project name"]').value===${JSON.stringify(project.name)} && !document.querySelector('[aria-label="Project name"]').disabled`,
     );
-    await window.webContents.executeJavaScript(
-      "document.querySelector('main').scrollTop=0",
-    );
+    await window.webContents.executeJavaScript("document.querySelector('main').scrollTop=0");
     await captureProject("settings-project.png");
     window.setMinimumSize(320, 500);
     window.setContentSize(390, 900);
-    await window.webContents.executeJavaScript(
-      "new Promise(resolve=>setTimeout(resolve,150))",
-    );
-    await window.webContents.executeJavaScript(
-      "document.querySelector('main').scrollTop=0",
-    );
+    await window.webContents.executeJavaScript("new Promise(resolve=>setTimeout(resolve,150))");
+    await window.webContents.executeJavaScript("document.querySelector('main').scrollTop=0");
     if (
       !(await window.webContents.executeJavaScript(
         "document.documentElement.scrollWidth<=innerWidth",
@@ -1526,8 +1369,7 @@ async function runSmoke() {
     await captureProject("settings-project-narrow.png");
     window.setContentSize(1280, 800);
   }
-  if (screenshotDirectory)
-    await setAppearanceMode("light", "settings/appearance");
+  if (screenshotDirectory) await setAppearanceMode("light", "settings/appearance");
   await window.loadURL("versionstead://app/settings/appearance");
   await waitSettings("document.querySelector('[aria-label=\"Compact rows\"]')");
   await window.webContents.executeJavaScript(
@@ -1574,9 +1416,7 @@ async function runSmoke() {
     `document.documentElement.style.fontSize==='18px' && document.documentElement.style.getPropertyValue('--interface-font').includes('Segoe UI') && document.documentElement.style.getPropertyValue('--monospace-font').includes('Consolas') && document.documentElement.style.getPropertyValue('--table-font-size')==='16px' && JSON.parse(localStorage.getItem('versionstead.appearance')).monospaceFontSize===16 && JSON.parse(localStorage.getItem('versionstead.appearance')).evidenceFontSize===18`,
   );
   await clickButton("Create theme");
-  await waitSettings(
-    `document.querySelector('dialog[open] [aria-label="Theme name"]')`,
-  );
+  await waitSettings(`document.querySelector('dialog[open] [aria-label="Theme name"]')`);
   await window.webContents.executeJavaScript(`(() => {
     const input=document.querySelector('[aria-label="Theme name"]');
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'Native smoke theme');
@@ -1615,18 +1455,14 @@ async function runSmoke() {
     );
     await writeFile(
       join(screenshotDirectory, "appearance-dark.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
     await window.webContents.executeJavaScript(
       `document.querySelector('.typography-font-group').scrollIntoView();new Promise(resolve=>setTimeout(resolve,150))`,
     );
     await writeFile(
       join(screenshotDirectory, "appearance-typography.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
     window.setMinimumSize(320, 500);
     window.setContentSize(390, 900);
@@ -1636,13 +1472,10 @@ async function runSmoke() {
     const contained: unknown = await window.webContents.executeJavaScript(
       "document.documentElement.scrollWidth<=innerWidth",
     );
-    if (contained !== true)
-      throw new Error("Appearance page escapes a narrow window");
+    if (contained !== true) throw new Error("Appearance page escapes a narrow window");
     await writeFile(
       join(screenshotDirectory, "appearance-narrow.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
     window.setContentSize(1440, 900);
   }
@@ -1683,9 +1516,7 @@ async function runSmoke() {
     "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+alt+k'",
   );
   await clickButton("Reset all shortcuts");
-  await window.webContents.executeJavaScript(
-    "document.getElementById('content').focus()",
-  );
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
   window.webContents.sendInputEvent({
     type: "keyDown",
     keyCode: ",",
@@ -1739,9 +1570,7 @@ async function runSmoke() {
       return navigator.windowControlsOverlay?.visible && Math.round(bar.getBoundingClientRect().height)===40 && area && last.right<=area.x+area.width && getComputedStyle(bar).getPropertyValue('app-region')==='drag' && getComputedStyle(bar.querySelector('button')).getPropertyValue('app-region')==='no-drag';
     })()`);
     if (chrome !== true)
-      throw new Error(
-        "Native title bar geometry or draggable controls are incorrect",
-      );
+      throw new Error("Native title bar geometry or draggable controls are incorrect");
   }
   const key = (keyCode: string) => {
     window?.webContents.focus();
@@ -1764,9 +1593,7 @@ async function runSmoke() {
   if (screenshotDirectory)
     await writeFile(
       join(screenshotDirectory, "settings-search.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
   key("Down");
   key("Enter");
@@ -1786,9 +1613,7 @@ async function runSmoke() {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'contrast');
     input.dispatchEvent(new Event('input',{bubbles:true}));
   })()`);
-  await waitSettings(
-    "document.querySelector('#settings-search-results [role=\"option\"]')",
-  );
+  await waitSettings("document.querySelector('#settings-search-results [role=\"option\"]')");
   key("Escape");
   await waitSettings(
     "document.getElementById('settings-search').value==='' && location.pathname==='/settings/general'",
@@ -1819,9 +1644,7 @@ async function runSmoke() {
   if (screenshotDirectory)
     await writeFile(
       join(screenshotDirectory, "restore-device-defaults.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
   await clickButton("Restore defaults");
   await waitSettings(
@@ -1830,9 +1653,7 @@ async function runSmoke() {
   if (screenshotDirectory)
     await writeFile(
       join(screenshotDirectory, "settings-general.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
   if (
     JSON.stringify((await readyCoordinator())?.snapshot.settings) !==
@@ -1842,8 +1663,7 @@ async function runSmoke() {
   const invalidTheme = await window.webContents.executeJavaScript(
     "window.versionstead.setWindowTheme({theme:'dark'}).then(()=>false,()=>true)",
   );
-  if (invalidTheme !== true)
-    throw new Error("Window appearance IPC accepted invalid input");
+  if (invalidTheme !== true) throw new Error("Window appearance IPC accepted invalid input");
   captureWindowPreferences();
   await persistWindowPreferences();
   const persistedWindow = await loadWindowPreferences(app.getPath("userData"));
@@ -1856,10 +1676,8 @@ async function runSmoke() {
   const logo = await window.webContents.executeJavaScript(
     "document.querySelector('.app-titlebar [data-slot=\"app-logo\"]') && fetch(document.querySelector('link[rel=\"icon\"]').href).then(response=>response.ok && response.headers.get('content-type')==='image/svg+xml' && response.text()).then(source=>typeof source==='string' && source.includes('viewBox=\"0 0 32 32\"'))",
   );
-  if (logo !== true)
-    throw new Error("App header logo or favicon is unavailable");
-  const nativeIconColor = await window.webContents
-    .executeJavaScript(`new Promise(resolve => {
+  if (logo !== true) throw new Error("App header logo or favicon is unavailable");
+  const nativeIconColor = await window.webContents.executeJavaScript(`new Promise(resolve => {
     const icon=new Image();icon.onload=()=>{
       const canvas=document.createElement('canvas');canvas.width=32;canvas.height=32;
       const context=canvas.getContext('2d');context.drawImage(icon,0,0);
@@ -1867,8 +1685,7 @@ async function runSmoke() {
       resolve(rgba[0]===48 && rgba[1]===104 && rgba[2]===245 && rgba[3]===255);
     };icon.onerror=()=>resolve(false);icon.src=${JSON.stringify(trayIcon().toDataURL())};
   })`);
-  if (nativeIconColor !== true)
-    throw new Error("Native app icon does not match the blue V mark");
+  if (nativeIconColor !== true) throw new Error("Native app icon does not match the blue V mark");
   await window.webContents.executeJavaScript(
     "[...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].find(item=>item.textContent.includes('Device defaults restored.')).querySelector('[data-slot=\"toast-close\"]').focus()",
   );
@@ -1901,8 +1718,7 @@ async function runSmoke() {
   const invalidSummaryShown = await window.webContents.executeJavaScript(
     `document.querySelector('[data-slot="toast-viewport"]')?.textContent.includes(${JSON.stringify(summary.body)})`,
   );
-  if (invalidSummaryShown)
-    throw new Error("An invalid native notification was displayed");
+  if (invalidSummaryShown) throw new Error("An invalid native notification was displayed");
   window.webContents.send("versionstead:notification-summary", summary);
   const summarySelector = `[...document.querySelectorAll('[data-slot="toast"]:not([data-ending-style])')].filter(item=>item.textContent.includes(${JSON.stringify(summary.body)}))`;
   await new Promise((resolve) => setTimeout(resolve, 150));
@@ -1920,18 +1736,14 @@ async function runSmoke() {
   window.webContents.send("versionstead:notification-summary", summary);
   await new Promise((resolve) => setTimeout(resolve, 150));
   await waitSettings(`${summarySelector}.length===1`);
-  await window.webContents.executeJavaScript(
-    "document.getElementById('content').focus()",
-  );
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
   window.webContents.focus();
   key("F6");
   await waitSettings(
     "document.querySelector('[data-slot=\"toast-viewport\"]')?.contains(document.activeElement)",
   );
   key("Escape");
-  await waitSettings(
-    `location.pathname==='/settings/general' && ${summarySelector}.length===1`,
-  );
+  await waitSettings(`location.pathname==='/settings/general' && ${summarySelector}.length===1`);
   if (screenshotDirectory) {
     window.setMinimumSize(320, 500);
     window.setContentSize(390, 900);
@@ -1943,9 +1755,7 @@ async function runSmoke() {
     if (!contained) throw new Error("Toast escapes a narrow window");
     await writeFile(
       join(screenshotDirectory, "notification-narrow.png"),
-      (
-        await window.webContents.capturePage(undefined, { stayHidden: true })
-      ).toPNG(),
+      (await window.webContents.capturePage(undefined, { stayHidden: true })).toPNG(),
     );
     window.setContentSize(1440, 900);
   }
@@ -1960,8 +1770,7 @@ async function runSmoke() {
   const attentionClosed = await window.webContents.executeJavaScript(
     "[...document.querySelectorAll('.target-group-trigger')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
   );
-  if (!attentionClosed)
-    throw new Error("Needs attention accordions must start closed");
+  if (!attentionClosed) throw new Error("Needs attention accordions must start closed");
   await window.loadURL("versionstead://app/settings/general");
   await waitSettings(
     "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
@@ -2065,8 +1874,8 @@ if (!app.requestSingleInstanceLock()) {
       nativeTheme.themeSource = windowPreferences.theme;
       nativeTheme.on("updated", syncWindowAppearance);
       if (smoke) console.log("Desktop smoke: native ready");
-      session.defaultSession.setPermissionRequestHandler(
-        (_webContents, _permission, callback) => callback(false),
+      session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
+        callback(false),
       );
       session.defaultSession.setPermissionCheckHandler(() => false);
       ipcMain.handle("versionstead:select-project-directory", async (event) => {
@@ -2096,17 +1905,14 @@ if (!app.requestSingleInstanceLock()) {
         )
           throw new Error("Unauthorized desktop request");
       };
-      ipcMain.handle(
-        "versionstead:window-theme",
-        async (event, input: unknown) => {
-          assertActionSender(event);
-          const theme = decodeWindowTheme(input);
-          nativeTheme.themeSource = theme;
-          windowPreferences = { ...windowPreferences, theme };
-          syncWindowAppearance();
-          await persistWindowPreferences();
-        },
-      );
+      ipcMain.handle("versionstead:window-theme", async (event, input: unknown) => {
+        assertActionSender(event);
+        const theme = decodeWindowTheme(input);
+        nativeTheme.themeSource = theme;
+        windowPreferences = { ...windowPreferences, theme };
+        syncWindowAppearance();
+        await persistWindowPreferences();
+      });
       for (const operation of ["start", "command"] as const)
         ipcMain.handle(
           `versionstead:global-tool-update-${operation}`,
@@ -2125,26 +1931,18 @@ if (!app.requestSingleInstanceLock()) {
               item.availableVersion !== request.targetVersion ||
               item.updateStatus !== "available"
             )
-              throw new Error(
-                "This update changed. Scan this PC and review the current version.",
-              );
+              throw new Error("This update changed. Scan this PC and review the current version.");
             if (
               inventory?.evidence.status === "scanning" ||
               connected.snapshot.scanProgress?.active?.kind === "pc" ||
-              connected.snapshot.scanProgress?.queued.some(
-                (target) => target.kind === "pc",
-              )
+              connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
             )
-              throw new Error(
-                "Wait for the PC scan to finish before updating.",
-              );
+              throw new Error("Wait for the PC scan to finish before updating.");
             if (
               inventory?.evidence.status === "failed" ||
               inventory?.updateEvidence?.status === "failed"
             )
-              throw new Error(
-                "Scan this PC successfully before updating a previous result.",
-              );
+              throw new Error("Scan this PC successfully before updating a previous result.");
             return operation === "command"
               ? (await globalToolUpdateDependencies.resolve(item)).command
               : decodeGlobalToolUpdateRun(globalToolUpdateRunner.start(item));
@@ -2154,68 +1952,43 @@ if (!app.requestSingleInstanceLock()) {
         assertActionSender(event);
         return decodeGlobalToolUpdateRuns(globalToolUpdateRunner.read());
       });
-      ipcMain.handle(
-        "versionstead:run-project-action",
-        async (event, input: unknown) => {
-          assertActionSender(event);
-          let request;
-          try {
-            request = decodeRunActionRequest(input);
-          } catch {
-            throw new Error("Invalid project action request.");
-          }
-          const { projectId, actionId, expectedCommand } = request;
-          const connected = await readyCoordinator();
-          const project = connected?.snapshot.projects.find(
-            (p) => p.id === projectId,
-          );
-          if (!project)
-            throw new Error(
-              "This selected project is unavailable. Refresh and retry.",
-            );
-          if (
-            project.actions?.find((a) => a.id === actionId)?.command !==
-            expectedCommand
-          )
-            throw new Error(
-              "This command changed. Refresh and review it before running.",
-            );
-          return decodeActionRun(
-            await projectActionRunner.start(project, actionId),
-          );
-        },
-      );
+      ipcMain.handle("versionstead:run-project-action", async (event, input: unknown) => {
+        assertActionSender(event);
+        let request;
+        try {
+          request = decodeRunActionRequest(input);
+        } catch {
+          throw new Error("Invalid project action request.");
+        }
+        const { projectId, actionId, expectedCommand } = request;
+        const connected = await readyCoordinator();
+        const project = connected?.snapshot.projects.find((p) => p.id === projectId);
+        if (!project) throw new Error("This selected project is unavailable. Refresh and retry.");
+        if (project.actions?.find((a) => a.id === actionId)?.command !== expectedCommand)
+          throw new Error("This command changed. Refresh and review it before running.");
+        return decodeActionRun(await projectActionRunner.start(project, actionId));
+      });
       for (const operation of ["status", "stop"] as const)
-        ipcMain.handle(
-          `versionstead:project-action-${operation}`,
-          async (event, id: unknown) => {
-            assertActionSender(event);
-            if (
-              operation === "status" &&
-              typeof id === "object" &&
-              id !== null
-            ) {
-              let request;
-              try {
-                request = decodeActionRequest(id);
-              } catch {
-                throw new Error("Invalid project action status request.");
-              }
-              const latest = projectActionRunner.latest(
-                request.projectId,
-                request.actionId,
-              );
-              return latest ? decodeActionRun(latest) : null;
+        ipcMain.handle(`versionstead:project-action-${operation}`, async (event, id: unknown) => {
+          assertActionSender(event);
+          if (operation === "status" && typeof id === "object" && id !== null) {
+            let request;
+            try {
+              request = decodeActionRequest(id);
+            } catch {
+              throw new Error("Invalid project action status request.");
             }
-            if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id))
-              throw new Error("Invalid command identifier.");
-            return decodeActionRun(
-              operation === "stop"
-                ? await projectActionRunner.stop(id)
-                : projectActionRunner.read(id),
-            );
-          },
-        );
+            const latest = projectActionRunner.latest(request.projectId, request.actionId);
+            return latest ? decodeActionRun(latest) : null;
+          }
+          if (typeof id !== "string" || !/^[a-f0-9-]{36}$/.test(id))
+            throw new Error("Invalid command identifier.");
+          return decodeActionRun(
+            operation === "stop"
+              ? await projectActionRunner.stop(id)
+              : projectActionRunner.read(id),
+          );
+        });
       runtime = (await ensureCoordinator()).runtime;
       if (smoke) console.log("Desktop smoke: coordinator ready");
       protocol.handle("versionstead", async (request) => {
@@ -2223,20 +1996,18 @@ if (!app.requestSingleInstanceLock()) {
         const api = url.pathname.startsWith("/api/");
         if (
           !trustedLocation(request.url) ||
-          !(
-            api ? ["GET", "HEAD", "POST", "PATCH", "DELETE"] : ["GET", "HEAD"]
-          ).includes(request.method)
+          !(api ? ["GET", "HEAD", "POST", "PATCH", "DELETE"] : ["GET", "HEAD"]).includes(
+            request.method,
+          )
         )
           return new Response("Forbidden", { status: 403 });
         if (!runtime) runtime = (await readyCoordinator())?.runtime ?? null;
-        if (!runtime)
-          return new Response("Coordinator disconnected", { status: 503 });
+        if (!runtime) return new Response("Coordinator disconnected", { status: 503 });
         const removingProject =
           request.method === "DELETE"
             ? /^\/api\/projects\/([a-zA-Z0-9-]{1,100})$/.exec(url.pathname)?.[1]
             : undefined;
-        if (removingProject)
-          await projectActionRunner.stopProject(removingProject);
+        if (removingProject) await projectActionRunner.stopProject(removingProject);
         const body =
           request.method === "GET" || request.method === "HEAD"
             ? undefined
@@ -2244,18 +2015,15 @@ if (!app.requestSingleInstanceLock()) {
         if (body && body.byteLength > 64 * 1024)
           return new Response("Request too large", { status: 413 });
         try {
-          const response = await net.fetch(
-            `${runtime.origin}${url.pathname}${url.search}`,
-            {
-              method: request.method,
-              headers: {
-                Authorization: `Bearer ${runtime.token}`,
-                ...(body ? { "Content-Type": "application/json" } : {}),
-              },
-              ...(body ? { body } : {}),
-              signal: AbortSignal.timeout(15_000),
+          const response = await net.fetch(`${runtime.origin}${url.pathname}${url.search}`, {
+            method: request.method,
+            headers: {
+              Authorization: `Bearer ${runtime.token}`,
+              ...(body ? { "Content-Type": "application/json" } : {}),
             },
-          );
+            ...(body ? { body } : {}),
+            signal: AbortSignal.timeout(15_000),
+          });
           if (
             response.ok &&
             request.method === "PATCH" &&

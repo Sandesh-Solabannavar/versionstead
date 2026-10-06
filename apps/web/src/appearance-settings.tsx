@@ -242,9 +242,7 @@ function ThemeImport({
           }
         }}
       >
-        <p className="muted">
-          Import a Versionstead theme JSON file. Colors stay on this device.
-        </p>
+        <p className="muted">Import a Versionstead theme JSON file. Colors stay on this device.</p>
         <label className="field-label">
           Choose theme file
           <Input
@@ -742,10 +740,7 @@ export function AppearanceSettings() {
       )}
       {removing && (
         <Dialog title={`Remove ${removing.label}?`} onClose={() => setRemoving(null)}>
-          <p>
-            Selected light or dark modes will be removed. Saved scan evidence stays
-            available.
-          </p>
+          <p>Selected light or dark modes will be removed. Saved scan evidence stays available.</p>
           <div className="row-actions">
             <Button
               variant="danger"

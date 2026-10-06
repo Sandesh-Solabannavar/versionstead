@@ -20,10 +20,7 @@ type Dependencies = {
 /** Provider updater: re-resolve ownership, lock the installer, execute, verify, refresh. */
 export class GlobalToolUpdateRunner {
   private runs = new Map<string, GlobalToolUpdateRun>();
-  private work = new Map<
-    string,
-    { controller: AbortController; done: Promise<void> }
-  >();
+  private work = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private closing = false;
   private readonly dependencies: Dependencies;
   constructor(dependencies: Dependencies) {
@@ -45,9 +42,7 @@ export class GlobalToolUpdateRunner {
       item.updateStatus !== "available" ||
       item.origin !== "registry"
     )
-      throw new Error(
-        "This package has no verified update. Scan this PC again.",
-      );
+      throw new Error("This package has no verified update. Scan this PC again.");
     if (this.work.has(item.rootId))
       throw new Error("An update is already running in this global location.");
     const key = `${item.rootId}:${item.name}`;
@@ -64,8 +59,7 @@ export class GlobalToolUpdateRunner {
       message: "Checking the owning installation…",
     };
     for (const [oldKey, run] of this.runs)
-      if (this.runs.size >= 20 && !globalToolUpdateActive(run))
-        this.runs.delete(oldKey);
+      if (this.runs.size >= 20 && !globalToolUpdateActive(run)) this.runs.delete(oldKey);
     this.runs.set(key, state);
     const controller = new AbortController();
     const change = (patch: Partial<GlobalToolUpdateRun>) =>
@@ -74,9 +68,7 @@ export class GlobalToolUpdateRunner {
       try {
         const plan = await this.dependencies.resolve(item, controller.signal);
         if (controller.signal.aborted)
-          throw new Error(
-            "The update was stopped. Scan this PC before retrying.",
-          );
+          throw new Error("The update was stopped. Scan this PC before retrying.");
         change({
           status: "updating",
           command: plan.command,

@@ -44,9 +44,7 @@ export function initialWindowBounds(
     ? b
     : { width: 1280, height: 860 };
 }
-export async function loadWindowPreferences(
-  directory: string,
-): Promise<WindowPreferences> {
+export async function loadWindowPreferences(directory: string): Promise<WindowPreferences> {
   try {
     const file = join(directory, "window-settings.json");
     if ((await stat(file)).size > 4096) return defaultWindowPreferences;
@@ -55,10 +53,7 @@ export async function loadWindowPreferences(
     return defaultWindowPreferences;
   }
 }
-export async function saveWindowPreferences(
-  directory: string,
-  preferences: WindowPreferences,
-) {
+export async function saveWindowPreferences(directory: string, preferences: WindowPreferences) {
   const value = decodeWindowPreferences(preferences);
   await mkdir(directory, { recursive: true });
   const temporary = join(directory, "window-settings.json.tmp");
