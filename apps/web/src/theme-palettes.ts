@@ -1,4 +1,3 @@
-// Adapted from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 // Palette values copied from packages/shared/src/themePalettes.ts.
 export const colorRoles = [
   "canvas",
@@ -31,7 +30,12 @@ export const colorRoles = [
 export type ColorRole = (typeof colorRoles)[number];
 export type ThemeColors = Record<ColorRole, string>;
 export type ThemeMode = "light" | "dark";
-export type ThemeDefinition = { id: string; label: string; light: ThemeColors; dark: ThemeColors };
+export type ThemeDefinition = {
+  id: string;
+  label: string;
+  light: ThemeColors;
+  dark: ThemeColors;
+};
 
 export const builtInThemes: readonly ThemeDefinition[] = [
   {

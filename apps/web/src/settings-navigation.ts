@@ -1,4 +1,3 @@
-// Search/breadcrumb/return navigation adapted from T3 Code's settings shell (MIT).
 export const settingsSections = [
   { path: "/settings/general", label: "General" },
   { path: "/settings/appearance", label: "Appearance" },
@@ -43,11 +42,21 @@ const entries: readonly [SettingsPath, readonly string[]][] = [
   ["/settings/source-control", ["Automatically scan", "Scan interval"]],
   [
     "/settings/connections",
-    ["Local environment", "Version", "Network access", "Tailscale HTTPS", "Background monitoring"],
+    [
+      "Local environment",
+      "Version",
+      "Network access",
+      "Tailscale HTTPS",
+      "Background monitoring",
+    ],
   ],
 ];
 export const searchableSettings = [
-  ...settingsSections.map((s) => ({ ...s, id: s.path, target: null as string | null })),
+  ...settingsSections.map((s) => ({
+    ...s,
+    id: s.path,
+    target: null as string | null,
+  })),
   ...entries.flatMap(([path, labels]) =>
     labels.map((label) => ({
       path,
@@ -58,7 +67,8 @@ export const searchableSettings = [
   ),
 ];
 const pageKeywords: Partial<Record<SettingsPath, string>> = {
-  "/settings/general": "restore device defaults monitoring notifications schedules",
+  "/settings/general":
+    "restore device defaults monitoring notifications schedules",
   "/settings/appearance": "themes palettes system light dark",
   "/settings/project": "remove custom commands checkout",
   "/settings/keybindings": "keyboard shortcuts hotkeys",
@@ -71,7 +81,8 @@ export function searchSettings(query: string) {
   return searchableSettings
     .filter((item) => {
       const section = settingsSections.find((s) => s.path === item.path)!.label;
-      const keywords = item.target === null ? (pageKeywords[item.path] ?? "") : "";
+      const keywords =
+        item.target === null ? (pageKeywords[item.path] ?? "") : "";
       return words.every((word) =>
         `${item.label} ${section} ${keywords}`.toLowerCase().includes(word),
       );

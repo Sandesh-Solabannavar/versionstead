@@ -1,4 +1,3 @@
-// Project identity and picker behavior adapted from T3 Code (MIT).
 import {
   Folder,
   Code,

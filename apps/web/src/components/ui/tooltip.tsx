@@ -1,4 +1,3 @@
-// Adapted from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 
 import { cn } from "../../lib/utils";

@@ -1,4 +1,3 @@
-// Adapts T3 Code's ProviderInstanceCard update controls and lifecycle (MIT).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpCircle, Check, Copy, Download, LoaderCircle } from "lucide-react";
 import type { Installation } from "@versionstead/contracts/monitoring";

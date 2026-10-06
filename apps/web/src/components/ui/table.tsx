@@ -1,4 +1,3 @@
-// Adapted from T3 Code's shadcn components (MIT); see apps/web/public/THIRD_PARTY_NOTICES.txt.
 import type { ComponentProps } from "react";
 import { cn } from "../../lib/utils";
 

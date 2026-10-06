@@ -1,4 +1,3 @@
-// Adapted from T3 Code's shadcn/Base UI components (MIT); see apps/web/public/THIRD_PARTY_NOTICES.txt.
 import { Select as SelectPrimitive } from "@base-ui/react/select";
 import { Check, ChevronDown } from "lucide-react";
 import { useContext } from "react";

@@ -1,4 +1,3 @@
-// Adapted from T3 Code's DiscoveryItemRow (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { useState, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { Button, Collapsible, CollapsibleTrigger, CollapsibleContent, Badge } from "../ui";

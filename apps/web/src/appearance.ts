@@ -46,7 +46,10 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function bounded(value: unknown, min: number, max: number, fallback: number) {
-  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= min &&
+    value <= max
     ? value
     : fallback;
 }
@@ -60,13 +63,21 @@ export function readAppearance(value: unknown): Appearance {
     glassOpacity: bounded(v.glassOpacity, 40, 100, 80),
     panelAnimationMs: bounded(v.panelAnimationMs, 0, 400, 0),
     contentWidth:
-      v.contentWidth === "wide" || v.contentWidth === "full" ? v.contentWidth : "comfortable",
-    interfaceFont: interfaceFonts.find((font) => font === v.interfaceFont) ?? "System default",
+      v.contentWidth === "wide" || v.contentWidth === "full"
+        ? v.contentWidth
+        : "comfortable",
+    interfaceFont:
+      interfaceFonts.find((font) => font === v.interfaceFont) ??
+      "System default",
     interfaceFontSize: bounded(v.interfaceFontSize, 12, 20, 16),
-    monospaceFont: monospaceFonts.find((font) => font === v.monospaceFont) ?? "System default",
+    monospaceFont:
+      monospaceFonts.find((font) => font === v.monospaceFont) ??
+      "System default",
     monospaceFontSize: bounded(v.monospaceFontSize, 10, 18, 13),
-    tableFontSize: v.tableFontSize === 0 ? 0 : bounded(v.tableFontSize, 10, 18, 0),
-    evidenceFontSize: v.evidenceFontSize === 0 ? 0 : bounded(v.evidenceFontSize, 12, 20, 0),
+    tableFontSize:
+      v.tableFontSize === 0 ? 0 : bounded(v.tableFontSize, 10, 18, 0),
+    evidenceFontSize:
+      v.evidenceFontSize === 0 ? 0 : bounded(v.evidenceFontSize, 12, 20, 0),
     wordWrap: typeof v.wordWrap === "boolean" ? v.wordWrap : true,
     advancedTypography: v.advancedTypography === true,
   };
@@ -76,7 +87,9 @@ export function readAppearance(value: unknown): Appearance {
 export function isThemeColor(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 100) return false;
   if (/^#[\da-f]{6}$/i.test(value)) return true;
-  const oklch = /^oklch\(\s*([\d.]+)\s+([\d.]+)\s+(-?[\d.]+)\s*\)$/i.exec(value);
+  const oklch = /^oklch\(\s*([\d.]+)\s+([\d.]+)\s+(-?[\d.]+)\s*\)$/i.exec(
+    value,
+  );
   return (
     !!oklch &&
     Number(oklch[1]) >= 0 &&
@@ -92,7 +105,9 @@ function colors(value: unknown, mode: ThemeMode): ThemeColors {
   for (const role of colorRoles) {
     if (value[role] === undefined) continue;
     if (!isThemeColor(value[role]))
-      throw new Error(`Invalid ${mode} ${role} color. Use #rrggbb or literal oklch(l c h).`);
+      throw new Error(
+        `Invalid ${mode} ${role} color. Use #rrggbb or literal oklch(l c h).`,
+      );
     result[role] = value[role];
   }
   return result;
@@ -111,18 +126,24 @@ export function parseTheme(value: unknown): ThemeDefinition {
   const label = value.name ?? value.label;
   if (typeof label !== "string" || !label.trim() || label.trim().length > 48)
     throw new Error("Theme name must contain 1–48 characters.");
-  // Accept Versionstead pairs and T3 Code's appearance/colors/variants file format.
+
   const paired = record(value.light) && record(value.dark);
   const appearance = readTheme(value.appearance);
   if (!paired && appearance === "system")
-    throw new Error("A theme needs light/dark colors or an explicit appearance.");
+    throw new Error(
+      "A theme needs light/dark colors or an explicit appearance.",
+    );
   const variants = record(value.variants) ? value.variants : {};
   const light = paired
     ? value.light
     : appearance === "light"
       ? value.colors
       : (variants.light ?? {});
-  const dark = paired ? value.dark : appearance === "dark" ? value.colors : (variants.dark ?? {});
+  const dark = paired
+    ? value.dark
+    : appearance === "dark"
+      ? value.colors
+      : (variants.dark ?? {});
   return {
     id: value.id,
     label: label.trim(),
@@ -137,7 +158,13 @@ export function importTheme(text: string): ThemeDefinition {
 }
 export function serializeTheme(theme: ThemeDefinition) {
   return JSON.stringify(
-    { version: 1, id: theme.id, name: theme.label, light: theme.light, dark: theme.dark },
+    {
+      version: 1,
+      id: theme.id,
+      name: theme.label,
+      light: theme.light,
+      dark: theme.dark,
+    },
     null,
     2,
   );
@@ -148,14 +175,18 @@ export function readCustomThemes(value: unknown): ThemeDefinition[] {
   for (const candidate of value.slice(0, maxCustomThemes)) {
     try {
       const theme = parseTheme(candidate);
-      if (!result.some((existing) => existing.id === theme.id)) result.push(theme);
+      if (!result.some((existing) => existing.id === theme.id))
+        result.push(theme);
     } catch {
       /* Keep other valid saved themes when one entry is malformed. */
     }
   }
   return result;
 }
-export function readThemeHalves(value: unknown, themes: readonly ThemeDefinition[]): ThemeHalves {
+export function readThemeHalves(
+  value: unknown,
+  themes: readonly ThemeDefinition[],
+): ThemeHalves {
   const v = record(value) ? value : {};
   const resolve = (mode: ThemeMode) =>
     themes.find((theme) => theme.id === v[mode])?.id ?? "default";
@@ -166,7 +197,8 @@ export function resolvePalette(
   themes: readonly ThemeDefinition[],
   mode: ThemeMode,
 ): ThemeColors {
-  return (themes.find((theme) => theme.id === halves[mode]) ?? builtInThemes[0]!)[mode];
+  return (themes.find((theme) => theme.id === halves[mode]) ??
+    builtInThemes[0]!)[mode];
 }
 export function appearanceVariables(
   palette: ThemeColors,
@@ -223,7 +255,9 @@ export function appearanceVariables(
         ? "ui-monospace, Consolas, monospace"
         : `"${appearance.monospaceFont}", monospace`,
     "--monospace-scale": String(appearance.monospaceFontSize / 13),
-    "--table-font-size": appearance.tableFontSize ? `${appearance.tableFontSize}px` : "inherit",
+    "--table-font-size": appearance.tableFontSize
+      ? `${appearance.tableFontSize}px`
+      : "inherit",
     "--evidence-font-scale": String(
       appearance.evidenceFontSize
         ? appearance.evidenceFontSize / 16

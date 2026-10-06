@@ -1,4 +1,3 @@
-// Source chooser and back/confirmation flow adapted from T3 Code CommandPalette.tsx (MIT).
 import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, ChevronRight, FolderPlus, Link2, Search } from "lucide-react";

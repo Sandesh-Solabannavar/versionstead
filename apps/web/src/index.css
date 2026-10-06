@@ -1145,7 +1145,10 @@ h3 {
 :root[data-desktop="linux"] .app-titlebar {
   padding-right: max(
     12px,
-    calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - 144px)) + 12px)
+    calc(
+      100vw - env(titlebar-area-x, 0px) -
+        env(titlebar-area-width, calc(100vw - 144px)) + 12px
+    )
   );
 }
 :root[data-desktop="darwin"] .app-titlebar {
@@ -2192,7 +2195,12 @@ select {
   background: var(--accent);
 }
 .scan-meter:indeterminate {
-  background: linear-gradient(90deg, var(--border) 30%, var(--accent) 50%, var(--border) 70%);
+  background: linear-gradient(
+    90deg,
+    var(--border) 30%,
+    var(--accent) 50%,
+    var(--border) 70%
+  );
   background-size: 300% 100%;
   animation: scan-indeterminate 1.7s ease-in-out infinite;
 }
@@ -2541,7 +2549,10 @@ dialog::backdrop {
 @media (max-width: 600px) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: var(--workspace-titlebar-height, 52px) auto minmax(0, 1fr);
+    grid-template-rows: var(--workspace-titlebar-height, 52px) auto minmax(
+        0,
+        1fr
+      );
     height: auto;
     min-height: 100dvh;
   }
@@ -2683,7 +2694,6 @@ dialog::backdrop {
   }
 }
 
-/* Appearance previews and controls adapted from T3 Code. */
 .settings-page:has(.appearance-settings) {
   max-width: 850px;
 }
@@ -3011,7 +3021,9 @@ kbd {
   overflow: auto;
   overflow-wrap: normal;
 }
-:root[data-table-font-custom="true"] .table-wrap :is(th, td, .item-label, .table-subtext) {
+:root[data-table-font-custom="true"]
+  .table-wrap
+  :is(th, td, .item-label, .table-subtext) {
   font-size: var(--table-font-size);
 }
 .detail-dialog {

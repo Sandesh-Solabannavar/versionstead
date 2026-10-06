@@ -2,14 +2,19 @@ import { access, realpath, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { delimiter, isAbsolute, join, win32 } from "node:path";
 
-/** T3 Code's Windows CLI fallbacks fill missing desktop PATH entries without changing priority. */
-export function toolDirectories(env: NodeJS.ProcessEnv = process.env, platform = process.platform) {
+export function toolDirectories(
+  env: NodeJS.ProcessEnv = process.env,
+  platform = process.platform,
+) {
   const paths = platform === "win32" ? win32 : { isAbsolute, join };
-  const inherited = Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
+  const inherited =
+    Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ??
+    "";
   const directories = inherited.split(platform === "win32" ? ";" : delimiter);
   if (platform === "win32") {
     const add = (base: string | undefined, ...parts: string[]) => {
-      if (base && paths.isAbsolute(base)) directories.push(paths.join(base, ...parts));
+      if (base && paths.isAbsolute(base))
+        directories.push(paths.join(base, ...parts));
     };
     add(env.APPDATA, "npm");
     add(env.LOCALAPPDATA, "Programs", "nodejs");

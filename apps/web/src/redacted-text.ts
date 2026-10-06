@@ -1,4 +1,3 @@
-// Copied from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 const REDACTED_TEXT_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 
 export function redactedPlaceholder(value: string): string {
@@ -11,11 +10,15 @@ export function redactedPlaceholder(value: string): string {
   const nextChar = () => {
     state = Math.imul(state ^ (state >>> 13), 0x85ebca6b);
     state = Math.imul(state ^ (state >>> 16), 0xc2b2ae35);
-    return REDACTED_TEXT_ALPHABET[Math.abs(state) % REDACTED_TEXT_ALPHABET.length] ?? "x";
+    return (
+      REDACTED_TEXT_ALPHABET[Math.abs(state) % REDACTED_TEXT_ALPHABET.length] ??
+      "x"
+    );
   };
 
   return Array.from(value, (char) => {
-    if (char === "@" || char === "." || char === "-" || char === "_") return char;
+    if (char === "@" || char === "." || char === "-" || char === "_")
+      return char;
     return nextChar();
   }).join("");
 }

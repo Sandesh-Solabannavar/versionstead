@@ -1,4 +1,3 @@
-// Adapted from T3 Code's Appearance settings (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { useState, type CSSProperties, type ReactNode } from "react";
 import { Copy, Moon, Paintbrush, Pencil, Plus, RotateCcw, Sun, Trash2 } from "lucide-react";
 import { useAppearance } from "./theme";
@@ -244,7 +243,7 @@ function ThemeImport({
         }}
       >
         <p className="muted">
-          Import a Versionstead or T3 Code theme JSON file. Colors stay on this device.
+          Import a Versionstead theme JSON file. Colors stay on this device.
         </p>
         <label className="field-label">
           Choose theme file
@@ -744,7 +743,7 @@ export function AppearanceSettings() {
       {removing && (
         <Dialog title={`Remove ${removing.label}?`} onClose={() => setRemoving(null)}>
           <p>
-            Selected light or dark modes will return to T3 Code. Saved scan evidence stays
+            Selected light or dark modes will be removed. Saved scan evidence stays
             available.
           </p>
           <div className="row-actions">

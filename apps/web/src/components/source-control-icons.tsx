@@ -1,4 +1,3 @@
-// Adapted from T3 Code Icons.tsx (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { useId, type FC, type SVGProps } from "react";
 type Icon = FC<SVGProps<SVGSVGElement>>;
 

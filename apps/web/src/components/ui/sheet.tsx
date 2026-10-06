@@ -1,4 +1,3 @@
-// Adapted from T3 Code's shadcn/Base UI components (MIT); see apps/web/public/THIRD_PARTY_NOTICES.txt.
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog";
 import { X } from "lucide-react";
 import type { ComponentProps } from "react";

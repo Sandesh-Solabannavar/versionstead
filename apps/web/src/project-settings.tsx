@@ -1,4 +1,3 @@
-// Project settings and action editor adapted from T3 Code (MIT).
 import "./project-settings.css";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";

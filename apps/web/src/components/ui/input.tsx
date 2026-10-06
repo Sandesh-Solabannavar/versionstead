@@ -1,4 +1,3 @@
-// Adapted from T3 Code's shadcn/Base UI components (MIT); see apps/web/public/THIRD_PARTY_NOTICES.txt.
 import { Input as InputPrimitive } from "@base-ui/react/input";
 import { cn } from "../../lib/utils";
 

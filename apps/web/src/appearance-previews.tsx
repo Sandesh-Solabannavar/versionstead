@@ -1,4 +1,3 @@
-// Adapted from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { useState, type CSSProperties } from "react";
 import { cn } from "./lib/utils";
 import type { ThemeColors, ThemeMode } from "./theme-palettes";
@@ -126,7 +125,7 @@ export function ThemePreviewCircle({
   );
 }
 
-// T3 Code miniature adapted to Versionstead: sidebar, package rows, scan progress, and evidence.
+// The appearance previews include the sidebar, package rows, scan progress, and evidence.
 function ThemeWireframePane({
   colors,
   clip,

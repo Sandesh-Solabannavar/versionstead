@@ -1,4 +1,3 @@
-// Connections rows and the mode-card pairing flow adapted from T3 Code (MIT).
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { Autocomplete } from "@base-ui/react/autocomplete";

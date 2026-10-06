@@ -1,4 +1,3 @@
-// Window geometry/appearance adapted from T3 Code's DesktopWindow (MIT).
 import { readFile, writeFile, rename, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { BrowserWindowConstructorOptions } from "electron";
@@ -45,7 +44,9 @@ export function initialWindowBounds(
     ? b
     : { width: 1280, height: 860 };
 }
-export async function loadWindowPreferences(directory: string): Promise<WindowPreferences> {
+export async function loadWindowPreferences(
+  directory: string,
+): Promise<WindowPreferences> {
   try {
     const file = join(directory, "window-settings.json");
     if ((await stat(file)).size > 4096) return defaultWindowPreferences;
@@ -54,7 +55,10 @@ export async function loadWindowPreferences(directory: string): Promise<WindowPr
     return defaultWindowPreferences;
   }
 }
-export async function saveWindowPreferences(directory: string, preferences: WindowPreferences) {
+export async function saveWindowPreferences(
+  directory: string,
+  preferences: WindowPreferences,
+) {
   const value = decodeWindowPreferences(preferences);
   await mkdir(directory, { recursive: true });
   const temporary = join(directory, "window-settings.json.tmp");

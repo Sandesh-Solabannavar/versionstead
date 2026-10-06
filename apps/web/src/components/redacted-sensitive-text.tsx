@@ -1,4 +1,3 @@
-// Adapted from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { useMemo, useState } from "react";
 
 import { cn } from "../lib/utils";

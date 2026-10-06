@@ -1,4 +1,3 @@
-// Adapted from T3 Code (MIT); see public/THIRD_PARTY_NOTICES.txt.
 import { RefreshCwIcon } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 

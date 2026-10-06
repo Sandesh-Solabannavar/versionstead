@@ -1,4 +1,3 @@
-// Adapted from T3 Code's shadcn/Base UI menu (MIT).
 import { Menu as MenuPrimitive } from "@base-ui/react/menu";
 import { cn } from "../../lib/utils";
 

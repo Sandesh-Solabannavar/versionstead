@@ -9,7 +9,7 @@ onlyBuiltDependencies:
 overrides:
   vite: npm:@voidzero-dev/vite-plus-core@1.0.0
 
-# Vite+ exposes Vite-compatible APIs under its own version, as in T3 Code.
+# Vite+ exposes Vite-compatible APIs under its own version.
 peerDependencyRules:
   allowedVersions:
     vite: "*"
