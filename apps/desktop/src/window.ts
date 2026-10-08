@@ -1,6 +1,6 @@
 import { readFile, writeFile, rename, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { BrowserWindowConstructorOptions } from "electron";
+import type { BrowserWindowConstructorOptions, MenuItemConstructorOptions } from "electron";
 import {
   decodeWindowPreferences,
   type WindowBounds,
@@ -27,6 +27,35 @@ export function titleBarOptions(
           symbolColor: dark ? "#f8fafc" : "#1f2937",
         },
       };
+}
+/** Role menus keep native editing, zoom, full-screen and close-window (hide to tray) shortcuts.
+ * Reload and developer tools accelerators would override app shortcuts, so the full View menu
+ * exists only with VERSIONSTEAD_DEVTOOLS=1. */
+export function applicationMenu(
+  platform = process.platform,
+  devtools = process.env.VERSIONSTEAD_DEVTOOLS === "1",
+): MenuItemConstructorOptions[] {
+  const view: MenuItemConstructorOptions = devtools
+    ? { role: "viewMenu" }
+    : {
+        label: "View",
+        submenu: [
+          { role: "resetZoom" },
+          { role: "zoomIn" },
+          { role: "zoomOut" },
+          { type: "separator" },
+          { role: "togglefullscreen" },
+        ],
+      };
+  return platform === "darwin"
+    ? [
+        { role: "appMenu" },
+        { role: "fileMenu" },
+        { role: "editMenu" },
+        view,
+        { role: "windowMenu" },
+      ]
+    : [{ role: "editMenu" }, view, { role: "windowMenu" }];
 }
 export function initialWindowBounds(
   preferences: WindowPreferences,

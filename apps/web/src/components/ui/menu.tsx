@@ -17,3 +17,13 @@ export function MenuPopup({ children, className, ...props }: MenuPrimitive.Popup
 export function MenuItem({ className, ...props }: MenuPrimitive.Item.Props) {
   return <MenuPrimitive.Item className={cn("connection-menu-item", className)} {...props} />;
 }
+/** An anchor styled as a menu item; the menu closes when it is followed. */
+export function MenuLinkItem({ className, ...props }: MenuPrimitive.LinkItem.Props) {
+  return (
+    <MenuPrimitive.LinkItem
+      className={cn("connection-menu-item", className)}
+      closeOnClick
+      {...props}
+    />
+  );
+}

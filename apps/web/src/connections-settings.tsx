@@ -21,11 +21,21 @@ import {
 import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { request, useMonitoring } from "./monitoring";
-import { SettingGroup, SettingRow, Choice } from "./components/settings-controls";
+import { actionKeys } from "./monitoring-actions";
+import { backgroundSummary } from "./monitoring-view";
+import {
+  SettingGroup,
+  SettingRow,
+  Choice,
+  credentialStorageNote,
+} from "./components/settings-controls";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
 import { Switch } from "./components/ui/switch";
 import { RefreshIcon } from "./components/ui/refresh-icon";
-import { Button, Dialog, Input, timestamp } from "./ui";
+import { Button, ConfirmDialog, Dialog, Input, timestamp, useFailure } from "./ui";
+import { cn } from "./lib/utils";
+
+const credentialNoteId = "credential-storage-note";
 
 function ConnectionModeCard({
   selected,
@@ -333,12 +343,16 @@ export function AddEnvironmentDialog({ close }: { close: () => void }) {
 
 function SavedEnvironment({
   computer,
-  disabled,
+  connected,
 }: {
   computer: ConnectedComputer;
-  disabled: boolean;
+  connected: boolean;
 }) {
   const { change } = useApplication();
+  const { pending } = useMonitoring();
+  // Every action on this environment waits for the one running on it, and no other.
+  const key = actionKeys.environment(computer.id);
+  const disabled = !connected || pending.has(key);
   const enabled = computer.enabled !== false;
   const status = !enabled
     ? "Disabled"
@@ -348,6 +362,7 @@ function SavedEnvironment({
         ? "Connected"
         : "Connecting…";
   const [removing, setRemoving] = useState(false);
+  const [removeError, failRemove, clearRemoveError] = useFailure(removing);
   return (
     <div className="saved-environment">
       <div className="saved-environment-main">
@@ -375,6 +390,7 @@ function SavedEnvironment({
               { id: computer.id, enabled: value },
               value ? "Environment enabled." : "Environment disabled. Saved evidence is retained.",
               "PATCH",
+              { key },
             );
           }}
         />
@@ -398,6 +414,8 @@ function SavedEnvironment({
                   "computers/refresh",
                   { id: computer.id },
                   "Environment evidence refreshed.",
+                  "POST",
+                  { key },
                 );
               }}
             >
@@ -406,7 +424,13 @@ function SavedEnvironment({
             <MenuItem
               disabled={disabled || !enabled}
               onClick={() => {
-                void change("computers/scan", { id: computer.id }, "Read-only scan requested.");
+                void change(
+                  "computers/scan",
+                  { id: computer.id },
+                  "Read-only scan requested.",
+                  "POST",
+                  { key },
+                );
               }}
             >
               Scan selected sources
@@ -414,7 +438,10 @@ function SavedEnvironment({
             <MenuItem
               disabled={disabled || removing}
               className="error-text"
-              onClick={() => setRemoving(true)}
+              onClick={() => {
+                clearRemoveError();
+                setRemoving(true);
+              }}
             >
               Remove environment
             </MenuItem>
@@ -429,20 +456,29 @@ function SavedEnvironment({
         <Dialog
           title="Remove environment?"
           description="Saved evidence and this connection will be removed. If the PC is offline, revoke this client's access there as well."
+          dismissible={!pending.has(key)}
           onClose={() => setRemoving(false)}
         >
-          <div className="row-actions">
-            <Button onClick={() => setRemoving(false)} disabled={disabled}>
+          {removeError && (
+            <p className="error-text" role="alert">
+              {removeError}
+            </p>
+          )}
+          <div className={cn("row-actions", removeError && "mt-3")}>
+            <Button onClick={() => setRemoving(false)} disabled={pending.has(key)}>
               Cancel
             </Button>
             <Button
               variant="danger"
               disabled={disabled}
               onClick={() => {
+                clearRemoveError();
                 void change(
                   "computers/remove",
                   { id: computer.id },
                   "Environment removed. Revoke access on the other PC if it was offline.",
+                  "POST",
+                  { key, onError: failRemove },
                 ).then((result) => {
                   if (result) setRemoving(false);
                 });
@@ -459,21 +495,37 @@ function SavedEnvironment({
 
 export function ConnectionsSettings() {
   const { snapshot: app, change, discovering, discover } = useApplication();
-  const { snapshot, busy, connection, mutate } = useMonitoring();
+  const { snapshot, pending, connection, mutate } = useMonitoring();
   const [addOpen, setAddOpen] = useState(false);
   const [networkOpen, setNetworkOpen] = useState(false);
+  // The client whose access is being revoked, awaiting confirmation.
+  const [revoking, setRevoking] = useState<string | null>(null);
   const [address, setAddress] = useState("");
   const [port, setPort] = useState("");
   const [invite, setInvite] = useState<ReturnType<typeof decodeInvitation> | null>(null);
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
   const [clock, setClock] = useState(() => Date.now());
+  // A dialog shows why its own action failed, since a toast cannot be reached from a modal dialog.
+  // If a dialog has closed by the time the answer arrives, a toast says it instead.
+  const [networkError, failNetwork, clearNetworkError] = useFailure(networkOpen);
+  const [inviteError, failInvite, clearInviteError] = useFailure(invite !== null);
+  const revokingOpen = app?.sharing.clients.some((client) => client.id === revoking) ?? false;
+  const [revokeError, failRevoke, clearRevokeError] = useFailure(revokingOpen);
   useEffect(() => {
     if (!invite) return;
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [invite]);
   if (!app || !snapshot) return null;
-  const disabled = busy || connection !== "connected";
+  const connected = connection === "connected";
+  // Each control waits only for its own action, so a slow one never holds back the rest.
+  const waiting = (key: string) => !connected || pending.has(key);
+  const applying = pending.has(actionKeys.sharing);
+  // Network access, pairing, and saved environments all keep a protected credential. Where there is
+  // no protected storage they stay off, and the note explains why.
+  const protectedCredentials = app.credentialStorageAvailable;
+  const noteId = protectedCredentials ? undefined : credentialNoteId;
+  const revokingClient = app.sharing.clients.find((client) => client.id === revoking);
   const chosen = address || app.sharing.address || app.networkAddresses[0] || "";
   const chosenPort = port || String(app.sharing.port);
   const tailnetAddress = app.networkAddresses.find((a) => a.startsWith("100."));
@@ -488,18 +540,26 @@ export function ConnectionsSettings() {
       () => setCopyMessage("Select the field and copy it manually."),
     );
   };
-  const makeInvitation = () => {
-    void mutate("/api/application/invitation", {}, decodeInvitation, "Pairing link created.").then(
-      (result) => {
-        if (result) {
-          setInvite(result);
-          setClock(Date.now());
-          setCopyMessage(null);
-        }
-      },
-    );
+  // `onError` is for a dialog that shows the failure itself; from a menu or button it is a toast.
+  const makeInvitation = (onError?: (message: string) => void) => {
+    clearInviteError();
+    void mutate(
+      "/api/application/invitation",
+      {},
+      decodeInvitation,
+      "Pairing link created.",
+      "POST",
+      { key: actionKeys.invitation, onError },
+    ).then((result) => {
+      if (result) {
+        setInvite(result);
+        setClock(Date.now());
+        setCopyMessage(null);
+      }
+    });
   };
   const openNetwork = (next?: string) => {
+    clearNetworkError();
     setAddress(next ?? app.sharing.address ?? "");
     setPort(String(app.sharing.port));
     setNetworkOpen(true);
@@ -518,6 +578,12 @@ export function ConnectionsSettings() {
               : "Check for updates";
   return (
     <div className="connections-settings">
+      {!protectedCredentials && (
+        <p id={credentialNoteId} role="status" className="source-control-note">
+          {credentialStorageNote} Network access, Tailscale setup, and Add environment stay off
+          here.
+        </p>
+      )}
       <SettingGroup
         title={
           <span className="environment-section-title">
@@ -540,7 +606,7 @@ export function ConnectionsSettings() {
             </MenuTrigger>
             <MenuPopup>
               <MenuItem
-                disabled={disabled || discovering}
+                disabled={!connected || discovering}
                 onClick={() => {
                   void discover();
                 }}
@@ -548,12 +614,17 @@ export function ConnectionsSettings() {
                 Refresh connections
               </MenuItem>
               <MenuItem
-                disabled={disabled || !app.sharing.enabled || !!app.sharing.error}
-                onClick={makeInvitation}
+                disabled={
+                  waiting(actionKeys.invitation) || !app.sharing.enabled || !!app.sharing.error
+                }
+                onClick={() => makeInvitation()}
               >
                 Create pairing link
               </MenuItem>
-              <MenuItem disabled={disabled} onClick={() => openNetwork()}>
+              <MenuItem
+                disabled={waiting(actionKeys.sharing) || !protectedCredentials}
+                onClick={() => openNetwork()}
+              >
                 Configure network access
               </MenuItem>
             </MenuPopup>
@@ -567,7 +638,7 @@ export function ConnectionsSettings() {
           <Switch
             aria-label="Local environment"
             checked={!snapshot.settings.paused}
-            disabled={disabled}
+            disabled={waiting(actionKeys.setting("paused"))}
             onCheckedChange={(enabled) => {
               void mutate(
                 "/api/settings",
@@ -575,6 +646,7 @@ export function ConnectionsSettings() {
                 decodeMonitoringSettings,
                 enabled ? "Local scheduled scans resumed." : "Local scheduled scans paused.",
                 "PATCH",
+                { key: actionKeys.setting("paused") },
               );
             }}
           />
@@ -586,9 +658,11 @@ export function ConnectionsSettings() {
           <Button
             variant="ghost"
             className="connection-version-status"
-            disabled={disabled || app.update.status === "checking"}
+            disabled={waiting(actionKeys.update) || app.update.status === "checking"}
             onClick={() => {
-              void change("update", {}, "Versionstead release check finished.");
+              void change("update", {}, "Versionstead release check finished.", "POST", {
+                key: actionKeys.update,
+              });
             }}
           >
             {updateLabel}
@@ -603,14 +677,19 @@ export function ConnectionsSettings() {
         >
           <div className="row-actions">
             {origin && (
-              <Button variant="ghost" disabled={disabled} onClick={makeInvitation}>
+              <Button
+                variant="ghost"
+                disabled={waiting(actionKeys.invitation)}
+                onClick={() => makeInvitation()}
+              >
                 Pair device
               </Button>
             )}
             <Switch
               aria-label="Enable network access"
+              aria-describedby={noteId}
               checked={app.sharing.enabled}
-              disabled={disabled || !app.credentialStorageAvailable}
+              disabled={waiting(actionKeys.sharing) || !protectedCredentials}
               onCheckedChange={() => openNetwork()}
             />
           </div>
@@ -626,7 +705,12 @@ export function ConnectionsSettings() {
           }
         >
           {tailnetAddress ? (
-            <Button variant="ghost" disabled={disabled} onClick={() => openNetwork(tailnetAddress)}>
+            <Button
+              variant="ghost"
+              aria-describedby={noteId}
+              disabled={waiting(actionKeys.sharing) || !protectedCredentials}
+              onClick={() => openNetwork(tailnetAddress)}
+            >
               {app.sharing.enabled && app.sharing.address === tailnetAddress
                 ? "Configure"
                 : "Set up"}
@@ -636,7 +720,7 @@ export function ConnectionsSettings() {
               variant="ghost"
               className="utility-button"
               aria-label="Refresh network connections"
-              disabled={disabled || discovering}
+              disabled={!connected || discovering}
               onClick={() => {
                 void discover();
               }}
@@ -645,16 +729,7 @@ export function ConnectionsSettings() {
             </Button>
           )}
         </SettingRow>
-        <SettingRow
-          label="Background monitoring"
-          description={
-            snapshot.runtime.host === "boot-task"
-              ? "Windows boot host is configured. Verify connectivity and scan history after sign-out."
-              : snapshot.runtime.mode === "background"
-                ? "Background host. The app window can stay closed."
-                : "Monitoring keeps running when the app window closes. Install the Windows boot host for access after sign-out."
-          }
-        >
+        <SettingRow label="Background monitoring" description={backgroundSummary(snapshot.runtime)}>
           <span className="muted small">
             {snapshot.runtime.host === "boot-task"
               ? "Boot host"
@@ -675,8 +750,10 @@ export function ConnectionsSettings() {
               description="Create a single-use link for another PC. A new link replaces the previous unused link."
             >
               <Button
-                disabled={disabled || !app.sharing.enabled || !!app.sharing.error}
-                onClick={makeInvitation}
+                disabled={
+                  waiting(actionKeys.invitation) || !app.sharing.enabled || !!app.sharing.error
+                }
+                onClick={() => makeInvitation()}
               >
                 Create pairing link
               </Button>
@@ -686,13 +763,14 @@ export function ConnectionsSettings() {
                 key={client.id}
                 label={client.label}
                 searchable={false}
-                description={`Paired ${timestamp(client.createdAt)}`}
+                description={<>Paired {timestamp(client.createdAt)}</>}
               >
                 <Button
                   variant="ghost"
-                  disabled={disabled}
+                  disabled={waiting(actionKeys.client(client.id))}
                   onClick={() => {
-                    void change("computers/revoke", { id: client.id }, "Client access revoked.");
+                    clearRevokeError();
+                    setRevoking(client.id);
                   }}
                 >
                   Revoke access
@@ -707,7 +785,8 @@ export function ConnectionsSettings() {
         action={
           <Button
             variant="ghost"
-            disabled={disabled || !app.credentialStorageAvailable}
+            aria-describedby={noteId}
+            disabled={!connected || !protectedCredentials}
             onClick={() => setAddOpen(true)}
           >
             <Plus size={13} aria-hidden /> Add environment
@@ -716,7 +795,7 @@ export function ConnectionsSettings() {
       >
         {app.computers.length ? (
           app.computers.map((computer) => (
-            <SavedEnvironment key={computer.id} computer={computer} disabled={disabled} />
+            <SavedEnvironment key={computer.id} computer={computer} connected={connected} />
           ))
         ) : (
           <div className="empty-environments">
@@ -733,22 +812,47 @@ export function ConnectionsSettings() {
         )}
       </SettingGroup>
       {addOpen && <AddEnvironmentDialog close={() => setAddOpen(false)} />}
+      {revokingClient && (
+        <ConfirmDialog
+          danger
+          title={`Revoke access for ${revokingClient.label}?`}
+          description="That PC can no longer read this PC's evidence or request scans. Create a new pairing link to let it connect again."
+          confirmLabel="Revoke access"
+          pending={pending.has(actionKeys.client(revokingClient.id))}
+          error={revokeError}
+          onClose={() => setRevoking(null)}
+          onConfirm={() => {
+            clearRevokeError();
+            void change(
+              "computers/revoke",
+              { id: revokingClient.id },
+              "Client access revoked.",
+              "POST",
+              { key: actionKeys.client(revokingClient.id), onError: failRevoke },
+            ).then((result) => {
+              if (result) setRevoking(null);
+            });
+          }}
+        />
+      )}
       {networkOpen && (
         <Dialog
           title={app.sharing.enabled ? "Configure network access" : "Enable network access?"}
           description="Let paired devices read this PC's evidence and request scans of its selected sources."
           className="network-dialog"
-          dismissible={!busy}
+          dismissible={!applying}
           onClose={() => setNetworkOpen(false)}
         >
           <form
             onSubmit={(e) => {
               e.preventDefault();
+              clearNetworkError();
               void change(
                 "sharing",
                 { enabled: true, address: chosen, port: Number(chosenPort) },
                 "Network access enabled.",
                 "PATCH",
+                { key: actionKeys.sharing, onError: failNetwork },
               ).then((result) => {
                 if (result) {
                   setInvite(null);
@@ -772,7 +876,7 @@ export function ConnectionsSettings() {
                     value,
                     label: `${value}${value.startsWith("100.") ? " · Tailscale" : ""}`,
                   }))}
-                  disabled={disabled}
+                  disabled={waiting(actionKeys.sharing)}
                   onChange={setAddress}
                 />
               </div>
@@ -786,7 +890,7 @@ export function ConnectionsSettings() {
                   min={1024}
                   max={65535}
                   required
-                  disabled={disabled}
+                  disabled={waiting(actionKeys.sharing)}
                 />
               </label>
             </div>
@@ -804,17 +908,25 @@ export function ConnectionsSettings() {
                 {app.sharing.error}
               </p>
             )}
+            {/* A failed change is usually also the saved sharing error: say it once. */}
+            {networkError && networkError !== app.sharing.error && (
+              <p className="connection-form-error" role="alert">
+                {networkError}
+              </p>
+            )}
             <div className="row-actions">
               {(app.sharing.enabled || app.sharing.clients.length > 0) && (
                 <Button
                   variant="danger"
-                  disabled={disabled}
+                  disabled={waiting(actionKeys.sharing)}
                   onClick={() => {
+                    clearNetworkError();
                     void change(
                       "sharing",
                       { enabled: false },
                       "Network access disabled. Pairing records are retained.",
                       "PATCH",
+                      { key: actionKeys.sharing, onError: failNetwork },
                     ).then((result) => {
                       if (result) {
                         setInvite(null);
@@ -826,11 +938,15 @@ export function ConnectionsSettings() {
                   Disable network access
                 </Button>
               )}
-              <Button disabled={disabled} onClick={() => setNetworkOpen(false)}>
+              <Button disabled={waiting(actionKeys.sharing)} onClick={() => setNetworkOpen(false)}>
                 Cancel
               </Button>
-              <Button type="submit" variant="primary" disabled={disabled || !chosen}>
-                {busy ? "Applying…" : app.sharing.enabled ? "Save" : "Enable"}
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={waiting(actionKeys.sharing) || !chosen}
+              >
+                {applying ? "Applying…" : app.sharing.enabled ? "Save" : "Enable"}
               </Button>
             </div>
           </form>
@@ -841,6 +957,7 @@ export function ConnectionsSettings() {
           title="Pair another device"
           description="Paste this link into Add Environment on the other PC. It grants evidence reads and selected-source scans."
           className="pair-device-dialog"
+          dismissible={!pending.has(actionKeys.invitation)}
           onClose={() => {
             setInvite(null);
             setCopyMessage(null);
@@ -860,14 +977,27 @@ export function ConnectionsSettings() {
               <Copy size={14} aria-hidden />
               Copy link
             </Button>
-            <Button variant="ghost" disabled={!remaining || disabled} onClick={makeInvitation}>
+            <Button
+              variant="ghost"
+              disabled={!remaining || waiting(actionKeys.invitation)}
+              onClick={() => makeInvitation(failInvite)}
+            >
               Create new link
             </Button>
           </div>
-          <p className="muted small" role="status">
+          {inviteError && (
+            <p className="connection-form-error" role="alert">
+              {inviteError}
+            </p>
+          )}
+          <p className="muted small">
             {remaining
               ? `Expires in ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}. Single use.`
               : "This link has expired. Create a new link."}
+          </p>
+          {/* The countdown ticks every second, so it is not a live region; only the expiry is announced. */}
+          <p role="status" className="sr-only">
+            {remaining ? "" : "The pairing link has expired."}
           </p>
           <details className="pairing-manual">
             <summary>Enter host and code separately</summary>

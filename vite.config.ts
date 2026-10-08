@@ -14,6 +14,12 @@ export default defineConfig({
       ".cache/**",
       ".pnpm-store/**",
       "pnpm-lock.yaml",
+      ".agents/**",
+      ".claude/**",
+      ".cursor/**",
+      ".recall/**",
+      ".superpowers/**",
+      ".e2e/**",
     ],
   },
 });

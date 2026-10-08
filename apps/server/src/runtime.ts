@@ -1,16 +1,21 @@
 import { execFile } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { chmod, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as Schema from "effect/Schema";
+import { InputError } from "./adapters/projects.ts";
 
+// The only frontend origin a development coordinator accepts besides its own.
+export const DEV_ORIGIN = "http://127.0.0.1:4317";
 const RuntimeFile = Schema.Struct({
   origin: Schema.String,
   pid: Schema.Number,
   mode: Schema.Literals(["interactive", "background"]),
   host: Schema.Literals(["session", "boot-task", "unconfigured"]),
+  // Absent in descriptors written by older coordinators.
+  devOrigin: Schema.optional(Schema.String),
   protection: Schema.Literals(["dpapi-machine", "private-file"]),
   protectedToken: Schema.String,
 });
@@ -21,13 +26,31 @@ export type CoordinatorRuntime = Omit<RuntimeFile, "protection" | "protectedToke
 const decodeRuntime = Schema.decodeUnknownSync(RuntimeFile);
 let cachedRuntime: { dataDir: string; contents: string; runtime: CoordinatorRuntime } | undefined;
 
-export function resolveDataDir(): string {
-  const override = process.env.VERSIONSTEAD_DATA_DIR;
+export const DATABASE_FILE = "monitoring.sqlite";
+
+export function resolveDataDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home = homedir(),
+): string {
+  const override = env.VERSIONSTEAD_DATA_DIR;
   if (override) {
     if (!isAbsolute(override)) throw new Error("VERSIONSTEAD_DATA_DIR must be absolute");
     return resolve(override);
   }
-  return join(process.env.LOCALAPPDATA ?? join(homedir(), ".local", "share"), "Versionstead");
+  const share = join(home, ".local", "share");
+  if (platform === "win32") return join(env.LOCALAPPDATA ?? share, "Versionstead");
+  const xdg = env.XDG_DATA_HOME;
+  const current =
+    platform === "darwin"
+      ? join(home, "Library", "Application Support", "Versionstead")
+      : join(xdg && isAbsolute(xdg) ? xdg : share, "Versionstead");
+  // Earlier builds kept their macOS and Linux data in ~/.local/share/Versionstead (Windows used
+  // %LOCALAPPDATA%\Versionstead and still does). Only a database counts as data: Electron creates its own
+  // profile in the macOS folder on every launch, which must not strand it.
+  const legacy = join(share, "Versionstead");
+  const holdsDatabase = (directory: string) => existsSync(join(directory, DATABASE_FILE));
+  return !holdsDatabase(current) && holdsDatabase(legacy) ? legacy : current;
 }
 
 // The database lock is released by the OS on a crash; stale PID files cannot split the writer.
@@ -87,15 +110,23 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
   });
 }
 
-export async function protectSecret(value: string): Promise<string> {
-  if (process.platform !== "win32")
-    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
+// An input error, so the interface receives this reason as a 400 rather than a generic 500.
+const secretsUnsupported =
+  "OS-backed connection credentials are currently supported on Windows only.";
+
+export async function protectSecret(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string> {
+  if (platform !== "win32") throw new InputError(secretsUnsupported);
   return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
 }
 
-export async function unprotectSecret(value: string): Promise<string> {
-  if (process.platform !== "win32")
-    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
+export async function unprotectSecret(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<string> {
+  if (platform !== "win32") throw new InputError(secretsUnsupported);
   return Buffer.from(await dpapi(value, "Unprotect"), "base64").toString("utf8");
 }
 
@@ -109,6 +140,7 @@ function validateDescriptor(runtime: RuntimeFile): void {
     url.hash ||
     url.username ||
     url.password ||
+    (runtime.devOrigin !== undefined && runtime.devOrigin !== DEV_ORIGIN) ||
     !Number.isSafeInteger(runtime.pid) ||
     runtime.pid < 1 ||
     runtime.protectedToken.length > 8192
@@ -139,6 +171,7 @@ export async function readRuntime(dataDir: string): Promise<CoordinatorRuntime |
       pid: runtime.pid,
       mode: runtime.mode,
       host: runtime.host,
+      ...(runtime.devOrigin ? { devOrigin: runtime.devOrigin } : {}),
       token,
     };
     cachedRuntime = { dataDir, contents, runtime: result };
@@ -155,6 +188,7 @@ export async function writeRuntime(dataDir: string, runtime: CoordinatorRuntime)
     pid: runtime.pid,
     mode: runtime.mode,
     host: runtime.host,
+    ...(runtime.devOrigin ? { devOrigin: runtime.devOrigin } : {}),
     protection: process.platform === "win32" ? "dpapi-machine" : "private-file",
     protectedToken: process.platform === "win32" ? await dpapi(encoded, "Protect") : encoded,
   });

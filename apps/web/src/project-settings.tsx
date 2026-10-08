@@ -29,16 +29,20 @@ import {
   type ActionRun,
 } from "@versionstead/contracts/project-settings";
 import { useMonitoring } from "./monitoring";
+import { actionKeys } from "./monitoring-actions";
 import { useApplication } from "./application";
 import { useAppearance } from "./theme";
-import { keyChord } from "./keybindings";
-import { Button, Dialog, Input, EmptyState, hasOpenModal } from "./ui";
+import { commandModifiers, formatShortcut, isMac, keyChord } from "./keybindings";
+import { Button, Dialog, Input, EmptyState, hasOpenModal, useFailure } from "./ui";
+import { cn } from "./lib/utils";
 import { Choice, SettingGroup, SettingRow } from "./components/settings-controls";
 import { ProjectBadge, projectIdentity, iconComponents, readProjectIcon } from "./project-icons";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
 import {
   groupSettingsProjects,
+  actionForChord,
   actionShortcutConflict,
+  actionShortcutProblem,
   type ProjectSettingsMember as Member,
 } from "./project-settings.logic";
 
@@ -51,6 +55,10 @@ const actionGlyphs = {
   package: Package,
 };
 
+// Only the Windows desktop runs commands; every other platform and a browser have no bridge.
+const canRunCommands = () => Boolean(window.versionstead?.runProjectAction);
+const commandsNote = "Custom commands run in the Windows desktop app.";
+
 export function ProjectCommands({ project }: { project: Project }) {
   const [running, setRunning] = useState<ProjectAction | null>(null);
   const { bindings } = useAppearance();
@@ -60,18 +68,13 @@ export function ProjectCommands({ project }: { project: Project }) {
         event.repeat ||
         event.isComposing ||
         hasOpenModal() ||
-        !window.versionstead?.runProjectAction ||
+        !canRunCommands() ||
         !(event.target instanceof HTMLElement) ||
         event.target.closest('input,textarea,select,[contenteditable="true"]') ||
         event.target.closest("[data-project-id]")?.getAttribute("data-project-id") !== project.id
       )
         return;
-      const chord = keyChord(event, navigator.platform.toLowerCase().includes("mac"));
-      const action = project.actions?.find(
-        (a) =>
-          a.shortcut === chord &&
-          !actionShortcutConflict(project.actions ?? [], a.id, chord ?? "", bindings),
-      );
+      const action = actionForChord(project.actions ?? [], keyChord(event, isMac()), bindings);
       if (action) {
         event.preventDefault();
         setRunning(action);
@@ -95,22 +98,25 @@ export function ProjectCommands({ project }: { project: Project }) {
         Project settings
       </Link>
       {!project.repository && !!project.actions?.length && (
-        <Menu>
-          <MenuTrigger render={<Button size="compact" />}>Actions</MenuTrigger>
-          <MenuPopup>
-            {project.actions.map((action) => (
-              <MenuItem
-                key={action.id}
-                disabled={!window.versionstead?.runProjectAction}
-                onClick={() => setRunning(action)}
-              >
-                <Play size={13} />
-                {action.name}
-                {action.shortcut && <kbd>{action.shortcut}</kbd>}
-              </MenuItem>
-            ))}
-          </MenuPopup>
-        </Menu>
+        <>
+          <Menu>
+            <MenuTrigger render={<Button size="compact" />}>Actions</MenuTrigger>
+            <MenuPopup>
+              {project.actions.map((action) => (
+                <MenuItem
+                  key={action.id}
+                  disabled={!canRunCommands()}
+                  onClick={() => setRunning(action)}
+                >
+                  <Play size={13} />
+                  {action.name}
+                  {action.shortcut && <kbd>{formatShortcut(action.shortcut)}</kbd>}
+                </MenuItem>
+              ))}
+            </MenuPopup>
+          </Menu>
+          {!canRunCommands() && <span className="muted small">{commandsNote}</span>}
+        </>
       )}
       {running && (
         <ProjectActionOutput project={project} action={running} close={() => setRunning(null)} />
@@ -129,13 +135,13 @@ export function ProjectActionOutput({
   close: () => void;
 }) {
   const [run, setRun] = useState<ActionRun | null>(null);
-  const [pending, setPending] = useState(!!window.versionstead?.runProjectAction);
+  const [pending, setPending] = useState(canRunCommands());
   const [error, setError] = useState<string | null>(null);
   const bridge = window.versionstead;
   useEffect(() => {
     let cancelled = false;
     void bridge
-      ?.projectActionStatus({ projectId: project.id, actionId: action.id })
+      ?.projectActionStatus?.({ projectId: project.id, actionId: action.id })
       .then((value) => {
         if (!cancelled && value) setRun(decodeActionRun(value));
       })
@@ -151,12 +157,14 @@ export function ProjectActionOutput({
   }, [bridge, project.id, action.id]);
   const runId = run?.id;
   const running = run?.status === "running";
+  // PowerShell is the Windows desktop's runner; where its bridge is missing, nothing runs.
+  const runner = canRunCommands() ? " PowerShell runs as your signed-in Windows user." : "";
   useEffect(() => {
     if (!runId || !running || !bridge) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
       void bridge
-        .projectActionStatus(runId)
+        .projectActionStatus?.(runId)
         .then((value) => {
           if (!cancelled) setRun(decodeActionRun(value));
         })
@@ -171,7 +179,7 @@ export function ProjectActionOutput({
     };
   }, [bridge, runId, running]);
   const perform = async (stop: boolean) => {
-    if (!bridge) return;
+    if (!bridge?.runProjectAction || !bridge.stopProjectAction) return;
     setPending(true);
     setError(null);
     try {
@@ -189,7 +197,7 @@ export function ProjectActionOutput({
   return (
     <Dialog
       title={action.name}
-      description={`Manual command in ${project.name}. PowerShell runs as your signed-in Windows user.`}
+      description={`Manual command in ${project.name}.${runner}`}
       className="project-output-dialog"
       onClose={close}
     >
@@ -225,7 +233,7 @@ export function ProjectActionOutput({
         ) : (
           <Button
             variant="primary"
-            disabled={pending || !bridge}
+            disabled={pending || !bridge?.runProjectAction}
             onClick={() => void perform(false)}
           >
             <Play size={14} />
@@ -247,7 +255,8 @@ function IconPicker({
   close,
 }: {
   project: Project;
-  save: (icon: ProjectIcon) => Promise<boolean>;
+  // Resolves to null once saved, else to why not.
+  save: (icon: ProjectIcon) => Promise<string | null>;
   close: () => void;
 }) {
   const existing = project.icon;
@@ -392,8 +401,9 @@ function IconPicker({
               try {
                 validateProjectChanges({ icon: candidate });
                 setPending(true);
-                if (await save(candidate)) close();
-                else setError("The icon could not save. Retry when the coordinator is available.");
+                const failure = await save(candidate);
+                if (failure === null) close();
+                else setError(failure);
               } catch (failure) {
                 setError(failure instanceof Error ? failure.message : "Choose a valid icon.");
               } finally {
@@ -417,7 +427,8 @@ function ActionEditor({
 }: {
   project: Project;
   action: ProjectAction | null;
-  save: (actions: readonly ProjectAction[]) => Promise<boolean>;
+  // Resolves to null once saved, else to why not.
+  save: (actions: readonly ProjectAction[]) => Promise<string | null>;
   close: () => void;
 }) {
   const { bindings } = useAppearance();
@@ -451,8 +462,9 @@ function ActionEditor({
       }
       validateProjectChanges({ actions: next });
       setPending(true);
-      if (await save(next)) close();
-      else setError("The action could not save. Your edits are still here.");
+      const failure = await save(next);
+      if (failure === null) close();
+      else setError(`${failure} Your edits are still here.`);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Check the action fields.");
     } finally {
@@ -494,11 +506,14 @@ function ActionEditor({
           Keybinding
           <Input
             aria-label="Action keybinding"
+            aria-describedby="action-keybinding-help"
             readOnly
-            value={shortcut}
+            value={formatShortcut(shortcut)}
             placeholder="Press shortcut"
             disabled={pending}
             onKeyDown={(e) => {
+              // Tab and Escape keep their usual job, so the field never traps keyboard focus.
+              if (e.key === "Tab" || e.key === "Escape") return;
               e.preventDefault();
               e.stopPropagation();
               if (e.key === "Backspace" || e.key === "Delete") {
@@ -506,17 +521,18 @@ function ActionEditor({
                 setError(null);
                 return;
               }
-              const chord = keyChord(e, navigator.platform.toLowerCase().includes("mac"));
+              const chord = keyChord(e, isMac());
               if (chord) {
-                const conflict = actionShortcutConflict(project.actions ?? [], id, chord, bindings);
-                setError(conflict);
-                if (!conflict) setShortcut(chord);
+                const problem = actionShortcutProblem(project.actions ?? [], id, chord, bindings);
+                setError(problem);
+                if (!problem) setShortcut(chord);
               }
             }}
           />
         </label>
-        <p className="muted small">
-          Shortcuts open the command panel for this project. Backspace clears a shortcut.
+        <p id="action-keybinding-help" className="muted small">
+          Shortcuts open the command panel for this project. Press {commandModifiers(isMac())} with
+          a key. Backspace clears a shortcut; Tab and Escape leave the field.
         </p>
         <label className="field-label">
           Command
@@ -561,53 +577,71 @@ function ActionEditor({
 
 function ProjectDetail({ members }: { members: Member[] }) {
   const project = members[0]!.project;
-  const { mutate, busy, connection } = useMonitoring();
-  const [error, setError] = useState<string | null>(null);
+  const { mutate, pending, connection } = useMonitoring();
+  // Why the last change failed. If this page is gone when the answer arrives, a toast says it.
+  const [error, fail, clearError] = useFailure();
   const [iconOpen, setIconOpen] = useState(false);
   const [editing, setEditing] = useState<{ action: ProjectAction | null } | null>(null);
   const [running, setRunning] = useState<ProjectAction | null>(null);
   const [removing, setRemoving] = useState(false);
+  // Removal is a loop over the entries; the dialog is held for all of it, not entry by entry.
+  const [deleting, setDeleting] = useState(false);
+  const [removeError, failRemove, clearRemoveError] = useFailure(removing);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const remote = members.some((m) => m.environment !== "local");
-  const disabled = remote || busy || saving || connection !== "connected";
+  // Only this project's own removal holds its controls; saving already has its own state.
+  const removalRunning = members.some((m) => pending.has(actionKeys.removeProject(m.project.id)));
+  const disabled = remote || removalRunning || saving || connection !== "connected";
+  // Where commands cannot run, Run says so instead of acting.
+  const noRunner = !remote && !canRunCommands();
   const { bindings } = useAppearance();
-  const change = async (body: unknown) => {
-    if (remote) {
-      setError("Edit this project on its own PC.");
-      return false;
-    }
-    if (savingRef.current) return false;
+  // Saves a change on every selected entry. It resolves to null once saved, else to why not: the
+  // page shows that, and so does a dialog that asked, beside its own form.
+  const change = async (body: unknown): Promise<string | null> => {
+    const refuse = (message: string) => {
+      fail(message);
+      return message;
+    };
+    if (remote) return refuse("Edit this project on its own PC.");
+    if (savingRef.current) return "Another change is still saving.";
     savingRef.current = true;
     setSaving(true);
-    setError(null);
+    clearError();
     try {
       validateProjectChanges(body);
       for (const member of members) {
+        const cause = { message: "" };
         const result = await mutate(
           `/api/projects/${encodeURIComponent(member.project.id)}`,
           body,
           decodeProject,
           "Project settings saved.",
           "PATCH",
+          {
+            onError: (message) => {
+              cause.message = message;
+            },
+          },
         );
-        if (!result) {
-          setError(`Could not save ${member.project.name} on ${member.label}.`);
-          return false;
-        }
+        if (!result)
+          return refuse(
+            `Could not save ${member.project.name} on ${member.label}${cause.message ? `: ${cause.message}` : "."}`,
+          );
       }
-      return true;
+      return null;
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "Project settings could not save.");
-      return false;
+      return refuse(
+        failure instanceof Error ? failure.message : "Project settings could not save.",
+      );
     } finally {
       savingRef.current = false;
       setSaving(false);
     }
   };
   useEffect(() => {
-    if (remote || project.repository || !window.versionstead?.runProjectAction) return;
+    if (remote || project.repository || !canRunCommands()) return;
     const handler = (event: KeyboardEvent) => {
       if (
         event.repeat ||
@@ -617,12 +651,7 @@ function ProjectDetail({ members }: { members: Member[] }) {
           event.target.closest('input,textarea,select,[contenteditable="true"]'))
       )
         return;
-      const chord = keyChord(event, navigator.platform.toLowerCase().includes("mac"));
-      const action = project.actions?.find(
-        (a) =>
-          a.shortcut === chord &&
-          !actionShortcutConflict(project.actions ?? [], a.id, chord ?? "", bindings),
-      );
+      const action = actionForChord(project.actions ?? [], keyChord(event, isMac()), bindings);
       if (action) {
         event.preventDefault();
         setRunning(action);
@@ -636,7 +665,7 @@ function ProjectDetail({ members }: { members: Member[] }) {
       const icon = await readProjectIcon(file);
       await change({ icon });
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "The icon file could not be read.");
+      fail(failure instanceof Error ? failure.message : "The icon file could not be read.");
     }
   };
   return (
@@ -654,6 +683,8 @@ function ProjectDetail({ members }: { members: Member[] }) {
           {error}
         </p>
       )}
+      {/* The rows below are h3s, so they need a heading above them, though no title is shown. */}
+      <h2 className="sr-only">Name and icon</h2>
       <div className="setting-group project-overview">
         <SettingRow
           label="Name"
@@ -751,12 +782,17 @@ function ProjectDetail({ members }: { members: Member[] }) {
                 mark={<Glyph size={15} />}
                 description={action.command}
               >
-                {action.shortcut && <kbd>{action.shortcut}</kbd>}
+                {action.shortcut && <kbd>{formatShortcut(action.shortcut)}</kbd>}
+                {/* Without the bridge Run stays focusable and names its reason; it never starts. */}
                 <Button
                   size="compact"
-                  disabled={disabled || !window.versionstead?.runProjectAction}
+                  disabled={disabled}
+                  aria-disabled={noRunner || undefined}
+                  aria-describedby={noRunner ? "project-commands-note" : undefined}
                   aria-label={`Run ${action.name}`}
-                  onClick={() => setRunning(action)}
+                  onClick={() => {
+                    if (!noRunner) setRunning(action);
+                  }}
                 >
                   <Play size={13} />
                   Run
@@ -773,9 +809,9 @@ function ProjectDetail({ members }: { members: Member[] }) {
             );
           })
         )}
-        {!window.versionstead?.runProjectAction && !project.repository && !remote && (
-          <p className="project-actions-empty muted small">
-            Open Versionstead desktop to launch commands. Saved actions can be edited here.
+        {noRunner && !project.repository && (
+          <p id="project-commands-note" className="project-actions-empty muted small">
+            {commandsNote} Saved actions can be edited here.
           </p>
         )}
       </SettingGroup>
@@ -784,7 +820,14 @@ function ProjectDetail({ members }: { members: Member[] }) {
           label={members.length > 1 ? "Remove this project everywhere" : "Remove project"}
           description="Deletes selected project entries and current evidence. Files on disk are not touched."
         >
-          <Button variant="danger" disabled={disabled} onClick={() => setRemoving(true)}>
+          <Button
+            variant="danger"
+            disabled={disabled}
+            onClick={() => {
+              clearRemoveError();
+              setRemoving(true);
+            }}
+          >
             <Trash2 size={14} />
             {members.length > 1 ? "Remove all entries" : "Remove project"}
           </Button>
@@ -813,28 +856,40 @@ function ProjectDetail({ members }: { members: Member[] }) {
           title="Remove project?"
           description={`Remove ${members.length === 1 ? project.name : `all ${members.length} selected entries`}, its current dependencies, findings, icon, and actions? Project files remain on disk. Historical scan records retain their observed labels.`}
           onClose={() => setRemoving(false)}
-          dismissible={!busy}
+          dismissible={!deleting}
         >
-          <div className="row-actions">
-            <Button disabled={busy} onClick={() => setRemoving(false)}>
+          {removeError && (
+            <p role="alert" className="error-text">
+              {removeError}
+            </p>
+          )}
+          <div className={cn("row-actions", removeError && "mt-3")}>
+            <Button disabled={deleting} onClick={() => setRemoving(false)}>
               Cancel
             </Button>
             <Button
               variant="danger"
-              disabled={busy}
+              disabled={deleting}
               onClick={() => {
+                clearRemoveError();
+                setDeleting(true);
                 void (async () => {
-                  for (const member of members) {
-                    const removed = await mutate(
-                      `/api/projects/${encodeURIComponent(member.project.id)}`,
-                      {},
-                      decodeAcceptedResponse,
-                      "Project removed.",
-                      "DELETE",
-                    );
-                    if (!removed) return;
+                  try {
+                    for (const member of members) {
+                      const removed = await mutate(
+                        `/api/projects/${encodeURIComponent(member.project.id)}`,
+                        {},
+                        decodeAcceptedResponse,
+                        "Project removed.",
+                        "DELETE",
+                        { key: actionKeys.removeProject(member.project.id), onError: failRemove },
+                      );
+                      if (!removed) return;
+                    }
+                    setRemoving(false);
+                  } finally {
+                    setDeleting(false);
                   }
-                  setRemoving(false);
                 })();
               }}
             >

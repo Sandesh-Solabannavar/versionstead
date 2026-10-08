@@ -30,19 +30,23 @@ export class InputError extends Error {
   }
 }
 
+export const isNetworkShare = (path: string) => path.startsWith("\\\\") || path.startsWith("//");
+const networkSharesUnsupported = "Network shares are not supported yet.";
+
 export async function selectDirectory(path: string): Promise<string> {
   if (!isAbsolute(path) || path.length > 4096 || path.includes("\0")) {
     throw new InputError("Select an absolute local directory.");
   }
   // Network shares require an explicit access/credential design before they are selected.
-  if (path.startsWith("\\\\") || path.startsWith("//")) {
-    throw new InputError("Network shares are not supported yet.");
-  }
+  if (isNetworkShare(path)) throw new InputError(networkSharesUnsupported);
   try {
     const canonical = await realpath(path);
+    // A mapped drive looks local until it is resolved to its UNC target.
+    if (isNetworkShare(canonical)) throw new InputError(networkSharesUnsupported);
     if (!(await stat(canonical)).isDirectory()) throw new Error();
     return canonical;
-  } catch {
+  } catch (error) {
+    if (error instanceof InputError) throw error;
     throw new InputError("The selected directory is missing or cannot be accessed.");
   }
 }
@@ -89,14 +93,19 @@ export async function readSelectedFile(root: string, name: string, limit = 10 * 
     ) {
       throw new InputError("A project input changed identity while opening; retry the scan.");
     }
-    const buffer = Buffer.alloc(limit + 1);
+    const size = Math.min(info.size, limit);
+    const buffer = Buffer.allocUnsafe(size + 1);
     let used = 0;
     while (used < buffer.length) {
       const { bytesRead } = await file.read(buffer, used, buffer.length - used, null);
       if (bytesRead === 0) break;
       used += bytesRead;
     }
-    if (used > limit) throw new InputError("An input file exceeds its supported size.");
+    // The spare byte exposes a file that outgrew its measured size or the limit.
+    if (used > size)
+      throw new InputError(
+        "An input file exceeds its supported size or changed while it was read.",
+      );
     return buffer
       .subarray(0, used)
       .toString("utf8")
@@ -232,9 +241,15 @@ async function npmInputs(
     throw new InputError("The lockfile exceeds 10,000 packages.", "unsupported");
   const errors: string[] = [];
   const importers = new Map<string, Declaration[]>([[".", declarations(manifest, ".")]]);
+  let linkedOutside = false;
   for (const [path, value] of entries) {
     if (!path || path.includes("node_modules")) continue;
     object(value);
+    // `npm install ../x` records the link target outside the project; it is not a workspace to read.
+    if (isAbsolute(path) || path.split("/").includes("..")) {
+      linkedOutside = true;
+      continue;
+    }
     if (importers.size >= 100)
       throw new InputError("The project exceeds 100 workspace importers.", "unsupported");
     const input = await read(`${path}/package.json`, 1024 * 1024);
@@ -320,6 +335,9 @@ async function npmInputs(
       `npm lockfile v${lock.lockfileVersion}: requested and resolved dependencies`,
       `${importers.size} selected workspace importer(s)`,
       "Lockfile evidence only; node_modules is not inspected",
+      ...(linkedOutside
+        ? ["A linked dependency outside the selected project was not inspected."]
+        : []),
     ],
   };
 }

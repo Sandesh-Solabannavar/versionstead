@@ -205,6 +205,7 @@ export const MonitoringSnapshot = Schema.Struct({
       "settings-repositories-connections-v4",
       "settings-repositories-connections-v5",
       "settings-repositories-connections-v6",
+      "settings-repositories-connections-v7",
     ]),
   ),
   runtime: Schema.Struct({
@@ -233,6 +234,15 @@ export const MonitoringSnapshot = Schema.Struct({
 });
 export type MonitoringSnapshot = typeof MonitoringSnapshot.Type;
 export const decodeMonitoringSnapshot = Schema.decodeUnknownSync(MonitoringSnapshot);
+// Live fields read without the snapshot; `revision` is the snapshot's ETag value.
+export const MonitoringProgress = Schema.Struct({
+  revision: Schema.String,
+  scanProgress: ScanProgress,
+  notificationSummary: Schema.NullOr(NotificationSummary),
+  notificationNextAt: NullableString,
+});
+export type MonitoringProgress = typeof MonitoringProgress.Type;
+export const decodeMonitoringProgress = Schema.decodeUnknownSync(MonitoringProgress);
 export const decodeProject = Schema.decodeUnknownSync(Project);
 export const decodeMonitoringSettings = Schema.decodeUnknownSync(MonitoringSettings);
 export const AcceptedResponse = Schema.Struct({ accepted: Schema.Literal(true) });

@@ -20,3 +20,5 @@ Thumbs.db
 .e2e/logs/
 .e2e/videos/
 .e2e/coordinator-data/
+.recall/
+.superpowers/

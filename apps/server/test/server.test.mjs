@@ -1,17 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm, realpath } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { get } from "node:http";
+import { fileURLToPath } from "node:url";
 import { startServer } from "../dist/server.js";
 import { decodeStatus } from "@versionstead/contracts/status";
+import { decodeMonitoringProgress } from "@versionstead/contracts/monitoring";
 import { MonitoringCoordinator } from "../dist/monitoring.js";
+import { InputError } from "../dist/adapters/projects.js";
 import {
   acquireCoordinatorLock,
+  protectSecret,
   readRuntime,
-  writeRuntime,
   removeRuntime,
+  resolveDataDir,
+  unprotectSecret,
+  writeRuntime,
 } from "../dist/runtime.js";
 import { randomBytes } from "node:crypto";
 
@@ -296,6 +303,149 @@ test("authenticated HTTP exposes real scan progress and atomically acknowledges 
   }
 });
 
+test("snapshot revisions drive ETag/304 responses while live progress has its own endpoint", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-revision-http-"));
+  const projectDir = join(dataDir, "selected");
+  await mkdir(projectDir);
+  await writeFile(
+    join(projectDir, "package.json"),
+    JSON.stringify({ name: "fixture", dependencies: { example: "^1.0.0" } }),
+  );
+  await writeFile(
+    join(projectDir, "package-lock.json"),
+    JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "fixture", dependencies: { example: "^1.0.0" } },
+        "node_modules/example": {
+          version: "1.0.0",
+          resolved: "https://registry.npmjs.org/example/-/example-1.0.0.tgz",
+        },
+      },
+    }),
+  );
+  const gates = [];
+  const dependencyLookup = async (dependencies, _signal, progress) => {
+    for (const completed of [0, dependencies.length]) {
+      progress?.({ stage: "versions", completed, total: dependencies.length });
+      await new Promise((resolve) => gates.push(resolve));
+    }
+    return { dependencies, advisories: new Map(), coverage: [], errors: [] };
+  };
+  const token = randomBytes(32).toString("base64url");
+  const open = async () => {
+    const coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup });
+    coordinator.changeSettings({ paused: true });
+    return {
+      coordinator,
+      server: await startServer({ port: 0, monitoring: coordinator, authToken: token }),
+    };
+  };
+  let first = await open();
+  let second;
+  const call = (path, { method = "GET", headers = {}, body } = {}, instance = first) =>
+    fetch(`${instance.server.origin}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...headers,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  const progress = async () =>
+    decodeMonitoringProgress(await (await call("/api/monitoring/progress")).json());
+  // Fails loudly: a condition that never arrives must not let the next assertion run on stale state.
+  const until = async (predicate) => {
+    const deadline = Date.now() + 10_000;
+    while (!(await predicate())) {
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${predicate}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    assert.equal((await fetch(`${first.server.origin}/api/monitoring/progress`)).status, 401);
+    const initial = await call("/api/monitoring");
+    assert.equal(initial.status, 200);
+    const tag = initial.headers.get("etag");
+    assert.match(tag, /^"[^"]+"$/, "The revision is one quoted entity tag");
+    const body = await initial.json();
+    assert.equal(body.features, "settings-repositories-connections-v7");
+    assert.deepEqual(body, first.coordinator.snapshot(), "Cached and live parts form the snapshot");
+    for (const [method, headers, status] of [
+      ["GET", { "If-None-Match": tag }, 304],
+      ["GET", { "If-None-Match": `"stale", ${tag}` }, 304],
+      ["HEAD", {}, 200],
+      ["HEAD", { "If-None-Match": tag }, 304],
+    ]) {
+      const response = await call("/api/monitoring", { method, headers });
+      assert.equal(response.status, status, `${method} ${JSON.stringify(headers)}`);
+      assert.equal(response.headers.get("etag"), tag);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(await response.text(), "");
+    }
+    const idle = await progress();
+    assert.equal(`"${idle.revision}"`, tag, "Progress names the snapshot revision it belongs to");
+    assert.deepEqual(idle.scanProgress, { active: null, queued: [] });
+    assert.equal(idle.notificationSummary, null);
+    assert.equal(idle.notificationNextAt, null);
+
+    let current = tag;
+    const changed = async () => {
+      const response = await call("/api/monitoring", { headers: { "If-None-Match": current } });
+      assert.equal(response.status, 200, "A durable change is a new revision");
+      assert.notEqual(response.headers.get("etag"), current);
+      current = response.headers.get("etag");
+      return response.json();
+    };
+    const patch = { method: "PATCH", body: { projectIntervalMinutes: 30 } };
+    assert.equal((await call("/api/settings", patch)).status, 200);
+    assert.equal((await changed()).settings.projectIntervalMinutes, 30);
+    const add = { method: "POST", body: { path: projectDir, mode: "maintained" } };
+    const project = await (await call("/api/projects", add)).json();
+    assert.equal((await changed()).projects[0].id, project.id);
+    const rename = { method: "PATCH", body: { name: "Renamed" } };
+    assert.equal((await call(`/api/projects/${project.id}`, rename)).status, 200);
+    assert.equal((await changed()).projects[0].name, "Renamed");
+
+    const scan = { method: "POST", body: { target: "projects", projectId: project.id } };
+    assert.equal((await call("/api/scans", scan)).status, 202);
+    await until(() => gates.length === 1);
+    assert.equal((await changed()).projects[0].evidence.status, "scanning");
+    const started = await progress();
+    assert.equal(`"${started.revision}"`, current);
+    assert.equal(started.scanProgress.active.completed, 0);
+    gates.shift()();
+    await until(() => gates.length === 1);
+    const advanced = await progress();
+    assert.equal(advanced.revision, started.revision, "Live progress is not a durable change");
+    assert.equal(advanced.scanProgress.active.completed, 1);
+    const unchanged = { headers: { "If-None-Match": current } };
+    assert.equal((await call("/api/monitoring", unchanged)).status, 304);
+    gates.shift()();
+    await until(async () => (await progress()).scanProgress.active === null);
+    assert.equal((await changed()).projects[0].evidence.status, "complete");
+
+    const closing = first;
+    first = undefined;
+    await closing.server.close();
+    await closing.coordinator.close();
+    second = await open();
+    const reopened = await call("/api/monitoring", unchanged, second);
+    assert.equal(reopened.status, 200, "Another instance on the same database never matches");
+    assert.notEqual(reopened.headers.get("etag"), current);
+    assert.notEqual(reopened.headers.get("etag"), tag);
+  } finally {
+    for (const release of gates) release();
+    for (const instance of [first, second].filter(Boolean)) {
+      await instance.server.close();
+      await instance.coordinator.close();
+    }
+    assert.ok(dataDir.startsWith(join(tmpdir(), "versionstead-revision-http-")));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("runtime descriptor protects the token and an OS database lock prevents duplicate writers", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "versionstead-runtime-"));
   const release = acquireCoordinatorLock(dataDir);
@@ -329,6 +479,132 @@ test("runtime descriptor protects the token and an OS database lock prevents dup
     assert.ok(dataDir.startsWith(join(tmpdir(), "versionstead-runtime-")));
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("runtime descriptor round-trips the optional development origin that browser access prints", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-runtime-"));
+  const runtime = {
+    origin: "http://127.0.0.1:4318",
+    pid: process.pid,
+    token: randomBytes(32).toString("base64url"),
+    mode: "interactive",
+    host: "session",
+  };
+  const access = () =>
+    execFileSync(process.execPath, [fileURLToPath(new URL("../dist/access.js", import.meta.url))], {
+      encoding: "utf8",
+      env: { ...process.env, VERSIONSTEAD_DATA_DIR: dataDir },
+    });
+  try {
+    await writeRuntime(dataDir, runtime);
+    assert.deepEqual(await readRuntime(dataDir), runtime, "Descriptors without it stay valid");
+    assert.equal(
+      access(),
+      `Open ${runtime.origin} and enter this session access code:\n${runtime.token}\n`,
+    );
+    const development = { ...runtime, devOrigin: "http://127.0.0.1:4317" };
+    await writeRuntime(dataDir, development);
+    assert.deepEqual(await readRuntime(dataDir), development);
+    assert.equal(
+      access(),
+      `Open ${development.devOrigin} and enter this session access code:\n${runtime.token}\n`,
+    );
+    await assert.rejects(
+      writeRuntime(dataDir, { ...runtime, devOrigin: "http://127.0.0.1:9999" }),
+      /Invalid coordinator descriptor/,
+    );
+    const file = join(dataDir, "runtime.json");
+    const stored = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ ...stored, devOrigin: "https://attacker.invalid" }));
+    assert.equal(await readRuntime(dataDir), null, "Only the development origin is accepted");
+  } finally {
+    assert.ok(dataDir.startsWith(join(tmpdir(), "versionstead-runtime-")));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+async function temporaryHome(t) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "versionstead-home-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  return home;
+}
+
+test("data directory follows each platform's convention", async (t) => {
+  const home = await temporaryHome(t);
+  const share = join(home, ".local", "share", "Versionstead");
+  const explicit = join(home, "explicit");
+  assert.equal(resolveDataDir({ VERSIONSTEAD_DATA_DIR: explicit }, "linux", home), explicit);
+  assert.equal(resolveDataDir({ VERSIONSTEAD_DATA_DIR: explicit }, "darwin", home), explicit);
+  assert.throws(
+    () => resolveDataDir({ VERSIONSTEAD_DATA_DIR: "relative" }, "linux", home),
+    /must be absolute/,
+  );
+  // Windows is unchanged.
+  const local = join(home, "Local");
+  assert.equal(resolveDataDir({ LOCALAPPDATA: local }, "win32", home), join(local, "Versionstead"));
+  assert.equal(resolveDataDir({}, "win32", home), share);
+  // Linux honors an absolute XDG_DATA_HOME and ignores a relative one and LOCALAPPDATA.
+  assert.equal(
+    resolveDataDir({ XDG_DATA_HOME: join(home, "xdg") }, "linux", home),
+    join(home, "xdg", "Versionstead"),
+  );
+  assert.equal(resolveDataDir({ XDG_DATA_HOME: "relative" }, "linux", home), share);
+  assert.equal(resolveDataDir({ LOCALAPPDATA: local }, "linux", home), share);
+  assert.equal(resolveDataDir({}, "linux", home), share);
+  // macOS uses Application Support and ignores both of those variables.
+  const support = join(home, "Library", "Application Support", "Versionstead");
+  assert.equal(resolveDataDir({ LOCALAPPDATA: local }, "darwin", home), support);
+  assert.equal(resolveDataDir({ XDG_DATA_HOME: join(home, "xdg") }, "darwin", home), support);
+});
+
+test("data of an earlier build stays in use until the new folder holds a database, whatever else is in it", async (t) => {
+  const home = await temporaryHome(t);
+  const legacy = join(home, ".local", "share", "Versionstead");
+  const support = join(home, "Library", "Application Support", "Versionstead");
+  const xdg = join(home, "xdg");
+  const custom = join(xdg, "Versionstead");
+  const hold = async (directory, file = "monitoring.sqlite") => {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, file), "");
+  };
+  const mac = () => resolveDataDir({}, "darwin", home);
+  const linux = () => resolveDataDir({ XDG_DATA_HOME: xdg }, "linux", home);
+  // A fresh install, or an earlier folder without a database, starts in the platform's own folder.
+  await mkdir(legacy, { recursive: true });
+  assert.equal(mac(), support);
+  assert.equal(linux(), custom);
+  // A database in the earlier folder is the owner's data and is kept.
+  await hold(legacy);
+  assert.equal(mac(), legacy);
+  assert.equal(linux(), legacy);
+  // Electron creates its own profile in the macOS folder on every launch, which must not strand that data.
+  await hold(support, "Preferences");
+  await hold(custom, "settings.json");
+  assert.equal(mac(), legacy);
+  assert.equal(linux(), legacy);
+  // Once the new folder has a database it wins.
+  await hold(support);
+  await hold(custom);
+  assert.equal(mac(), support);
+  assert.equal(linux(), custom);
+  // Without a custom XDG_DATA_HOME the Linux folder is the earlier folder itself; Windows ignores all of this.
+  assert.equal(resolveDataDir({}, "linux", home), legacy);
+  assert.equal(
+    resolveDataDir({ LOCALAPPDATA: join(home, "Local") }, "win32", home),
+    join(home, "Local", "Versionstead"),
+  );
+});
+
+test("hosts without OS-backed credential storage answer with an input error that says why", async () => {
+  for (const operation of [protectSecret, unprotectSecret])
+    for (const platform of ["linux", "darwin"])
+      await assert.rejects(
+        operation("value", platform),
+        (error) =>
+          error instanceof InputError &&
+          error.message ===
+            "OS-backed connection credentials are currently supported on Windows only.",
+      );
 });
 
 test("static serving exposes built routes/assets, never arbitrary workspace paths", async () => {

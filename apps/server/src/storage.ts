@@ -5,6 +5,7 @@ import {
   decodeMonitoringSnapshot,
   type MonitoringSnapshot,
 } from "@versionstead/contracts/monitoring";
+import { DATABASE_FILE } from "./runtime.ts";
 
 export type StoredMonitoring = {
   snapshot: MonitoringSnapshot;
@@ -17,7 +18,7 @@ export class MonitoringStorage {
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.database = new DatabaseSync(join(dataDir, "monitoring.sqlite"), { timeout: 5000 });
+    this.database = new DatabaseSync(join(dataDir, DATABASE_FILE), { timeout: 5000 });
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
     const version = this.database.prepare("PRAGMA user_version").get()?.user_version;
     if (version !== 0 && version !== 1) {

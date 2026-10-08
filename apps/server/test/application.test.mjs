@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
@@ -289,6 +289,35 @@ test("application settings routes require local authentication and validate muta
 });
 
 test(
+  "connecting a provider where OS-backed credential storage is unsupported is a 400 that says why",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    core.changeSettings({ paused: true });
+    const app = await ApplicationService.create(core, providerFixture().fetcher);
+    const token = randomBytes(32).toString("base64url");
+    const server = await startServer({
+      port: 0,
+      monitoring: core,
+      authToken: token,
+      application: app,
+    });
+    t.after(async () => {
+      await server.close();
+      await core.close();
+      await cleanupTemporary(t);
+    });
+    const refused = await fetch(`${server.origin}/api/application/providers/connect`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "github", token: "read-token" }),
+    });
+    assert.equal(refused.status, 400);
+    assert.match((await refused.json()).error, /supported on Windows only/);
+  },
+);
+
+test(
   "selected repositories scan automatically; protected credentials and retained evidence survive restart",
   { skip: process.platform !== "win32" },
   async (t) => {
@@ -564,6 +593,119 @@ test(
   },
 );
 
+function seedApplication(core, { computers = [], automaticAppUpdateChecks = false } = {}) {
+  core.readApplication(); // Creates the table the first write needs.
+  core.writeApplication({
+    preferences: { gitEnabled: false, automaticRepositoryScans: false, automaticAppUpdateChecks },
+    providers: ["github", "gitlab"].map((kind) => ({
+      kind,
+      enabled: false,
+      account: null,
+      checkedAt: null,
+      error: null,
+    })),
+    computers,
+    sharing: {
+      enabled: false,
+      address: "",
+      port: 4389,
+      fingerprint: null,
+      error: null,
+      clients: [],
+    },
+    secrets: [],
+    clientHashes: [],
+  });
+}
+const pairedComputer = (label) => ({
+  id: randomUUID(),
+  label,
+  origin: "https://127.0.0.1:4389",
+  fingerprint: "a".repeat(64),
+  deviceId: randomUUID(),
+  checkedAt: null,
+  error: null,
+  snapshot: null,
+  enabled: true,
+});
+
+test("a PC removed or disabled while a poll awaits another never rejects the poll", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const [first, removed, disabled, last] = ["first", "removed", "disabled", "last"].map(
+    pairedComputer,
+  );
+  seedApplication(core, { computers: [first, removed, disabled, last] });
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  const refreshed = [];
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const refresh = app.refreshComputer.bind(app);
+  app.refreshComputer = async (id) => {
+    refreshed.push(id);
+    if (id === first.id) {
+      await held;
+      throw new Error("unexpected refresh failure");
+    }
+    return refresh(id);
+  };
+  t.mock.timers.tick(30000);
+  const polling = app.polling;
+  assert.deepEqual(refreshed, [first.id], "The poll is awaiting the first PC");
+  await app.removeComputer(removed.id);
+  await app.changeComputer(disabled.id, false);
+  release();
+  await polling;
+  assert.deepEqual(
+    refreshed,
+    [first.id, last.id],
+    "Removed and disabled PCs are skipped, and one failing PC does not stop the next",
+  );
+  const computers = app.snapshot().computers;
+  assert.deepEqual(
+    computers.map((c) => [c.label, c.enabled]),
+    [
+      ["first", true],
+      ["disabled", false],
+      ["last", true],
+    ],
+  );
+  assert.match(
+    computers.find((c) => c.id === last.id).error,
+    /unreachable/,
+    "refreshComputer still records per-PC failures for the UI",
+  );
+});
+
+test("a failing app update check never rejects the poll", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  seedApplication(core, { automaticAppUpdateChecks: true });
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  let checks = 0;
+  app.checkUpdate = async () => {
+    checks++;
+    throw new Error("unexpected update failure");
+  };
+  t.mock.timers.tick(30000);
+  await app.polling;
+  assert.equal(checks, 1);
+});
+
 test("Git context never executes clean/process filters or inherited project overrides", async (t) => {
   if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
   const folder = await temporary(t);
@@ -602,4 +744,102 @@ test("Git context never executes clean/process filters or inherited project over
     if (before === undefined) delete process.env.GIT_WORK_TREE;
     else process.env.GIT_WORK_TREE = before;
   }
+});
+
+async function commitFixture(folder) {
+  const args = ["-c", "core.hooksPath=", "-C", folder];
+  await runTool("git", ["-c", "init.templateDir=", "init", "--quiet", folder]);
+  await runTool("git", [...args, "add", "--all"]);
+  await runTool("git", [
+    ...args,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "--quiet",
+    "-m",
+    "Fixture",
+  ]);
+  return args;
+}
+
+test("Git status beyond the output bound reports a dirty tree instead of losing the context", async (t) => {
+  if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
+  const folder = await temporary(t);
+  t.after(() => cleanupTemporary(t));
+  // Each deleted tracked file is one porcelain line; together they pass runTool's 64 KiB bound.
+  const names = Array.from(
+    { length: 700 },
+    (_, index) => `${String(index).padStart(4, "0")}-${"n".repeat(100)}`,
+  );
+  await Promise.all(names.map((name) => writeFile(join(folder, name), "x")));
+  const args = await commitFixture(folder);
+  await Promise.all(names.map((name) => rm(join(folder, name))));
+  await assert.rejects(
+    runTool("git", [...args, "status", "--porcelain", "--untracked-files=no"]),
+    /could not complete/,
+    "The fixture must exceed the output bound",
+  );
+  const result = await inspectGit(folder);
+  assert(result);
+  assert.match(result.commit, /^[a-f0-9]{40,64}$/);
+  assert.equal(result.dirty, true);
+});
+
+test("a failed Git inspection keeps the recorded Git context; turning Git context off still clears it", async (t) => {
+  if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  const folder = await temporary(t);
+  await writeFile(join(folder, "package.json"), files["package.json"]);
+  await writeFile(join(folder, "package-lock.json"), files["package-lock.json"]);
+  await commitFixture(folder);
+  const added = await core.addProject({ path: folder, mode: "maintained" });
+  const scanGit = async () => {
+    const previous = core.snapshot().history[0]?.id;
+    core.requestScan({ target: "projects", projectId: added.id });
+    await waitFor(() => {
+      const latest = core.snapshot().history[0];
+      return latest?.id !== previous && latest?.status !== "scanning";
+    });
+    return core.snapshot().projects[0].git;
+  };
+  const retained = "Git context could not be refreshed; the last recorded context is shown.";
+  const coverage = () => core.snapshot().projects[0].evidence.coverage;
+  const recorded = await scanGit();
+  assert.match(recorded.commit, /^[a-f0-9]{40,64}$/);
+  assert.equal(coverage().includes(retained), false, "A fresh context is current");
+  // Without its repository directory, git can no longer inspect the folder.
+  await rename(join(folder, ".git"), join(folder, ".git-away"));
+  assert.deepEqual(await scanGit(), recorded);
+  assert.ok(coverage().includes(retained), "Retained Git context must not read as current");
+  app.changePreferences({ gitEnabled: false });
+  assert.equal(await scanGit(), undefined);
+  assert.equal(coverage().includes(retained), false);
+});
+
+test("Git discovery follows the Git context preference: located but not run while it is off", async (t) => {
+  if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  assert.match((await app.discover()).tools.git.version, /^git version/);
+  app.changePreferences({ gitEnabled: false });
+  assert.deepEqual((await app.discover()).tools.git, { available: true, version: null });
+  app.changePreferences({ gitEnabled: true });
+  assert.match((await app.discover()).tools.git.version, /^git version/);
 });

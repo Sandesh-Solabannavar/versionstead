@@ -221,7 +221,7 @@ export class ApplicationService {
     this.localOrigin = origin;
   }
   async discover(refreshAuthentication = false) {
-    this.tools = await discoverTools();
+    this.tools = await discoverTools(this.state.preferences.gitEnabled);
     if (refreshAuthentication) {
       await Promise.all(
         this.state.providers.map(async (provider) => {
@@ -272,7 +272,7 @@ export class ApplicationService {
   }
   async connectProvider(kind: ProviderKind, token?: string, useCli = false) {
     if (useCli) {
-      if (this.coordinator.snapshot().runtime.mode !== "interactive")
+      if (this.coordinator.mode !== "interactive")
         throw new InputError(
           "The background host cannot read your signed-in CLI credentials. Connect with a read-only token instead.",
         );
@@ -370,7 +370,16 @@ export class ApplicationService {
       );
     }
     const result = await inspectProject(project.path);
-    if (this.state.preferences.gitEnabled) result.git = await inspectGit(project.path, signal);
+    // A failed inspection keeps the last recorded context, and says so; only turning Git context off
+    // clears it.
+    if (this.state.preferences.gitEnabled) {
+      const git = await inspectGit(project.path, signal);
+      if (!git && project.git)
+        result.coverage.push(
+          "Git context could not be refreshed; the last recorded context is shown.",
+        );
+      result.git = git ?? project.git;
+    }
     return result;
   }
   async checkUpdate() {
@@ -506,7 +515,7 @@ export class ApplicationService {
     const code = randomBytes(32).toString("base64url");
     const expires = Date.now() + 5 * 60000;
     this.invitation = { code, expires, attempts: 0 };
-    const device = this.coordinator.snapshot().device;
+    const device = this.coordinator.device;
     return {
       invitation: Buffer.from(
         JSON.stringify({
@@ -529,7 +538,7 @@ export class ApplicationService {
       ++invite.attempts > 8 ||
       !/^[A-Za-z0-9_-]{43}$/.test(code) ||
       !equal(hash(code), hash(invite.code)) ||
-      deviceId === this.coordinator.snapshot().device.id
+      deviceId === this.coordinator.device.id
     )
       throw new InputError("The pairing invitation is invalid, expired, or already used.");
     if (this.state.sharing.clients.length >= 16)
@@ -543,7 +552,7 @@ export class ApplicationService {
     };
     this.state.clientHashes = [...this.state.clientHashes, { id, hash: hash(token) }];
     this.save();
-    return { token, deviceId: this.coordinator.snapshot().device.id };
+    return { token, deviceId: this.coordinator.device.id };
   }
   private authenticateClient(token: string) {
     if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
@@ -558,7 +567,7 @@ export class ApplicationService {
     this.save();
   }
   async sshHosts() {
-    if (this.coordinator.snapshot().runtime.mode !== "interactive")
+    if (this.coordinator.mode !== "interactive")
       return {
         available: false,
         hosts: [],
@@ -569,7 +578,7 @@ export class ApplicationService {
   }
   private async transport(computer: { id: string; origin: string; ssh?: SshTarget | undefined }) {
     if (!computer.ssh) return {};
-    if (this.coordinator.snapshot().runtime.mode !== "interactive")
+    if (this.coordinator.mode !== "interactive")
       throw new InputError(
         "SSH requires the owner-session monitoring host. Use a LAN or Tailscale Remote link for unattended access.",
       );
@@ -613,14 +622,14 @@ export class ApplicationService {
       throw new InputError("Paste a valid Versionstead pairing link or code from the other PC.");
     }
     if (ssh) validateSshTarget(ssh);
-    if (data.deviceId === this.coordinator.snapshot().device.id)
+    if (data.deviceId === this.coordinator.device.id)
       throw new InputError("This invitation belongs to this PC. Create it on the other PC.");
     if (this.state.computers.some((c) => c.deviceId === data.deviceId))
       throw new InputError("This PC is already connected.");
     if (this.state.computers.length >= 8)
       throw new InputError("A maximum of eight connected computers is supported.");
     const origin = peerOrigin(data.origin);
-    const local = this.coordinator.snapshot().device;
+    const local = this.coordinator.device;
     const id = randomUUID();
     // Verify OS-backed storage before consuming the remote one-time invitation.
     await protectSecret("pairing-storage-check");
@@ -732,14 +741,19 @@ export class ApplicationService {
     this.save();
     return this.snapshot();
   }
+  // Never rejects: the timer chain has no handler, and one PC must not stop the others.
   private async poll() {
     if (this.shutdown.signal.aborted) return;
-    for (const c of this.state.computers) {
+    // A PC can be removed or disabled while an earlier one is awaited, so look each up again.
+    for (const id of this.state.computers.map((c) => c.id)) {
       if (this.shutdown.signal.aborted) break;
-      if (c.enabled !== false) await this.refreshComputer(c.id);
+      const computer = this.state.computers.find((c) => c.id === id);
+      if (!computer || computer.enabled === false) continue;
+      // refreshComputer records its failures on the PC record; nothing else needs surfacing here.
+      await this.refreshComputer(id).catch(() => {});
     }
     if (this.state.preferences.automaticAppUpdateChecks && Date.now() > this.nextUpdate)
-      await this.checkUpdate();
+      await this.checkUpdate().catch(() => {});
   }
   async close() {
     if (this.shutdown.signal.aborted) return;

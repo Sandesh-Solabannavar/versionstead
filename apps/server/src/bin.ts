@@ -3,7 +3,13 @@ import { isAbsolute, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { MonitoringCoordinator } from "./monitoring.ts";
-import { acquireCoordinatorLock, removeRuntime, resolveDataDir, writeRuntime } from "./runtime.ts";
+import {
+  acquireCoordinatorLock,
+  DEV_ORIGIN,
+  removeRuntime,
+  resolveDataDir,
+  writeRuntime,
+} from "./runtime.ts";
 import { startServer } from "./server.ts";
 
 const { values } = parseArgs({
@@ -57,7 +63,7 @@ if (values.help) {
       throw new Error("Data directory must be absolute");
     if (values["web-root"] && !isAbsolute(values["web-root"]))
       throw new Error("Web root must be absolute");
-    if (values["dev-origin"] && values["dev-origin"] !== "http://127.0.0.1:4317")
+    if (values["dev-origin"] && values["dev-origin"] !== DEV_ORIGIN)
       throw new Error("Invalid development origin");
     dataDir = values["data-dir"] ? resolve(values["data-dir"]) : resolveDataDir();
     release = acquireCoordinatorLock(dataDir);
@@ -81,6 +87,7 @@ if (values.help) {
       token,
       mode: values.mode,
       host: values.host,
+      ...(values["dev-origin"] ? { devOrigin: values["dev-origin"] } : {}),
     });
     console.log(`Versionstead coordinator: ${server.origin}`);
     const signalStop = () => {

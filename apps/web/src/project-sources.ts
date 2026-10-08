@@ -1,5 +1,16 @@
 import type { ProviderKind, Repository } from "@versionstead/contracts/application";
 
+/**
+ * An example folder in the path style of a platform, as process.platform or navigator.platform names
+ * it. It is absolute, as the folder field requires: the field does not expand `~`.
+ */
+export const folderPlaceholder = (platform: string) =>
+  /^win/i.test(platform)
+    ? "D:\\projects\\my-app"
+    : /mac|darwin/i.test(platform)
+      ? "/Users/you/projects/my-app"
+      : "/home/you/projects/my-app";
+
 export function repositoryLocation(input: string): { kind: ProviderKind; name: string } | null {
   const text = input.trim();
   const ssh = /^git@(github\.com|gitlab\.com):(.+)$/.exec(text);

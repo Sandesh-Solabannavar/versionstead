@@ -335,7 +335,14 @@ export async function peerRequest(
           response.on("error", reject);
           response.on("end", () => {
             if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-              reject(new InputError("The paired PC rejected access or is unavailable."));
+              reject(
+                new InputError(
+                  // The listener's per-client scan cooldown; the PC itself is reachable and paired.
+                  response.statusCode === 429
+                    ? "This PC was asked to scan recently. Try again in a minute."
+                    : "The paired PC rejected access or is unavailable.",
+                ),
+              );
               return;
             }
             try {

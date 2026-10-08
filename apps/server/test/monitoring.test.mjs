@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, open, writeFile, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { MonitoringStorage } from "../dist/storage.js";
-import { inspectProject, InputError, selectDirectory } from "../dist/adapters/projects.js";
+import {
+  inspectProject,
+  inspectProjectFiles,
+  InputError,
+  isNetworkShare,
+  readSelectedFile,
+  selectDirectory,
+} from "../dist/adapters/projects.js";
 import { identity } from "../dist/adapters/projects.js";
 import { lookupDependencies } from "../dist/adapters/lookups.js";
 
@@ -168,12 +175,20 @@ test("selected roots reject files, workspace traversal and escaping lockfile sym
   const outside = await temporary(t);
   await npmFixture(root);
   await assert.rejects(selectDirectory(join(root, "package.json")), /directory/);
+  // An npm "../x" key is a file: link target that is noted, not read (see the linked-dependency test);
+  // an escaping package location and a pnpm importer path remain fatal.
   await writeFile(
     join(root, "package-lock.json"),
-    JSON.stringify({ lockfileVersion: 3, packages: { "../escape": {} } }),
+    JSON.stringify({ lockfileVersion: 3, packages: { "../escape/node_modules/x": {} } }),
   );
   await assert.rejects(inspectProject(root), /escapes/);
   await rm(join(root, "package-lock.json"));
+  await writeFile(
+    join(root, "pnpm-lock.yaml"),
+    "lockfileVersion: '9.0'\nimporters:\n  ../escape: {}\n",
+  );
+  await assert.rejects(inspectProject(root), /escapes/);
+  await rm(join(root, "pnpm-lock.yaml"));
   await writeFile(join(outside, "lock.json"), JSON.stringify({ lockfileVersion: 3, packages: {} }));
   try {
     await symlink(join(outside, "lock.json"), join(root, "package-lock.json"), "file");
@@ -187,6 +202,78 @@ test("selected roots reject files, workspace traversal and escaping lockfile sym
     throw error;
   }
   await assert.rejects(inspectProject(root), /symlink escapes/);
+});
+
+test("npm file: links outside the selected project are noted once and never read as workspaces", async (t) => {
+  const base = await temporary(t);
+  const root = join(base, "app");
+  await mkdir(root);
+  await mkdir(join(base, "shared"));
+  await writeFile(join(base, "shared", "package.json"), "{ never read");
+  // Shaped like `npm install ../shared`: the target is a "../" key and node_modules/<name> is the link.
+  const files = {
+    "package.json": JSON.stringify({ name: "app", dependencies: { shared: "file:../shared" } }),
+    "package-lock.json": JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "app", dependencies: { shared: "file:../shared" } },
+        "../shared": { version: "1.0.0" },
+        "/linked/elsewhere": { version: "1.0.0" },
+        "node_modules/shared": { resolved: "../shared", link: true },
+      },
+    }),
+  };
+  for (const [name, text] of Object.entries(files)) await writeFile(join(root, name), text);
+  const reads = [];
+  const inMemory = await inspectProjectFiles(async (name) => {
+    reads.push(name);
+    return files[name] ?? null;
+  });
+  assert.deepEqual(
+    reads.filter((name) => name.includes("..") || name.startsWith("/")),
+    [],
+    "A link target outside the project is not a workspace importer to read",
+  );
+  const note = "A linked dependency outside the selected project was not inspected.";
+  for (const inputs of [inMemory, await inspectProject(root)]) {
+    assert.deepEqual(inputs.errors, []);
+    assert.equal(inputs.coverage.filter((line) => line === note).length, 1);
+    assert.match(inputs.coverage.join("\n"), /\b1 selected workspace importer/);
+    assert.equal(inputs.dependencies.find((d) => d.name === "shared").origin, "workspace");
+  }
+});
+
+test("selected files are read into buffers sized by the file, still bounded by the limit", async (t) => {
+  const root = await temporary(t);
+  await writeFile(join(root, "small.json"), '{"a":1}');
+  await writeFile(join(root, "exact.txt"), "12345");
+  await writeFile(join(root, "large.txt"), "123456");
+  // The limit only caps the buffer: one that could never be allocated is harmless for a small file.
+  assert.equal(await readSelectedFile(root, "small.json", Number.MAX_SAFE_INTEGER), '{"a":1}');
+  assert.equal(await readSelectedFile(root, "exact.txt", 5), "12345");
+  await assert.rejects(readSelectedFile(root, "large.txt", 5), /supported size/);
+  assert.equal(await readSelectedFile(root, "missing.txt", 5), null);
+  // A file that grew after it was measured fails instead of being returned truncated.
+  const handle = await open(join(root, "large.txt"));
+  const prototype = Object.getPrototypeOf(handle);
+  await handle.close();
+  const measure = prototype.stat;
+  t.mock.method(prototype, "stat", async function (...args) {
+    return Object.assign(await measure.apply(this, args), { size: 3 });
+  });
+  await assert.rejects(readSelectedFile(root, "large.txt", 100), /supported size/);
+});
+
+test("network shares are recognized by path form, which also covers a mapped drive's resolved target", async () => {
+  for (const path of [
+    "\\\\server\\share\\project",
+    "//server/share/project",
+    "\\\\?\\UNC\\server\\share",
+  ])
+    assert.equal(isNetworkShare(path), true, path);
+  for (const path of ["C:\\work\\project", "D:/work/project", "/home/owner/project", "\\relative"])
+    assert.equal(isNetworkShare(path), false, path);
+  await assert.rejects(selectDirectory("//server/share/project"), /Network shares/);
 });
 
 test("public lookups use real alias identity, compatible SemVer and OSV; private inputs remain unqueried", async (t) => {
@@ -704,9 +791,9 @@ test("single scan queue coalesces repeated requests and paused schedules catch u
   const projectRoot = join(root, "project");
   await npmFixture(projectRoot);
   let release;
-  let entered = false;
+  let lookups = 0;
   const lookup = async (dependencies) => {
-    entered = true;
+    lookups++;
     await new Promise((resolve) => {
       release = resolve;
     });
@@ -730,12 +817,18 @@ test("single scan queue coalesces repeated requests and paused schedules catch u
   await new Promise((resolve) => setTimeout(resolve, 1100));
   assert.equal(coordinator.snapshot().history.length, 0);
   coordinator.requestScan({ target: "projects", projectId: project.id });
-  await waitFor(() => entered);
+  await waitFor(() => lookups === 1);
   for (let i = 0; i < 10; i++)
     coordinator.requestScan({ target: "projects", projectId: project.id });
   release();
+  await waitFor(() => lookups === 2);
+  release();
   await waitFor(() => coordinator.snapshot().projects[0].evidence.status !== "scanning");
-  assert.equal(coordinator.snapshot().history.filter((a) => a.targetId === project.id).length, 1);
+  assert.equal(
+    coordinator.snapshot().history.filter((a) => a.targetId === project.id).length,
+    2,
+    "Repeated manual requests coalesce into one rescan after the active scan",
+  );
   assert.throws(() => coordinator.changeSettings({ projectIntervalMinutes: 1 }));
   assert.throws(() => coordinator.changeSettings({ pcIntervalMinutes: Number.NaN }));
   assert.equal(coordinator.snapshot().runtime.nextScanAt, null);
@@ -744,7 +837,7 @@ test("single scan queue coalesces repeated requests and paused schedules catch u
   await waitFor(() =>
     coordinator.snapshot().history.some((a) => a.kind === "pc" && a.status !== "scanning"),
   );
-  assert.equal(coordinator.snapshot().history.filter((a) => a.targetId === project.id).length, 1);
+  assert.equal(coordinator.snapshot().history.filter((a) => a.targetId === project.id).length, 2);
   assert.ok(coordinator.snapshot().runtime.nextScanAt);
 });
 
@@ -1602,6 +1695,7 @@ test("live progress and one settled summary preserve frozen receipts, new arriva
   assert.equal(frozen.projectCount, 2);
   assert.equal(frozen.pcCount, 0);
   assert.equal(frozen.filter, "all");
+  assert.equal(frozen.title, "1 security advisory", "New advisories lead the title");
   assert.equal(
     initial.notifications.length,
     5,
@@ -1617,6 +1711,7 @@ test("live progress and one settled summary preserve frozen receipts, new arriva
   assert.equal(newer.id, frozen.id, "New arrivals must not replace the frozen presentation");
   assert.equal(newer.updateCount, 3);
   assert.equal(newer.newUpdateCount, 2);
+  assert.equal(newer.title, frozen.title);
   coordinator.acknowledgeNotificationSummary(frozen.id);
   const delivered = coordinator.snapshot();
   assert.equal(delivered.notifications.filter((n) => n.deliveredAt !== null).length, 5);
@@ -1655,6 +1750,8 @@ test("live progress and one settled summary preserve frozen receipts, new arriva
   coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
   await waitFor(() => coordinator.snapshot().notificationSummary !== null);
   const resolved = coordinator.snapshot().notificationSummary;
+  assert.equal(resolved.newAdvisoryCount, 0);
+  assert.equal(resolved.title, "3 updates available", "Updates title a batch without advisories");
   coordinator.removeProject(third.id);
   assert.equal(
     coordinator.snapshot().notifications.filter((n) => n.deliveredAt === null).length,
@@ -1710,4 +1807,319 @@ test("shutdown cancels an in-flight public lookup and durably marks interruption
   assert.equal(retained.projects[0].evidence.lastSuccess, original.evidence.lastSuccess);
   assert.deepEqual(retained.projects[0].dependencies, original.dependencies);
   assert.equal(retained.history[0].status, "failed");
+});
+
+test("a failed durable write is recorded as a sanitized attempt error and never escapes the scan worker", async (t) => {
+  let coordinator;
+  t.after(() => coordinator?.close());
+  const root = await temporary(t);
+  const projectRoot = join(root, "project");
+  await npmFixture(projectRoot);
+  const lookup = async (dependencies) => ({
+    dependencies,
+    advisories: new Map(),
+    coverage: [],
+    errors: [],
+  });
+  const write = MonitoringStorage.prototype.write;
+  let writes = 0;
+  let failAt = 0;
+  t.mock.method(MonitoringStorage.prototype, "write", function (state) {
+    if (++writes === failAt) throw new Error(`Storage unavailable at ${root}`);
+    return write.call(this, state);
+  });
+  let updateChecks = "complete";
+  coordinator = new MonitoringCoordinator({
+    dataDir: join(root, "state"),
+    dependencyLookup: lookup,
+    inventoryLookup: async () => ({
+      installations: [],
+      coverage: [],
+      errors: updateChecks === "failed" ? ["Version lookup failed."] : [],
+      inventoryChecks: "complete",
+      updateChecks,
+      checkedRoots: [],
+      managers: [],
+    }),
+  });
+  coordinator.changeSettings({ paused: true });
+  const project = await coordinator.addProject({ path: projectRoot, mode: "maintained" });
+  await scan(coordinator, project.id);
+  const saved = coordinator.snapshot().projects[0];
+  assert.equal(saved.evidence.status, "complete");
+  const notSaved = "Evidence could not be saved; the previous saved evidence is retained.";
+
+  failAt = writes + 1; // The record written when the attempt starts.
+  await scan(coordinator, project.id);
+  let attempt = coordinator.snapshot().history[0];
+  assert.equal(attempt.status, "failed");
+  assert.deepEqual(attempt.errors, [notSaved]);
+  const afterStart = coordinator.snapshot().projects[0];
+  assert.equal(afterStart.evidence.status, "failed");
+  assert.equal(afterStart.evidence.lastSuccess, saved.evidence.lastSuccess);
+  assert.deepEqual(afterStart.dependencies, saved.dependencies);
+
+  failAt = writes + 2; // The record written when the attempt finishes.
+  await scan(coordinator, project.id);
+  attempt = coordinator.snapshot().history[0];
+  assert.equal(attempt.status, "partial", "An unsaved attempt is never reported complete");
+  assert.deepEqual(attempt.errors, [notSaved]);
+  assert.equal(coordinator.snapshot().projects[0].evidence.status, "partial");
+  assert.deepEqual(coordinator.snapshot().projects[0].evidence.errors, [notSaved]);
+
+  await scan(coordinator, project.id);
+  assert.equal(coordinator.snapshot().history[0].status, "complete", "The worker keeps running");
+
+  // Anything unexpected outside the attempt's own handling still cannot reject the worker.
+  coordinator.mergeFindings = () => {
+    throw new Error("Unexpected failure");
+  };
+  coordinator.requestScan({ target: "projects", projectId: project.id });
+  await waitFor(() => coordinator.snapshot().scanProgress.active === null);
+  delete coordinator.mergeFindings;
+  await scan(coordinator, project.id);
+  assert.equal(coordinator.snapshot().history[0].status, "complete");
+
+  // An unsaved PC result also marks its update checks, never upgrading a failed check.
+  for (const [checks, expected] of [
+    ["complete", "partial"],
+    ["failed", "failed"],
+  ]) {
+    updateChecks = checks;
+    failAt = writes + 2;
+    const previous = coordinator.snapshot().history[0].id;
+    coordinator.requestScan({ target: "pc" });
+    await waitFor(() => {
+      const latest = coordinator.snapshot().history[0];
+      return latest.id !== previous && latest.status !== "scanning";
+    });
+    const { history, inventory } = coordinator.snapshot();
+    assert.equal(history[0].status, "partial");
+    assert.ok(history[0].errors.includes(notSaved));
+    assert.equal(inventory.evidence.status, "partial");
+    assert.ok(inventory.evidence.errors.includes(notSaved));
+    assert.equal(inventory.updateEvidence.status, expected);
+    assert.ok(inventory.updateEvidence.errors.includes(notSaved), checks);
+  }
+});
+
+test("a manual rescan requested during a target's scan runs once afterwards, while scheduled requests do not", async (t) => {
+  let coordinator;
+  const gates = [];
+  t.after(() => {
+    for (const release of gates) release();
+    return coordinator?.close();
+  });
+  const root = await temporary(t);
+  const projectRoot = join(root, "project");
+  await npmFixture(projectRoot);
+  const lookup = async (dependencies) => {
+    await new Promise((resolve) => gates.push(resolve));
+    return { dependencies, advisories: new Map(), coverage: [], errors: [] };
+  };
+  coordinator = new MonitoringCoordinator({
+    dataDir: join(root, "state"),
+    dependencyLookup: lookup,
+  });
+  coordinator.changeSettings({ paused: true });
+  const project = await coordinator.addProject({ path: projectRoot, mode: "maintained" });
+  coordinator.requestScan({ target: "projects", projectId: project.id });
+  await waitFor(() => gates.length === 1);
+
+  // The scan's next automatic run becomes due; the active target is still not queued again.
+  const clock = t.mock.method(Date, "now", () => Date.parse(new Date().toISOString()) + 7_200_000);
+  coordinator.changeSettings({ paused: false });
+  clock.mock.restore();
+  assert.deepEqual(coordinator.snapshot().scanProgress.queued, []);
+
+  for (let i = 0; i < 3; i++)
+    coordinator.requestScan({ target: "projects", projectId: project.id });
+  const progress = coordinator.snapshot().scanProgress;
+  assert.equal(progress.active.targetId, project.id);
+  assert.deepEqual(
+    progress.queued.map((target) => target.targetId),
+    [project.id],
+    "Repeated manual requests queue one rescan behind the active scan",
+  );
+  gates[0]();
+  await waitFor(() => gates.length === 2);
+  gates[1]();
+  await waitFor(() => coordinator.snapshot().scanProgress.active === null);
+  assert.equal(gates.length, 2);
+  assert.equal(coordinator.snapshot().history.filter((a) => a.targetId === project.id).length, 2);
+  assert.deepEqual(coordinator.snapshot().scanProgress.queued, []);
+});
+
+test("removing a project aborts its active scan and ends the attempt failed, never scanning", async (t) => {
+  let coordinator;
+  let releaseIgnoring;
+  t.after(() => {
+    releaseIgnoring?.();
+    return coordinator?.close();
+  });
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  const signals = {};
+  const lookup = async (dependencies, signal, _progress, local) => {
+    const name = basename(local.root);
+    signals[name] = signal;
+    if (name === "aborting")
+      await new Promise((_resolve, reject) =>
+        signal.addEventListener(
+          "abort",
+          () => reject(new InputError("The scan stopped before public package checks finished.")),
+          { once: true },
+        ),
+      );
+    if (name === "ignoring")
+      await new Promise((resolve) => {
+        releaseIgnoring = resolve;
+      });
+    return { dependencies, advisories: new Map(), coverage: [], errors: [] };
+  };
+  coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
+  coordinator.changeSettings({ paused: true });
+  const projects = {};
+  for (const name of ["aborting", "ignoring", "survivor"]) {
+    await npmFixture(join(root, name));
+    projects[name] = await coordinator.addProject({ path: join(root, name), mode: "maintained" });
+  }
+  const removed = "The project was removed during this scan.";
+  const attempt = (name) =>
+    coordinator.snapshot().history.find((a) => a.targetId === projects[name].id);
+
+  // A lookup that honors its signal is cancelled by the removal alone, not by shutdown.
+  coordinator.requestScan({ target: "projects", projectId: projects.aborting.id });
+  await waitFor(() => signals.aborting);
+  assert.equal(signals.aborting.aborted, false);
+  coordinator.removeProject(projects.aborting.id);
+  assert.equal(signals.aborting.aborted, true);
+  await waitFor(() => coordinator.snapshot().scanProgress.active === null);
+  assert.equal(attempt("aborting").status, "failed");
+  assert.deepEqual(attempt("aborting").errors, [removed]);
+
+  // A lookup that ignores its signal still ends the attempt as removed when it returns.
+  coordinator.requestScan({ target: "projects", projectId: projects.ignoring.id });
+  await waitFor(() => releaseIgnoring);
+  coordinator.removeProject(projects.ignoring.id);
+  releaseIgnoring();
+  await waitFor(() => coordinator.snapshot().scanProgress.active === null);
+  assert.equal(attempt("ignoring").status, "failed");
+  assert.deepEqual(attempt("ignoring").errors, [removed]);
+  assert.equal(coordinator.snapshot().findings.length, 0);
+
+  await scan(coordinator, projects.survivor.id);
+  assert.equal(coordinator.snapshot().projects.length, 1);
+  assert.equal(attempt("survivor").status, "complete", "Other scans are not cancelled");
+  await coordinator.close();
+  const storage = new MonitoringStorage(dataDir);
+  assert.ok(storage.read().snapshot.history.every((a) => a.status !== "scanning"));
+  storage.close();
+});
+
+test("findings seen while notifications are off are not announced when they are re-enabled", async (t) => {
+  let coordinator;
+  t.after(() => coordinator?.close());
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  const projectRoot = join(root, "project");
+  await npmFixture(projectRoot);
+  let available = "1.5.0";
+  const lookup = async (dependencies) => ({
+    dependencies: dependencies.map((d) => ({
+      ...d,
+      availableVersion: d.name === "alias" ? available : null,
+      versionStatus: d.role === "transitive" ? "unsupported" : "checked",
+      advisoryStatus: "checked",
+    })),
+    advisories: new Map(),
+    coverage: [],
+    errors: [],
+  });
+  coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
+  coordinator.changeSettings({ paused: true, notifyNewFindings: false });
+  const project = await coordinator.addProject({ path: projectRoot, mode: "maintained" });
+  await scan(coordinator, project.id);
+  const updates = () => coordinator.snapshot().findings.filter((f) => f.kind === "update");
+  assert.equal(updates().length, 1);
+  assert.equal(coordinator.snapshot().notifications.length, 0);
+
+  coordinator.changeSettings({ notifyNewFindings: true });
+  await scan(coordinator, project.id);
+  assert.equal(
+    coordinator.snapshot().notifications.length,
+    0,
+    "The backlog recorded while notifications were off is not new",
+  );
+  available = "1.7.0";
+  await scan(coordinator, project.id);
+  assert.equal(coordinator.snapshot().notifications.length, 1, "A later finding still notifies");
+
+  // Recorded identities follow the current findings instead of growing without bound.
+  available = null;
+  await scan(coordinator, project.id);
+  assert.equal(updates().length, 0);
+  await coordinator.close();
+  const storage = new MonitoringStorage(dataDir);
+  assert.deepEqual(storage.read().notified, []);
+  storage.close();
+});
+
+test("due entries of removed projects or projects without automatic scans are ignored", async (t) => {
+  let coordinator;
+  t.after(() => coordinator?.close());
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  const projectRoot = join(root, "project");
+  await npmFixture(projectRoot);
+  const lookup = async (dependencies) => ({
+    dependencies: dependencies.map((d) => ({
+      ...d,
+      availableVersion: d.name === "alias" ? "1.5.0" : null,
+      versionStatus: d.role === "transitive" ? "unsupported" : "checked",
+      advisoryStatus: "checked",
+    })),
+    advisories: new Map(),
+    coverage: [],
+    errors: [],
+  });
+  coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
+  coordinator.changeSettings({ paused: true });
+  const project = await coordinator.addProject({ path: projectRoot, mode: "maintained" });
+  await scan(coordinator, project.id);
+  coordinator.changeSettings({ paused: false });
+  const scheduled = coordinator.snapshot().runtime.nextScanAt;
+  assert.ok(Date.parse(scheduled) > Date.now());
+
+  const inspect = (selected) => inspectProject(selected.path);
+  coordinator.configureProjectInspection(inspect, () => false);
+  assert.equal(coordinator.snapshot().runtime.nextScanAt, null);
+  coordinator.configureProjectInspection(inspect, () => true);
+  assert.equal(coordinator.snapshot().runtime.nextScanAt, scheduled);
+  // Application preferences decide eligibility without persist(); the cached snapshot follows.
+  let automatic = true;
+  coordinator.configureProjectInspection(inspect, () => automatic);
+  coordinator.readApplication(); // Creates the table the first write needs.
+  const revision = coordinator.revision;
+  automatic = false;
+  coordinator.writeApplication({});
+  assert.notEqual(coordinator.revision, revision);
+  assert.equal(JSON.parse(coordinator.snapshotJson()).runtime.nextScanAt, null);
+  automatic = true;
+  coordinator.writeApplication({});
+  assert.equal(JSON.parse(coordinator.snapshotJson()).runtime.nextScanAt, scheduled);
+  const unchanged = coordinator.revision;
+  coordinator.writeApplication({});
+  assert.equal(coordinator.revision, unchanged, "Unrelated application writes keep the cache");
+
+  await coordinator.close();
+  const storage = new MonitoringStorage(dataDir);
+  const stored = storage.read();
+  stored.due["removed-project"] = 1;
+  storage.write(stored);
+  storage.close();
+  coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
+  assert.equal(coordinator.snapshot().runtime.nextScanAt, scheduled);
+  // A stale entry must not keep restarting the worker, which would postpone the summary forever.
+  await waitFor(() => coordinator.snapshot().notificationSummary !== null);
 });

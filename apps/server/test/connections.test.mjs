@@ -8,7 +8,11 @@ import { createServer, connect } from "node:net";
 import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { ApplicationService } from "../dist/application.js";
 import { startServer } from "../dist/server.js";
-import { peerRequest } from "../dist/adapters/paired-computers.js";
+import {
+  createPeerCertificate,
+  peerRequest,
+  startPeerServer,
+} from "../dist/adapters/paired-computers.js";
 import {
   parseSshConfig,
   sshTunnelArguments,
@@ -95,7 +99,8 @@ test("SSH parsing and tunnel arguments never evaluate config programs or execute
   assert(args.includes("StrictHostKeyChecking=yes"));
   assert(args.includes("BatchMode=yes"));
   assert(args.includes("ProxyCommand=none"));
-  assert(args.includes("KnownHostsCommand=none"));
+  // `-F none` already leaves KnownHostsCommand unset, and OpenSSH before 8.5 rejects the option.
+  assert(!args.some((arg) => /^KnownHostsCommand/i.test(arg)));
   assert.equal(args[args.indexOf("-F") + 1], "none");
   assert.equal(args[args.indexOf("-l") + 1], "owner");
   assert.equal(args[args.indexOf("-p") + 1], "2222");
@@ -232,6 +237,49 @@ test(
     });
     assert.equal(evidence.nonce, nonce);
     assert.equal(evidence.snapshot.device.id, host.core.snapshot().device.id);
+  },
+);
+
+test(
+  "a scan requested again within the peer's cooldown reads as recent, not as an unreachable or revoked PC",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const certificate = await createPeerCertificate();
+    let scans = 0;
+    const peer = await startPeerServer({
+      address: "127.0.0.1",
+      port: 0,
+      certificate,
+      snapshot: () => {
+        throw new Error("unused");
+      },
+      pair: () => {
+        throw new Error("unused");
+      },
+      authenticate: (token) => (token === "fixture-token" ? "fixture-client" : null),
+      scan: () => {
+        scans++;
+      },
+      revoke: () => {},
+    });
+    t.after(() => peer.close());
+    const scan = () =>
+      peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
+        token: "fixture-token",
+        body: {},
+      });
+    assert.deepEqual(await scan(), { accepted: true });
+    await assert.rejects(scan(), {
+      message: "This PC was asked to scan recently. Try again in a minute.",
+    });
+    assert.equal(scans, 1, "The cooldown must not start a second scan");
+    await assert.rejects(
+      peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
+        token: "revoked-token",
+        body: {},
+      }),
+      /rejected access or is unavailable/,
+    );
   },
 );
 

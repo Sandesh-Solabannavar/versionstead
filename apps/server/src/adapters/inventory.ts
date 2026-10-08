@@ -15,7 +15,13 @@ import { identity, InputError, object, packageName, readSelectedFile, string } f
 import { publicPackageVersions } from "./lookups.ts";
 
 import { decodeBunConfiguration } from "./bun-config.ts";
-import { toolExecutable as executable } from "./tool-paths.ts";
+import {
+  inspectBun,
+  inspectNode,
+  noAutoInstall,
+  ownNode,
+  toolExecutable as executable,
+} from "./tool-paths.ts";
 export { decodeBunConfiguration } from "./bun-config.ts";
 
 const execute = promisify(execFile);
@@ -169,6 +175,7 @@ function blockedNpmScopes(text: string, blocked: Set<string>) {
 async function run(executablePath: string, args: string[], signal?: AbortSignal) {
   const env = {
     ...process.env,
+    ...noAutoInstall,
     NODE_OPTIONS: "",
     npm_config_update_notifier: "false",
     npm_config_ignore_scripts: "true",
@@ -188,14 +195,35 @@ async function run(executablePath: string, args: string[], signal?: AbortSignal)
     .trim();
 }
 
-export async function npmGlobalCommand() {
-  const launcher = await executable(process.platform === "win32" ? "npm.cmd" : "npm");
+// Without a Node of its own (Electron), run the configured or discovered one and use the real path it reports.
+async function discoveredNode(directories?: readonly string[]) {
+  const candidate =
+    process.env.VERSIONSTEAD_NODE_EXECUTABLE ??
+    (await executable(process.platform === "win32" ? "node.exe" : "node", directories));
+  return candidate ? ((await inspectNode(candidate))?.execPath ?? null) : null;
+}
+
+export async function npmGlobalCommand(
+  directories?: readonly string[],
+  node: string | null = ownNode(),
+) {
+  const launcher = await executable(process.platform === "win32" ? "npm.cmd" : "npm", directories);
   if (!launcher) return null;
+  const runtime = node ?? (await discoveredNode(directories));
+  if (!runtime || !isAbsolute(runtime))
+    throw new InputError("npm's executable could not be verified.");
+  // The script sits beside the launcher or under ../lib. A version-manager launcher has none beside it, but
+  // the Node it dispatches to ships npm in the same layouts. The launcher is resolved only to find a script
+  // it links to; it is never run.
+  const linked = await realpath(launcher).catch(() => launcher);
+  const layouts = (directory: string) => [
+    join(directory, "node_modules", "npm", "bin", "npm-cli.js"),
+    join(directory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
   const candidates = [
-    join(dirname(launcher), "node_modules", "npm", "bin", "npm-cli.js"),
-    launcher.endsWith("npm-cli.js")
-      ? launcher
-      : join(dirname(launcher), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    ...layouts(dirname(launcher)),
+    ...(linked.endsWith("npm-cli.js") ? [linked] : []),
+    ...layouts(dirname(runtime)),
   ];
   for (const candidate of candidates) {
     try {
@@ -205,13 +233,7 @@ export async function npmGlobalCommand() {
       );
       if (pkg.name !== "npm" || typeof pkg.version !== "string" || !semver.valid(pkg.version))
         continue;
-      const node = /^node(?:\.exe)?$/i.test(basename(process.execPath))
-        ? process.execPath
-        : (process.env.VERSIONSTEAD_NODE_EXECUTABLE ??
-          (await executable(process.platform === "win32" ? "node.exe" : "node")));
-      if (!node || !isAbsolute(node) || !/^node(?:\.exe)?$/i.test(basename(node)))
-        throw new Error();
-      return { executable: await realpath(node), cli, version: pkg.version };
+      return { executable: runtime, cli, version: pkg.version };
     } catch {
       // Validate npm's actual JS entry point; never execute a shell wrapper.
     }
@@ -219,7 +241,10 @@ export async function npmGlobalCommand() {
   throw new InputError("npm's executable could not be verified.");
 }
 
-async function npmSource(signal?: AbortSignal): Promise<GlobalToolSource> {
+async function npmSource(
+  signal?: AbortSignal,
+  directories?: readonly string[],
+): Promise<GlobalToolSource> {
   const source: Writable<GlobalToolSource> = {
     manager: "npm",
     status: "not-installed",
@@ -231,7 +256,7 @@ async function npmSource(signal?: AbortSignal): Promise<GlobalToolSource> {
     error: null,
   };
   try {
-    const npm = await npmGlobalCommand();
+    const npm = await npmGlobalCommand(directories);
     if (!npm) return source;
     source.status = "unavailable";
     source.version = npm.version;
@@ -276,7 +301,7 @@ export function bunGlobalDirectory(
   return /^~[\\/]/.test(directory) ? join(home, directory.slice(2)) : directory;
 }
 
-async function bunSource(signal?: AbortSignal): Promise<GlobalToolSource> {
+async function bunSource(directories?: readonly string[]): Promise<GlobalToolSource> {
   const source: Writable<GlobalToolSource> = {
     manager: "bun",
     status: "not-installed",
@@ -287,15 +312,18 @@ async function bunSource(signal?: AbortSignal): Promise<GlobalToolSource> {
     checkedAt: now(),
     error: null,
   };
-  const binary = await executable(process.platform === "win32" ? "bun.exe" : "bun");
+  const binary = await executable(process.platform === "win32" ? "bun.exe" : "bun", directories);
   if (!binary) {
     source.registry = "unknown";
     return source;
   }
   source.status = "unavailable";
   try {
-    source.version = await run(binary, ["--version"], signal);
-    if (!semver.valid(source.version)) throw new Error();
+    // A shim reads the directory it runs in, so Bun is asked as a project check asks it: from an empty
+    // private folder, never the shared tmpdir().
+    const bun = await inspectBun(binary);
+    if (!bun || !semver.valid(bun.version)) throw new Error();
+    source.version = bun.version;
     let globalDir: string | null = null;
     const blocked = new Set<string>();
     const configs = [
@@ -340,8 +368,9 @@ async function bunSource(signal?: AbortSignal): Promise<GlobalToolSource> {
 export async function discoverGlobalToolSources(
   signal?: AbortSignal,
   previous: readonly GlobalToolSource[] = [],
+  directories?: readonly string[],
 ): Promise<GlobalToolSource[]> {
-  const sources = await Promise.all([npmSource(signal), bunSource(signal)]);
+  const sources = await Promise.all([npmSource(signal, directories), bunSource(directories)]);
   if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");
   return validateGlobalToolSources(sources, previous);
 }
