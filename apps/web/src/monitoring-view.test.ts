@@ -23,6 +23,7 @@ import {
   filterInstallations,
   findingCounts,
   findingSummary,
+  findingsRetained,
   findingUpgradeCommands,
   globalToolSourceState,
   installationCandidate,
@@ -522,6 +523,20 @@ test("labels name workspaces, platforms and counts the way people say them", () 
   assert.equal(plural(2, "target"), "2 targets");
   assert.equal(plural(1, "advisory", "advisories"), "1 advisory");
   assert.equal(plural(3, "advisory", "advisories"), "3 advisories");
+});
+
+test("findings that a failed or unsupported scan kept from earlier scans read as previous", () => {
+  const retained: Record<ScanEvidence["status"], boolean> = {
+    "not-scanned": false,
+    scanning: false,
+    complete: false,
+    partial: false,
+    failed: true,
+    // An unsupported lockfile keeps the project's earlier findings too.
+    unsupported: true,
+  };
+  for (const [status, expected] of Object.entries(retained))
+    assert.equal(findingsRetained(status as ScanEvidence["status"]), expected, status);
 });
 
 test("attention groups list findings most severe first", () => {

@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { parseDocument } from "yaml";
+import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
+import { isAlias, isScalar, parseDocument, visit } from "yaml";
 import semver from "semver";
 import { parseTree, getNodeValue, type ParseError } from "jsonc-parser";
 import { decodeBunConfiguration } from "./bun-config.ts";
@@ -342,14 +343,97 @@ async function npmInputs(
   };
 }
 
-function parseYaml(text: string) {
+// Runs only when parseYaml starts this module as its worker, and posts { lockfile } or { rejected }.
+// Several yaml paths rescan earlier input, which is quadratic on crafted files. Its duplicate-key check
+// and pretty errors are off: a Set per map finds duplicates with yaml's verdicts (and also rejects
+// repeated .nan keys). Anchors, aliases and collection keys, which pnpm never writes, are rejected as
+// unsupported before conversion.
+if (!isMainThread && typeof workerData?.pnpmLockfile === "string") {
+  let reply: unknown = { rejected: "malformed" };
   try {
-    const document = parseDocument(text, { uniqueKeys: true, schema: "core" });
-    if (document.errors.length) throw new Error();
-    return object(document.toJS({ maxAliasCount: 10 }));
+    const document = parseDocument(workerData.pnpmLockfile, {
+      uniqueKeys: false,
+      prettyErrors: false,
+      schema: "core",
+    });
+    let rejected: "malformed" | "unsupported" | null = document.errors.length ? "malformed" : null;
+    const found = (verdict: "malformed" | "unsupported") => {
+      rejected = verdict;
+      return visit.BREAK;
+    };
+    if (!rejected)
+      visit(document, {
+        Node: (_, node) => (isAlias(node) || node.anchor ? found("unsupported") : undefined),
+        Map(_, map) {
+          if (map.anchor || !map.items.every(({ key }) => isScalar(key)))
+            return found("unsupported");
+          const keys = new Set(map.items.map(({ key }) => (isScalar(key) ? key.value : key)));
+          if (keys.size < map.items.length) return found("malformed");
+        },
+      });
+    reply = rejected ? { rejected } : { lockfile: document.toJS({ maxAliasCount: 0 }) };
   } catch {
-    throw new InputError("The pnpm lockfile is malformed.");
+    // Malformed YAML or nesting deeper than the stack.
   }
+  parentPort?.postMessage(reply);
+}
+
+const malformedLockfile = "The pnpm lockfile is malformed.";
+
+// A large pnpm lockfile parses for seconds, which would stall every coordinator request, so the parse
+// runs on a worker thread that the scan's signal terminates; the caller validates the posted data.
+// ponytail: the YAML pnpm writes parses in linear time, and anything else is cut off by the 30 s
+// deadline and the 1 GiB heap cap. Scans run one at a time, so a hostile lockfile can still delay the
+// queue by 30 s at each rescan; lower the deadline if that matters.
+function parseYaml(text: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  return new Promise((resolveParsed, reject) => {
+    const fail = (message: string, status?: InputError["status"]) =>
+      reject(new InputError(message, status));
+    if (signal?.aborted) {
+      fail("The scan stopped before the pnpm lockfile was parsed.");
+      return;
+    }
+    // The worker reruns this file, so the server must stay unbundled: in a single-file bundle the
+    // worker would rerun the coordinator's entry point.
+    const worker = new Worker(new URL(import.meta.url), {
+      workerData: { pnpmLockfile: text },
+      // A legitimate 3.4 MiB lockfile peaks near 400 MB.
+      resourceLimits: { maxOldGenerationSizeMb: 1024 },
+    });
+    const stop = (message: string) => {
+      void worker.terminate();
+      fail(message);
+    };
+    const abort = () => stop("The scan stopped before the pnpm lockfile was parsed.");
+    const deadline = setTimeout(() => stop("The pnpm lockfile took too long to parse."), 30_000);
+    signal?.addEventListener("abort", abort, { once: true });
+    worker.once("message", (message: unknown) => {
+      try {
+        const reply = object(message);
+        if (reply.rejected === "unsupported")
+          fail(
+            "The pnpm lockfile uses YAML features pnpm does not write (anchors, aliases or collection keys).",
+            "unsupported",
+          );
+        else resolveParsed(object(reply.lockfile));
+      } catch {
+        fail(malformedLockfile);
+      }
+    });
+    // Data nested deeper than this thread's stack can be posted but not received.
+    worker.once("messageerror", () => fail(malformedLockfile));
+    worker.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ERR_WORKER_OUT_OF_MEMORY")
+        fail("The pnpm lockfile needs more memory to parse than the scanner allows.");
+      else reject(error);
+    });
+    worker.once("exit", () => {
+      clearTimeout(deadline);
+      signal?.removeEventListener("abort", abort);
+      // Messages are delivered before exit, so this only settles a worker that stopped without one.
+      reject(new Error("The lockfile parser stopped without a result."));
+    });
+  });
 }
 
 function pnpmIdentity(key: string) {
@@ -359,8 +443,12 @@ function pnpmIdentity(key: string) {
   return { name: match[1], version: match[2], reference: key.slice(match[1].length + 1) };
 }
 
-async function pnpmInputs(read: ProjectReader, text: string): Promise<ProjectInputs> {
-  const lock = parseYaml(text);
+async function pnpmInputs(
+  read: ProjectReader,
+  text: string,
+  signal?: AbortSignal,
+): Promise<ProjectInputs> {
+  const lock = await parseYaml(text, signal);
   if (String(lock.lockfileVersion) !== "9.0" && lock.lockfileVersion !== 9) {
     throw new InputError("Only pnpm lockfile version 9 is supported.", "unsupported");
   }
@@ -686,14 +774,17 @@ async function bunInputs(
   };
 }
 
-export async function inspectProject(root: string): Promise<ProjectInputs> {
+export async function inspectProject(root: string, signal?: AbortSignal): Promise<ProjectInputs> {
   const canonical = await selectDirectory(root);
   if (canonical !== root)
     throw new InputError("The selected directory identity changed; select it again.");
-  return inspectProjectFiles((name, limit) => readSelectedFile(root, name, limit));
+  return inspectProjectFiles((name, limit) => readSelectedFile(root, name, limit), signal);
 }
 
-export async function inspectProjectFiles(read: ProjectReader): Promise<ProjectInputs> {
+export async function inspectProjectFiles(
+  read: ProjectReader,
+  signal?: AbortSignal,
+): Promise<ProjectInputs> {
   const manifestText = await read("package.json", 1024 * 1024);
   if (manifestText === null)
     throw new InputError(
@@ -718,7 +809,7 @@ export async function inspectProjectFiles(read: ProjectReader): Promise<ProjectI
     npm !== null
       ? await npmInputs(read, manifest, npm)
       : pnpm !== null
-        ? await pnpmInputs(read, pnpm)
+        ? await pnpmInputs(read, pnpm, signal)
         : await bunInputs(read, manifest, bun!);
   const npmrc = await read(".npmrc", 100 * 1024);
   const blockedScopes = new Set<string>();

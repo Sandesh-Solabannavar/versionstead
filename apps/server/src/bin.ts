@@ -98,9 +98,10 @@ if (values.help) {
     process.once("SIGINT", signalStop);
     process.once("SIGTERM", signalStop);
   } catch (error) {
+    // Only these fixed, path-free messages are shown as they are.
     console.error(
       error instanceof Error &&
-        /^(A coordinator already|Port must|Invalid |Data directory must|Web root must)/.test(
+        /^(A coordinator already|Port must|Invalid |Data directory must|Web root must|The monitoring database )/.test(
           error.message,
         )
         ? error.message

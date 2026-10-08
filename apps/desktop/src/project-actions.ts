@@ -215,7 +215,7 @@ export class ProjectActionRunner {
         .map((run) => run.stop("The project is being removed.")),
     );
   }
-  async reconcile(projects: readonly Project[]) {
+  async reconcile(projects: readonly Pick<Project, "id" | "actions">[]) {
     const actions = new Map(
       projects.map((project) => [
         project.id,

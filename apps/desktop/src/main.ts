@@ -21,10 +21,12 @@ import {
   coordinatorRequest,
   ensureCoordinator,
   forwardRequest,
+  pollCoordinator,
   readyCoordinator,
   recoverCoordinator,
   restartCoordinator,
   webRoot,
+  type CoordinatorPoll,
   type CoordinatorRuntime,
 } from "./coordinator.js";
 import { readWebFile, responseHeaders } from "../../server/dist/web-files.js";
@@ -65,6 +67,8 @@ let started = false;
 let monitoringStopped = false;
 let quitting = false;
 let polling = false;
+// The last good tray poll; the full snapshot is read again only when its revision changes.
+let lastPoll: CoordinatorPoll | null = null;
 let notificationTimer: ReturnType<typeof setInterval> | undefined;
 const presented = new Set<string>();
 const pendingReceipts = new Set<string>();
@@ -246,14 +250,18 @@ function reopenFailed() {
 }
 
 async function updateTray() {
-  const connected = await readyCoordinator();
-  if (connected) await projectActionRunner.reconcile(connected.snapshot.projects);
-  else
+  // Only a running project command needs the project actions, which take a snapshot read.
+  const reconcile = projectActionRunner.active;
+  const connected = await pollCoordinator(lastPoll, reconcile);
+  if (connected) {
+    lastPoll = connected;
+    if (reconcile && connected.projects) await projectActionRunner.reconcile(connected.projects);
+  } else
     void recoverCoordinator(monitoringStopped)
       .then((recovered) => recovered && updateTray())
       .catch(() => console.error("Monitoring stopped unexpectedly and could not restart."));
   runtime = connected?.runtime ?? null;
-  const paused = connected?.snapshot.settings.paused ?? false;
+  const paused = connected?.settings.paused ?? false;
   tray?.setToolTip(
     `Versionstead — ${connected ? (paused ? "scans paused" : "monitoring") : "coordinator disconnected"}`,
   );
@@ -378,8 +386,8 @@ async function pollNotifications() {
       notificationRuntimePid = connected.runtime.pid;
     }
     for (const id of pendingReceipts) await acknowledgeSummary(connected.runtime, id);
-    if (!connected.snapshot.settings.notifyNewFindings) return;
-    const summary = connected.snapshot.notificationSummary;
+    if (!connected.settings.notifyNewFindings) return;
+    const summary = connected.notificationSummary;
     if (!summary || presented.has(summary.id) || notifications.has(summary.id)) return;
     notifications.clear();
     const notification = new Notification({

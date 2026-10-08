@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, open, writeFile, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { MonitoringStorage } from "../dist/storage.js";
@@ -14,7 +15,9 @@ import {
   selectDirectory,
 } from "../dist/adapters/projects.js";
 import { identity } from "../dist/adapters/projects.js";
-import { lookupDependencies } from "../dist/adapters/lookups.js";
+import { createSourceCache, lookupDependencies } from "../dist/adapters/lookups.js";
+import { ApplicationService } from "../dist/application.js";
+import { inspectRepository } from "../dist/adapters/repositories.js";
 
 async function temporary(t) {
   const path = await selectDirectory(await mkdtemp(join(tmpdir(), "versionstead-monitoring-")));
@@ -148,6 +151,260 @@ snapshots:
   assert.equal(inputs.dependencies.find((d) => d.name === "peer").role, "transitive");
   assert.equal(inputs.dependencies.filter((d) => d.name === "public-example").length, 0);
   assert.ok(inputs.coverage.some((e) => e.includes("internal workspace/local")));
+});
+
+// Records each worker thread started during a test: its messages and whether it has exited. A worker
+// that is not terminated always delivers its result before it exits.
+function watchWorkers(t, onStart = () => {}) {
+  const workers = [];
+  const started = (worker) => {
+    const record = { worker, messages: 0, exited: false };
+    record.exit = new Promise((resolve) =>
+      worker.once("exit", () => {
+        record.exited = true;
+        resolve();
+      }),
+    );
+    worker.on("message", () => (record.messages += 1));
+    workers.push(record);
+    onStart(record);
+  };
+  process.on("worker", started);
+  t.after(() => process.off("worker", started));
+  return workers;
+}
+
+test("pnpm lockfiles parse on a worker thread, leaving the coordinator's event loop free", async (t) => {
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+  };
+  const read = async (name) => files[name] ?? null;
+  const workers = watchWorkers(t);
+  let settled = false;
+  const inspection = inspectProjectFiles(read).finally(() => (settled = true));
+  // Every read resolves at once, so a parse on this thread would settle before the next turn.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal((await inspection).packageManager, "pnpm");
+  assert.equal(workers.length, 1);
+  // Duplicate keys (at any depth, and equal by value like yaml's own check), malformed YAML, and nesting
+  // the worker can post but this thread cannot receive (the depth varies by platform) are malformed.
+  for (const lockfile of [
+    "lockfileVersion: '9.0'\nimporters: {}\nimporters: {}\n",
+    "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  .: {}\n",
+    "lockfileVersion: '9.0'\nimporters: {1: {}, 0x1: {}}\n",
+    "lockfileVersion: [\n",
+    ...Array.from({ length: 7 }, (_, i) => "[".repeat(2000 + 250 * i) + "]".repeat(2000 + 250 * i)),
+  ]) {
+    files["pnpm-lock.yaml"] = lockfile;
+    await assert.rejects(
+      inspectProjectFiles(read),
+      (e) =>
+        e instanceof InputError &&
+        e.status === "failed" &&
+        e.message === "The pnpm lockfile is malformed.",
+    );
+  }
+  // YAML features pnpm never writes are unsupported rather than malformed.
+  for (const lockfile of [
+    "lockfileVersion: &version '9.0'\nimporters: {}\n",
+    "lockfileVersion: '9.0'\nimporters: &shared {}\n",
+    "lockfileVersion: '9.0'\nimporters: &shared {}\nsnapshots: *shared\n",
+    "lockfileVersion: '9.0'\nimporters: {}\n? [0]\n: 1\n",
+    "lockfileVersion: '9.0'\nimporters: {}\n? {a: 1}\n: 1\n",
+  ]) {
+    files["pnpm-lock.yaml"] = lockfile;
+    await assert.rejects(
+      inspectProjectFiles(read),
+      (e) =>
+        e instanceof InputError &&
+        e.status === "unsupported" &&
+        e.message ===
+          "The pnpm lockfile uses YAML features pnpm does not write (anchors, aliases or collection keys).",
+    );
+  }
+});
+
+test("large crafted lockfiles reach their verdicts", async () => {
+  // Each shape takes yaml seconds to minutes through its default paths, which rescan earlier input.
+  const keys = Array.from({ length: 40000 }, (_, i) => `  pkg-${i}@1.0.0: {}`).join("\n");
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": `lockfileVersion: '9.0'\nimporters: {}\nsnapshots:\n${keys}\n`,
+  };
+  const read = async (name) => files[name] ?? null;
+  // 40,000 unique keys parse, and the package limit then rejects the lockfile.
+  await assert.rejects(
+    inspectProjectFiles(read),
+    (e) =>
+      e instanceof InputError && e.status === "unsupported" && /10,000 packages/.test(e.message),
+  );
+  files["pnpm-lock.yaml"] += "  pkg-0@1.0.0: {}\n";
+  await assert.rejects(inspectProjectFiles(read), /pnpm lockfile is malformed/);
+  // 10,000 anchors followed by 10,000 collection keys.
+  const anchors = Array.from({ length: 10000 }, (_, i) => `  - &a${i} x`).join("\n");
+  const collectionKeys = Array.from({ length: 10000 }, (_, i) => `? [${i}]\n: 1`).join("\n");
+  files["pnpm-lock.yaml"] =
+    `lockfileVersion: '9.0'\nimporters:\n  .: {}\na:\n${anchors}\n${collectionKeys}\n`;
+  await assert.rejects(inspectProjectFiles(read), /YAML features pnpm does not write/);
+});
+
+test("a lockfile parse that outlasts its deadline is terminated", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+  };
+  // The deadline elapses as soon as the worker starts.
+  const workers = watchWorkers(t, () => t.mock.timers.tick(30_000));
+  await assert.rejects(
+    inspectProjectFiles(async (name) => files[name] ?? null),
+    (e) => e instanceof InputError && e.message === "The pnpm lockfile took too long to parse.",
+  );
+  assert.equal(workers.length, 1);
+  await workers[0].exit;
+  assert.equal(workers[0].messages, 0);
+});
+
+test("a lockfile worker that runs out of memory reports an input error", async (t) => {
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+  };
+  // Node reports a worker over its heap cap with this error and stops it; the 1 GiB cap is too large to
+  // reach in a test.
+  const workers = watchWorkers(t, ({ worker }) => {
+    const error = new Error(
+      "Worker terminated due to reaching memory limit: JS heap out of memory",
+    );
+    worker.emit("error", Object.assign(error, { code: "ERR_WORKER_OUT_OF_MEMORY" }));
+    void worker.terminate();
+  });
+  await assert.rejects(
+    inspectProjectFiles(async (name) => files[name] ?? null),
+    (e) =>
+      e instanceof InputError &&
+      e.message === "The pnpm lockfile needs more memory to parse than the scanner allows.",
+  );
+  await workers[0].exit;
+});
+
+test("aborting an inspection rejects at once and terminates its lockfile worker", async (t) => {
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+  };
+  const read = async (name) => files[name] ?? null;
+  const stopped = (e) =>
+    e instanceof InputError &&
+    e.message === "The scan stopped before the pnpm lockfile was parsed.";
+  let controller;
+  const workers = watchWorkers(t, () => controller?.abort());
+  // An already aborted scan starts no worker.
+  await assert.rejects(inspectProjectFiles(read, AbortSignal.abort()), stopped);
+  assert.equal(workers.length, 0);
+  // Aborting as the parse starts rejects before the worker has stopped, and the worker is terminated:
+  // it exits without delivering its result.
+  controller = new AbortController();
+  await assert.rejects(inspectProjectFiles(read, controller.signal), stopped);
+  assert.equal(workers.length, 1);
+  assert.equal(workers[0].exited, false);
+  await workers[0].exit;
+  assert.equal(workers[0].messages, 0);
+});
+
+test("removing a project or stopping the coordinator terminates its lockfile parse", async (t) => {
+  let coordinator;
+  t.after(() => coordinator?.close());
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  let onWorker = () => {};
+  const workers = watchWorkers(t, () => onWorker());
+  coordinator = new MonitoringCoordinator({ dataDir, lookup: false });
+  coordinator.changeSettings({ paused: true });
+  const pnpmProject = async (name) => {
+    const path = join(root, name);
+    await mkdir(path);
+    await writeFile(join(path, "package.json"), "{}");
+    await writeFile(join(path, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+    return coordinator.addProject({ path, mode: "watch" });
+  };
+  const attempt = (history, project) => history.find((a) => a.targetId === project.id);
+
+  const removed = await pnpmProject("removed");
+  onWorker = () => coordinator.removeProject(removed.id);
+  coordinator.requestScan({ target: "projects", projectId: removed.id });
+  await waitFor(() => workers.length === 1);
+  await workers[0].exit;
+  assert.equal(workers[0].messages, 0);
+  await waitFor(() => coordinator.snapshot().scanProgress.active === null);
+  assert.deepEqual(attempt(coordinator.snapshot().history, removed).errors, [
+    "The project was removed during this scan.",
+  ]);
+
+  const stopping = await pnpmProject("stopping");
+  let closing;
+  onWorker = () => (closing = coordinator.close());
+  coordinator.requestScan({ target: "projects", projectId: stopping.id });
+  await waitFor(() => closing);
+  await closing;
+  await workers[1].exit;
+  assert.equal(workers[1].messages, 0);
+  const storage = new MonitoringStorage(dataDir);
+  const stored = attempt(storage.read().snapshot.history, stopping);
+  storage.close();
+  assert.equal(stored.status, "failed");
+  assert.deepEqual(stored.errors, ["The scan stopped before the pnpm lockfile was parsed."]);
+});
+
+test("application and repository scans pass their signal to the lockfile parse", async (t) => {
+  let coordinator;
+  let app;
+  t.after(async () => {
+    await app?.close();
+    await coordinator?.close();
+  });
+  const root = await temporary(t);
+  let onWorker = () => {};
+  const workers = watchWorkers(t, () => onWorker());
+  const files = {
+    "package.json": "{}",
+    "pnpm-lock.yaml": "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+  };
+  // Local checkouts scan through ApplicationService's inspection.
+  coordinator = new MonitoringCoordinator({ dataDir: join(root, "state"), lookup: false });
+  coordinator.changeSettings({ paused: true });
+  app = await ApplicationService.create(coordinator);
+  const checkout = join(root, "checkout");
+  await mkdir(checkout);
+  for (const [name, content] of Object.entries(files))
+    await writeFile(join(checkout, name), content);
+  const local = await coordinator.addProject({ path: checkout, mode: "watch" });
+  onWorker = () => coordinator.removeProject(local.id);
+  coordinator.requestScan({ target: "projects", projectId: local.id });
+  await waitFor(() => workers.length === 1);
+  await workers[0].exit;
+  assert.equal(workers[0].messages, 0);
+
+  // Provider repositories scan through inspectRepository.
+  const fetcher = async (input) => {
+    const path = new URL(input).pathname;
+    if (path === "/repos/fixture/repo/commits/main") return Response.json({ sha: "a".repeat(40) });
+    const content = files[decodeURIComponent(path.split("/contents/")[1] ?? "")];
+    return content ? new Response(content) : new Response("", { status: 404 });
+  };
+  const repository = { provider: "github", repositoryId: "1", name: "fixture/repo", ref: "main" };
+  const controller = new AbortController();
+  onWorker = () => controller.abort();
+  await assert.rejects(
+    inspectRepository({ repository }, "token", fetcher, controller.signal),
+    (e) =>
+      e instanceof InputError &&
+      e.message === "The scan stopped before the pnpm lockfile was parsed.",
+  );
+  await workers[1].exit;
+  assert.equal(workers[1].messages, 0);
 });
 
 test("missing, malformed and unsupported inputs never produce complete coverage", async (t) => {
@@ -459,7 +716,8 @@ test("a failed OSV batch remains unverified while later batches collect advisory
       if (url.endsWith("/querybatch")) {
         const queries = JSON.parse(options.body).queries;
         batches.push(queries.length);
-        if (batches.length === 1) return new Response("OSV unavailable", { status: 503 });
+        // The first batch and its one retry are unavailable.
+        if (batches.length <= 2) return new Response("OSV unavailable", { status: 503 });
         return Response.json({
           results: queries.map((query) =>
             query.package.name === "osv-batch-120" ? { vulns: [{ id: "GHSA-late-batch" }] } : {},
@@ -480,8 +738,10 @@ test("a failed OSV batch remains unverified while later batches collect advisory
     },
     undefined,
     (value) => progress.push(value),
+    undefined,
+    createSourceCache(async () => {}),
   );
-  assert.deepEqual(batches, [100, 21]);
+  assert.deepEqual(batches, [100, 100, 21]);
   for (let index = 0; index < result.dependencies.length; index++)
     assert.equal(result.dependencies[index].advisoryStatus, index < 100 ? "failed" : "checked");
   assert.deepEqual(result.dependencies[120].advisoryIds, ["GHSA-late-batch"]);
@@ -565,8 +825,11 @@ test("project lookups check every unique direct name beyond 100 with bounded con
     },
     undefined,
     (value) => progress.push(value),
+    undefined,
+    createSourceCache(async () => {}),
   );
-  assert.equal(requests.length, 105);
+  assert.equal(requests.length, 106, "Every name once, and the unavailable one retried once");
+  assert.equal(requests.filter((name) => name === "complete-0").length, 2);
   assert.equal(
     failedResponseCanceled,
     true,
@@ -659,8 +922,14 @@ test("all advisory details beyond 50 are attempted with bounded concurrency and 
     },
     undefined,
     (value) => progress.push(value),
+    undefined,
+    createSourceCache(async () => {}),
   );
-  assert.deepEqual([...requests].sort(), [...ids].sort());
+  assert.deepEqual(
+    [...requests].sort(),
+    [...ids, "GHSA-detail-3"].sort(),
+    "Every id once, and the unavailable one retried once",
+  );
   assert.ok(
     maximum > 1 && maximum <= 4,
     `Advisory detail concurrency must be bounded at four, got ${maximum}`,
@@ -2122,4 +2391,352 @@ test("due entries of removed projects or projects without automatic scans are ig
   assert.equal(coordinator.snapshot().runtime.nextScanAt, scheduled);
   // A stale entry must not keep restarting the worker, which would postpone the summary forever.
   await waitFor(() => coordinator.snapshot().notificationSummary !== null);
+});
+
+// A complete saved state with findings for the PC and two projects.
+function storedFixture() {
+  const at = "2026-10-01T10:00:00.000Z";
+  const evidence = {
+    status: "complete",
+    lastAttempt: at,
+    lastSuccess: at,
+    coverage: ["lockfile"],
+    errors: [],
+  };
+  const project = (id) => ({
+    id,
+    name: id,
+    path: `/projects/${id}`,
+    mode: "maintained",
+    packageManager: "npm",
+    manifestPath: `/projects/${id}/package.json`,
+    lockfilePath: `/projects/${id}/package-lock.json`,
+    evidence: { ...evidence },
+    dependencies: [
+      {
+        id: `${id}-alias`,
+        name: "alias",
+        packageName: "public-example",
+        requested: "^1.0.0",
+        resolved: "1.0.0",
+        origin: "registry",
+        role: "production",
+        importer: ".",
+        availableVersion: "1.5.0",
+        latestVersion: null,
+        versionStatus: "checked",
+        advisoryStatus: "checked",
+        advisoryIds: [],
+      },
+    ],
+    createdAt: at,
+  });
+  const finding = (id, subjectId, kind = "update") => ({
+    id,
+    kind,
+    subjectId,
+    subjectLabel: subjectId,
+    name: "alias",
+    packageName: "public-example",
+    installedVersion: "1.0.0",
+    availableVersion: "1.5.0",
+    severity: kind === "advisory" ? "high" : "info",
+    source: "npm registry",
+    description: "A newer version satisfies the requested range.",
+    advisoryUrl: null,
+    detectedAt: at,
+    lastSeenAt: at,
+  });
+  return {
+    snapshot: {
+      protocolVersion: 1,
+      runtime: {
+        startedAt: at,
+        mode: "interactive",
+        host: "session",
+        platform: "win32",
+        nextScanAt: null,
+      },
+      device: { id: "device-1", label: "Owner PC", platform: "win32" },
+      settings: {
+        paused: true,
+        pcIntervalMinutes: 120,
+        projectIntervalMinutes: 30,
+        notifyNewFindings: true,
+      },
+      inventory: {
+        collector: "npm-bun-global-v1",
+        managers: [],
+        evidence: { ...evidence },
+        updateEvidence: { ...evidence },
+        installations: [
+          {
+            id: "tool",
+            name: "tool",
+            version: "1.0.0",
+            source: "npm global",
+            scope: "user",
+            channel: "stable",
+            availableVersion: "2.0.0",
+            updateStatus: "available",
+          },
+        ],
+      },
+      projects: [project("project-a"), project("project-b")],
+      findings: [
+        finding("pc-update", "device-1"),
+        finding("a-update", "project-a"),
+        finding("a-advisory", "project-a", "advisory"),
+        finding("b-update", "project-b"),
+      ],
+      history: [
+        {
+          id: "attempt",
+          targetId: "project-a",
+          targetLabel: "project-a",
+          kind: "project",
+          startedAt: at,
+          finishedAt: at,
+          status: "complete",
+          coverage: ["lockfile"],
+          errors: [],
+        },
+      ],
+      notifications: [
+        {
+          id: "pending",
+          findingId: "a-update",
+          title: "a",
+          body: "b",
+          createdAt: at,
+          deliveredAt: null,
+        },
+        {
+          id: "sent",
+          findingId: "b-update",
+          title: "a",
+          body: "b",
+          createdAt: at,
+          deliveredAt: at,
+        },
+      ],
+      notificationNextAt: "2026-10-01T10:05:00.000Z",
+    },
+    due: { pc: 1, "project-a": 2, "project-b": 3 },
+    notified: ["pc-update", "a-update", "a-advisory", "b-update"],
+  };
+}
+
+test("a version 1 database migrates to per-subject rows in one transaction and keeps every record", async (t) => {
+  let database;
+  t.after(() => database?.isOpen && database.close());
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  await mkdir(dataDir);
+  const stored = storedFixture();
+  // The schema version 1 statements, so the migration runs against a real older database.
+  database = new DatabaseSync(join(dataDir, "monitoring.sqlite"));
+  database.exec(`PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;
+    CREATE TABLE monitoring_state (id INTEGER PRIMARY KEY CHECK(id=1), snapshot TEXT NOT NULL, due TEXT NOT NULL, notified TEXT NOT NULL);
+    PRAGMA user_version=1;
+    COMMIT;`);
+  database
+    .prepare("INSERT INTO monitoring_state(id,snapshot,due,notified) VALUES(1,?,?,?)")
+    .run(
+      JSON.stringify(stored.snapshot),
+      JSON.stringify(stored.due),
+      JSON.stringify(stored.notified),
+    );
+  database.exec(
+    "CREATE TABLE application_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)",
+  );
+  database.prepare("INSERT INTO application_state(id,value) VALUES(1,?)").run('{"theme":"dark"}');
+  const version = () => database.prepare("PRAGMA user_version").get().user_version;
+  const tables = () =>
+    database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .all()
+      .map((row) => row.name);
+  const v1 = () => ({ ...database.prepare("SELECT * FROM monitoring_state").get() });
+  const original = v1();
+
+  // Invalid saved state is refused before anything is written.
+  database.prepare("UPDATE monitoring_state SET notified=?").run('{"not":"a list"}');
+  assert.throws(
+    () => new MonitoringStorage(dataDir),
+    /^Error: The monitoring database contains an invalid schedule state\.$/,
+  );
+  database.prepare("UPDATE monitoring_state SET notified=?").run(original.notified);
+  // A failure after the split rows are written (the v1 table cannot be dropped) rolls them back.
+  database.exec(
+    "CREATE TABLE pin (state INTEGER REFERENCES monitoring_state(id)); INSERT INTO pin VALUES (1);",
+  );
+  assert.throws(() => new MonitoringStorage(dataDir), /FOREIGN KEY constraint failed/);
+  assert.equal(version(), 1);
+  assert.deepEqual(tables(), ["application_state", "monitoring_state", "pin"]);
+  assert.deepEqual(v1(), original);
+  database.exec("DROP TABLE pin");
+
+  const storage = new MonitoringStorage(dataDir);
+  try {
+    assert.equal(version(), 2);
+    assert.deepEqual(tables(), [
+      "application_state",
+      "monitoring_findings",
+      "monitoring_meta",
+      "monitoring_projects",
+    ]);
+    assert.deepEqual(
+      database
+        .prepare("SELECT subject_id FROM monitoring_findings")
+        .all()
+        .map((r) => r.subject_id),
+      ["device-1", "project-a", "project-b"],
+    );
+    // Device, settings, projects, findings, history, notifications, due and notified survive.
+    assert.deepEqual(storage.read(), stored);
+    assert.deepEqual(storage.readApplication(), { theme: "dark" });
+  } finally {
+    storage.close();
+  }
+  database.exec("PRAGMA user_version=3");
+  assert.throws(() => new MonitoringStorage(dataDir), /needs a newer Versionstead version/);
+});
+
+test("a project scan rewrites only its own rows, removal deletes them and a restart reads the same state", async (t) => {
+  let coordinator;
+  let database;
+  t.after(async () => {
+    if (database?.isOpen) database.close();
+    await coordinator?.close();
+  });
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  const lookup = async (dependencies) => ({
+    dependencies: dependencies.map((d) => ({
+      ...d,
+      availableVersion: d.name === "alias" ? "1.5.0" : null,
+      versionStatus: d.role === "transitive" ? "unsupported" : "checked",
+      advisoryStatus: "checked",
+    })),
+    advisories: new Map(),
+    coverage: [],
+    errors: [],
+  });
+  coordinator = new MonitoringCoordinator({ dataDir, dependencyLookup: lookup });
+  coordinator.changeSettings({ paused: true });
+  const projects = [];
+  for (const name of ["first", "second"]) {
+    await npmFixture(join(root, name));
+    projects.push(await coordinator.addProject({ path: join(root, name), mode: "maintained" }));
+    await scan(coordinator, projects.at(-1).id);
+  }
+  const [first, second] = projects;
+  database = new DatabaseSync(join(dataDir, "monitoring.sqlite"));
+  // A leading space keeps every row valid JSON and marks the rows later writes leave alone.
+  database.exec(`UPDATE monitoring_meta SET value=' '||value;
+    UPDATE monitoring_projects SET value=' '||value;
+    UPDATE monitoring_findings SET value=' '||value;`);
+  await scan(coordinator, first.id);
+  assert.deepEqual(
+    database
+      .prepare(
+        `SELECT 'meta' AS row FROM monitoring_meta WHERE value NOT LIKE ' %'
+        UNION ALL SELECT 'project ' || id FROM monitoring_projects WHERE value NOT LIKE ' %'
+        UNION ALL SELECT 'findings ' || subject_id FROM monitoring_findings WHERE value NOT LIKE ' %'`,
+      )
+      .all()
+      .map((r) => r.row)
+      .sort(),
+    ["findings " + first.id, "meta", "project " + first.id].sort(),
+  );
+
+  coordinator.removeProject(second.id);
+  assert.deepEqual(
+    database
+      .prepare("SELECT id FROM monitoring_projects")
+      .all()
+      .map((r) => r.id),
+    [first.id],
+  );
+  assert.deepEqual(
+    database
+      .prepare("SELECT subject_id FROM monitoring_findings")
+      .all()
+      .map((r) => r.subject_id),
+    [first.id],
+  );
+
+  // The stored state, without the live fields the snapshot adds.
+  const expected = coordinator.snapshot();
+  delete expected.features;
+  delete expected.scanProgress;
+  delete expected.notificationSummary;
+  await coordinator.close();
+  const storage = new MonitoringStorage(dataDir);
+  try {
+    assert.deepEqual(storage.read().snapshot, expected);
+  } finally {
+    storage.close();
+  }
+});
+
+test("a failed storage write rolls back every row and a corrupt row fails clearly", async (t) => {
+  let storage;
+  let database;
+  t.after(() => {
+    storage?.close();
+    if (database?.isOpen) database.close();
+  });
+  const root = await temporary(t);
+  const dataDir = join(root, "state");
+  const before = storedFixture();
+  storage = new MonitoringStorage(dataDir);
+  storage.write(before);
+  database = new DatabaseSync(join(dataDir, "monitoring.sqlite"));
+  const after = structuredClone(before);
+  after.snapshot.history[0].status = "partial";
+  after.snapshot.projects[0].evidence.status = "partial";
+  after.snapshot.findings[1].lastSeenAt = "2026-10-02T10:00:00.000Z";
+  after.snapshot.projects.pop();
+  after.snapshot.findings = after.snapshot.findings.filter((f) => f.subjectId !== "project-b");
+  const reopened = () => {
+    const reader = new MonitoringStorage(dataDir);
+    try {
+      return reader.read();
+    } finally {
+      reader.close();
+    }
+  };
+
+  // The removed subject's findings are deleted last, after every other row has been written.
+  database.exec(`CREATE TRIGGER fail BEFORE DELETE ON monitoring_findings
+    BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;`);
+  assert.throws(() => storage.write(after), /simulated write failure/);
+  assert.deepEqual(reopened(), before);
+  database.exec("DROP TRIGGER fail");
+  // The failed write is not remembered as written.
+  storage.write(after);
+  assert.deepEqual(reopened(), after);
+
+  for (const [corruption, message] of [
+    ["UPDATE monitoring_projects SET value='{'", /invalid project record/],
+    ["UPDATE monitoring_projects SET value=json_remove(value,'$.evidence')", /invalid monitoring/],
+    [
+      "UPDATE monitoring_findings SET subject_id='other' WHERE subject_id='project-a'",
+      /invalid findings record/,
+    ],
+    ["DELETE FROM monitoring_meta", /invalid monitoring state record/],
+  ]) {
+    database.exec(corruption);
+    const reader = new MonitoringStorage(dataDir);
+    try {
+      assert.throws(() => reader.read(), message, corruption);
+      // A storage that remembers no rows rewrites all of them.
+      reader.write(after);
+    } finally {
+      reader.close();
+    }
+    assert.deepEqual(reopened(), after, corruption);
+  }
 });

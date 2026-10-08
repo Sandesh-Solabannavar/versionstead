@@ -56,6 +56,7 @@ import {
   timestamp,
 } from "./ui";
 import { attentionGroups, installationCandidate, plural, workspaceLabel } from "./monitoring-view";
+import { latestEvidence } from "./computer-evidence";
 import { settingsSections } from "./settings-navigation";
 import { SettingsSearchTargets } from "./components/settings-controls";
 
@@ -749,10 +750,19 @@ export function SettingsPage() {
 export function ComputerPage() {
   const path = useLocation({ select: (l) => l.pathname });
   const id = path.split("/").at(-1);
-  const { snapshot: app, error, refresh, change } = useApplication();
+  const {
+    snapshot: app,
+    computerEvidence,
+    unreadableEvidence,
+    retryEvidence,
+    error,
+    refresh,
+    change,
+  } = useApplication();
   const { pending, connection } = useMonitoring();
   const computer = app?.computers.find((c) => c.id === id);
-  const snapshot = computer?.snapshot;
+  // The provider reads a PC's evidence when its digest changes, which includes this page's Refresh.
+  const snapshot = computer && computerEvidence.get(computer.id)?.snapshot;
   // Until the coordinator's settings arrive, no PC is known to be missing.
   if (!app)
     return error ? (
@@ -789,6 +799,13 @@ export function ComputerPage() {
   // The page's actions and Connections' environment menu share one key, so they wait for each other.
   const key = actionKeys.environment(computer.id);
   const unavailable = pending.has(key) || connection !== "connected" || computer.enabled === false;
+  // Held evidence of an earlier digest is not what this PC last sent, so it says so.
+  const latest = latestEvidence(computer, computerEvidence, unreadableEvidence);
+  const retry = (
+    <Button disabled={connection !== "connected"} onClick={() => retryEvidence(computer.id)}>
+      Retry
+    </Button>
+  );
   return (
     <>
       <PageHeading
@@ -844,11 +861,32 @@ export function ComputerPage() {
         </div>
       )}
       {!snapshot ? (
-        <EmptyState title="No evidence received">
-          Check that the other PC is running and reachable on your LAN or tailnet.
-        </EmptyState>
+        latest === "none" ? (
+          <EmptyState title="No evidence received">
+            Check that the other PC is running and reachable on your LAN or tailnet.
+          </EmptyState>
+        ) : latest === "failed" ? (
+          <EmptyState title="Evidence could not be read" action={retry}>
+            Your coordinator holds what this PC last sent, but reading it failed.
+          </EmptyState>
+        ) : (
+          <EmptyState title="Loading evidence">Reading what this PC last sent.</EmptyState>
+        )
       ) : (
         <>
+          {latest !== "current" && (
+            <div
+              className={`connection-banner${latest === "failed" ? " warning" : ""}`}
+              role="status"
+            >
+              <p>
+                {latest === "failed"
+                  ? "The latest evidence this PC sent could not be read. Earlier evidence is shown."
+                  : "Earlier evidence is shown while the latest this PC sent is read."}
+              </p>
+              {latest === "failed" && retry}
+            </div>
+          )}
           <ScanProgress
             snapshot={snapshot}
             connected={!computer.error && connection === "connected"}

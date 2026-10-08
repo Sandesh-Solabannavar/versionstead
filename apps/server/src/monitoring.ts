@@ -29,6 +29,7 @@ import {
 import { inspectInventory, validateGlobalToolSources } from "./adapters/inventory.ts";
 import { checkNativeVersions } from "./adapters/outdated.ts";
 import {
+  createSourceCache,
   lookupDependencies,
   type DependencyLookup,
   type LookupResult,
@@ -41,7 +42,7 @@ type Mutable<T> = T extends readonly (infer U)[]
     ? { -readonly [K in keyof T]: Mutable<T[K]> }
     : T;
 const timestamp = () => new Date().toISOString();
-const features = "settings-repositories-connections-v7" as const;
+const features = "settings-repositories-connections-v8" as const;
 const evidenceNotSaved = "Evidence could not be saved; the previous saved evidence is retained.";
 const emptyEvidence = (): Mutable<ScanEvidence> => ({
   status: "not-scanned",
@@ -63,8 +64,8 @@ export type MonitoringOptions = {
 };
 
 export class MonitoringCoordinator {
-  private projectInspection = (project: Project, _signal?: AbortSignal) =>
-    inspectProject(project.path);
+  private projectInspection = (project: Project, signal?: AbortSignal) =>
+    inspectProject(project.path, signal);
   private automaticProjectAllowed = (_project: Project) => true;
   private readonly storage: MonitoringStorage;
   private state: Mutable<MonitoringSnapshot>;
@@ -99,6 +100,8 @@ export class MonitoringCoordinator {
       options.nativeVersionLookup === false
         ? null
         : (options.nativeVersionLookup ?? checkNativeVersions);
+    // Every project and This PC scan of this coordinator shares one cache of public metadata.
+    const sources = createSourceCache();
     this.lookup =
       options.lookup === false
         ? null
@@ -120,8 +123,12 @@ export class MonitoringCoordinator {
                         onProgress?.({ stage: "native-versions", completed, total }),
                     )
                 : undefined,
+              sources,
             )));
-    this.inventoryLookup = options.inventoryLookup ?? inspectInventory;
+    this.inventoryLookup =
+      options.inventoryLookup ??
+      ((scanPlatform, mode, signal, progress, previous) =>
+        inspectInventory(scanPlatform, mode, signal, progress, previous, sources));
     this.state = stored
       ? (structuredClone(stored.snapshot) as Mutable<MonitoringSnapshot>)
       : {
@@ -241,6 +248,7 @@ export class MonitoringCoordinator {
   progressSnapshot(): MonitoringProgress {
     return decodeMonitoringProgress({
       revision: this.revision,
+      settings: this.state.settings,
       scanProgress: this.scanProgress(),
       notificationSummary: this.prepareNotificationSummary(),
       notificationNextAt: this.state.notificationNextAt ?? null,

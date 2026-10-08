@@ -32,6 +32,7 @@ import { Attention, Projects, Service, ThisPc } from "./pages";
 import { MonitoringProvider, useMonitoring } from "./monitoring";
 import { AppearanceProvider, useAppearance } from "./theme";
 import { ApplicationProvider, useApplication } from "./application";
+import { latestEvidence } from "./computer-evidence";
 import { searchSettings, settingsSections } from "./settings-navigation";
 import { WorkspaceChromeProvider, useWorkspaceChrome } from "./workspace-chrome";
 import { commands, defaultBindings, isMac, keyChord } from "./keybindings";
@@ -169,7 +170,7 @@ function ConnectionNotice() {
     snapshot &&
     (!snapshot.scanProgress ||
       snapshot.inventory.collector !== "npm-bun-global-v1" ||
-      snapshot.features !== "settings-repositories-connections-v7") &&
+      snapshot.features !== "settings-repositories-connections-v8") &&
     snapshot.runtime.startedAt !== dismissedBuild
   )
     // Nothing is held back by this banner (the PC scan controls say so themselves), so it can be
@@ -199,20 +200,27 @@ function ShellContent() {
   const path = useLocation({ select: (location) => location.pathname });
   const hash = useLocation({ select: (location) => location.hash });
   const settings = path.startsWith("/settings/");
-  const { snapshot: application } = useApplication();
+  const { snapshot: application, computerEvidence, unreadableEvidence } = useApplication();
   const attentionCount = useMemo(
     () =>
       (snapshot ? attentionGroups(snapshot).length : 0) +
-      (application?.computers.reduce(
-        (total, computer) =>
+      (application?.computers.reduce((total, computer) => {
+        // A PC whose evidence has not arrived, is still being read, or whose latest evidence could
+        // not be read counts as at least one target.
+        const evidence = computerEvidence.get(computer.id)?.snapshot;
+        return (
           total +
           Math.max(
-            computer.snapshot ? attentionGroups(computer.snapshot).length : 0,
-            computer.error || !computer.snapshot ? 1 : 0,
-          ),
-        0,
-      ) ?? 0),
-    [snapshot, application],
+            evidence ? attentionGroups(evidence).length : 0,
+            computer.error ||
+              !evidence ||
+              latestEvidence(computer, computerEvidence, unreadableEvidence) === "failed"
+              ? 1
+              : 0,
+          )
+        );
+      }, 0) ?? 0),
+    [snapshot, application, computerEvidence, unreadableEvidence],
   );
   const title = settings
     ? (settingsSections.find((section) => section.path === path)?.label ?? "Settings")

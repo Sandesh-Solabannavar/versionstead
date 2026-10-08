@@ -9,6 +9,7 @@ import {
   ConnectedComputer,
   Sharing,
   type ApplicationSnapshot,
+  type ComputerSnapshot,
   type ProviderKind,
   type Repository,
   type AppUpdate,
@@ -16,7 +17,11 @@ import {
   parsePairingInvitation,
   type SshTarget,
 } from "@versionstead/contracts/application";
-import { decodeAcceptedResponse, type Project } from "@versionstead/contracts/monitoring";
+import {
+  decodeAcceptedResponse,
+  MonitoringSnapshot,
+  type Project,
+} from "@versionstead/contracts/monitoring";
 import type { MonitoringCoordinator } from "./monitoring.ts";
 import { InputError, inspectProject, object } from "./adapters/projects.ts";
 import { discoverTools, inspectGit, runTool } from "./adapters/development-tools.ts";
@@ -34,18 +39,29 @@ import { discoverSshHosts, startSshTunnel, validateSshTarget } from "./adapters/
 import { readSource } from "./adapters/source-http.ts";
 import { protectSecret, unprotectSecret } from "./runtime.ts";
 
+// A saved paired PC is its connection record with the evidence it last sent. The polled application
+// read leaves the evidence out, so the contract's record has the evidence's digest instead.
+const { snapshotDigest: _wireOnly, ...computerFields } = ConnectedComputer.fields;
+const StoredComputer = Schema.Struct({
+  ...computerFields,
+  snapshot: Schema.NullOr(MonitoringSnapshot),
+});
 const StoredApplication = Schema.Struct({
   preferences: ApplicationPreferences,
   providers: Schema.Array(ProviderConnection),
-  computers: Schema.Array(ConnectedComputer),
+  computers: Schema.Array(StoredComputer),
   sharing: Sharing,
   secrets: Schema.Array(Schema.Struct({ key: Schema.String, encrypted: Schema.String })),
   clientHashes: Schema.Array(Schema.Struct({ id: Schema.String, hash: Schema.String })),
 });
-type State = {
-  -readonly [K in keyof typeof StoredApplication.Type]: (typeof StoredApplication.Type)[K];
+type Stored = typeof StoredApplication.Type;
+// The digest is computed when evidence arrives or is loaded and is never saved.
+type Computer = Stored["computers"][number] & { snapshotDigest: string | null };
+type State = Omit<{ -readonly [K in keyof Stored]: Stored[K] }, "computers"> & {
+  computers: Computer[];
 };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+const evidenceDigest = (snapshot: MonitoringSnapshot) => hash(JSON.stringify(snapshot));
 const equal = (a: string, b: string) =>
   a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const now = () => new Date().toISOString();
@@ -71,13 +87,29 @@ export class ApplicationService {
   private readonly timer: ReturnType<typeof setInterval>;
   private polling: Promise<void> | null = null;
   private nextUpdate = 0;
-  private discoveredAt = 0;
+  private readonly peer: typeof peerRequest;
+  private readonly probeTools: typeof discoverTools;
+  // What the last write contained, as save() compares it; see there.
+  private saved: string | null = null;
+  // The probe of the installed tools that runs when the service starts; reads wait for it.
+  private readonly startup: Promise<unknown>;
+  // Discoveries started, and the latest one whose result is applied; see discover().
+  private discoveries = 0;
+  private discovered = 0;
 
-  private constructor(coordinator: MonitoringCoordinator, fetcher: typeof fetch, version: string) {
+  private constructor(
+    coordinator: MonitoringCoordinator,
+    fetcher: typeof fetch,
+    peer: typeof peerRequest,
+    tools: typeof discoverTools,
+    version: string,
+  ) {
     this.coordinator = coordinator;
     this.fetcher = fetcher;
+    this.peer = peer;
+    this.probeTools = tools;
     const saved = coordinator.readApplication();
-    this.state = saved
+    const stored: Stored = saved
       ? Schema.decodeUnknownSync(StoredApplication)(saved)
       : {
           preferences: {
@@ -104,6 +136,13 @@ export class ApplicationService {
           secrets: [],
           clientHashes: [],
         };
+    this.state = {
+      ...stored,
+      computers: stored.computers.map((computer) => ({
+        ...computer,
+        snapshotDigest: computer.snapshot && evidenceDigest(computer.snapshot),
+      })),
+    };
     if (
       this.state.computers.length > 8 ||
       this.state.sharing.clients.length > 16 ||
@@ -140,15 +179,24 @@ export class ApplicationService {
       });
     }, 30000);
     this.timer.unref();
+    // The tools are probed now, and afterwards only when the owner asks (or changes the Git preference
+    // that decides what is reported of Git), never because the interface polls. A failed probe reads
+    // as unavailable; no rejection may escape this promise, which nothing observes until a read.
+    this.startup = this.discover().catch(() => {});
   }
 
-  static async create(coordinator: MonitoringCoordinator, fetcher: typeof fetch = fetch) {
+  static async create(
+    coordinator: MonitoringCoordinator,
+    fetcher: typeof fetch = fetch,
+    peer: typeof peerRequest = peerRequest,
+    tools: typeof discoverTools = discoverTools,
+  ) {
     const metadata = object(
       JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")),
     );
     if (typeof metadata.version !== "string" || !semver.valid(metadata.version))
       throw new Error("Invalid application version.");
-    const app = new ApplicationService(coordinator, fetcher, metadata.version);
+    const app = new ApplicationService(coordinator, fetcher, peer, tools, metadata.version);
     if (app.state.sharing.enabled) {
       try {
         await app.enableSharing(app.state.sharing.address, app.state.sharing.port);
@@ -163,8 +211,26 @@ export class ApplicationService {
     }
     return app;
   }
+  // The single write path. Received evidence counts by its digest and a computer's checkedAt not at
+  // all, so a refresh that changes neither the evidence nor the connection error is not written. Its
+  // check time stays in memory and is saved with the next change.
+  // ponytail: after a restart retained evidence can show an older check time than the last contact,
+  // never a newer one; save the time on a timer if that matters. One row also holds every received
+  // snapshot, so a changed snapshot rewrites all of them (up to 8 x 16 MiB); give each PC its own row
+  // if that measurably matters.
   private save() {
-    this.coordinator.writeApplication(this.state);
+    const durable = JSON.stringify({
+      ...this.state,
+      computers: this.state.computers.map(
+        ({ snapshot: _evidence, checkedAt: _at, ...rest }) => rest,
+      ),
+    });
+    if (durable === this.saved) return;
+    this.coordinator.writeApplication({
+      ...this.state,
+      computers: this.state.computers.map(({ snapshotDigest: _digest, ...stored }) => stored),
+    });
+    this.saved = durable;
   }
   private provider(kind: ProviderKind) {
     return this.state.providers.find((p) => p.kind === kind)!;
@@ -213,15 +279,35 @@ export class ApplicationService {
             ? (this.state.sharing.error ?? "The sharing listener is unavailable.")
             : this.state.sharing.error,
       },
-      computers: this.state.computers,
+      // The evidence is read per PC, through computerSnapshot(), not with every poll of this record.
+      computers: this.state.computers.map(({ snapshot: _evidence, ...computer }) => computer),
       update: this.update,
     });
+  }
+  /** One paired PC's received evidence, or null when that PC is not connected. */
+  computerSnapshot(id: string): ComputerSnapshot | null {
+    const computer = this.state.computers.find((candidate) => candidate.id === id);
+    return computer
+      ? {
+          snapshotDigest: computer.snapshotDigest,
+          checkedAt: computer.checkedAt,
+          error: computer.error,
+          snapshot: computer.snapshot,
+        }
+      : null;
   }
   setLocalOrigin(origin: string) {
     this.localOrigin = origin;
   }
   async discover(refreshAuthentication = false) {
-    this.tools = await discoverTools(this.state.preferences.gitEnabled);
+    // Overlapping discoveries (startup, Refresh, a Git switch) finish in any order; a result never
+    // replaces one from a discovery that started later.
+    const discovery = ++this.discoveries;
+    const tools = await this.probeTools(this.state.preferences.gitEnabled);
+    if (discovery > this.discovered) {
+      this.tools = tools;
+      this.discovered = discovery;
+    }
     if (refreshAuthentication) {
       await Promise.all(
         this.state.providers.map(async (provider) => {
@@ -252,14 +338,14 @@ export class ApplicationService {
       );
       this.save();
     }
-    this.discoveredAt = Date.now();
     return this.snapshot();
   }
   async readSnapshot() {
-    if (Date.now() - this.discoveredAt > 60000) await this.discover();
+    await this.startup;
     return this.snapshot();
   }
-  changePreferences(patch: typeof ChangeApplicationPreferences.Type) {
+  async changePreferences(patch: typeof ChangeApplicationPreferences.Type) {
+    const { gitEnabled } = this.state.preferences;
     const defined = Object.fromEntries(
       Object.entries(patch).filter(([, value]) => value !== undefined),
     );
@@ -268,7 +354,8 @@ export class ApplicationService {
       ...defined,
     });
     this.save();
-    return this.snapshot();
+    // Whether Git may run decides what is reported of it, and polling no longer refreshes that.
+    return this.state.preferences.gitEnabled === gitEnabled ? this.snapshot() : this.discover();
   }
   async connectProvider(kind: ProviderKind, token?: string, useCli = false) {
     if (useCli) {
@@ -369,7 +456,7 @@ export class ApplicationService {
         signal,
       );
     }
-    const result = await inspectProject(project.path);
+    const result = await inspectProject(project.path, signal);
     // A failed inspection keeps the last recorded context, and says so; only turning Git context off
     // clears it.
     if (this.state.preferences.gitEnabled) {
@@ -636,7 +723,7 @@ export class ApplicationService {
     let response;
     try {
       response = object(
-        await peerRequest(origin, data.fingerprint, "/pair", {
+        await this.peer(origin, data.fingerprint, "/pair", {
           ...(await this.transport({ id, origin, ...(ssh ? { ssh } : {}) })),
           body: { code: data.code, label: local.label, deviceId: local.id },
           signal: this.shutdown.signal,
@@ -662,6 +749,7 @@ export class ApplicationService {
           checkedAt: null,
           error: null,
           snapshot: null,
+          snapshotDigest: null,
         },
       ];
       this.save();
@@ -680,7 +768,7 @@ export class ApplicationService {
     try {
       const nonce = randomBytes(32).toString("base64url");
       const evidence = decodeRemoteEvidence(
-        await peerRequest(computer.origin, computer.fingerprint, "/evidence", {
+        await this.peer(computer.origin, computer.fingerprint, "/evidence", {
           ...(await this.transport(computer)),
           token: await this.secret(`computer:${id}`),
           nonce,
@@ -689,9 +777,18 @@ export class ApplicationService {
       );
       if (evidence.nonce !== nonce || evidence.snapshot.device.id !== computer.deviceId)
         throw new Error();
+      // Evidence the digest says is unchanged keeps the snapshot already held.
+      const snapshotDigest = evidenceDigest(evidence.snapshot);
       this.state.computers = this.state.computers.map((c) =>
         c.id === id && c.enabled !== false
-          ? { ...c, snapshot: evidence.snapshot, checkedAt: now(), error: null }
+          ? {
+              ...c,
+              ...(snapshotDigest === c.snapshotDigest
+                ? {}
+                : { snapshot: evidence.snapshot, snapshotDigest }),
+              checkedAt: now(),
+              error: null,
+            }
           : c,
       );
     } catch {
@@ -713,7 +810,7 @@ export class ApplicationService {
     if (!c) throw new InputError("This PC is no longer connected.");
     if (c.enabled === false) throw new InputError("Enable this environment before scanning it.");
     decodeAcceptedResponse(
-      await peerRequest(c.origin, c.fingerprint, "/scan", {
+      await this.peer(c.origin, c.fingerprint, "/scan", {
         ...(await this.transport(c)),
         token: await this.secret(`computer:${id}`),
         body: {},
@@ -726,7 +823,7 @@ export class ApplicationService {
     const c = this.state.computers.find((computer) => computer.id === id);
     if (!c) throw new InputError("This PC is no longer connected.");
     try {
-      await peerRequest(c.origin, c.fingerprint, "/revoke", {
+      await this.peer(c.origin, c.fingerprint, "/revoke", {
         ...(await this.transport(c)),
         token: await this.secret(`computer:${id}`),
         body: {},

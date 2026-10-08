@@ -12,7 +12,7 @@ import {
   type Installation,
 } from "@versionstead/contracts/monitoring";
 import { identity, InputError, object, packageName, readSelectedFile, string } from "./projects.ts";
-import { publicPackageVersions } from "./lookups.ts";
+import { publicPackageVersions, type SourceCache } from "./lookups.ts";
 
 import { decodeBunConfiguration } from "./bun-config.ts";
 import {
@@ -454,6 +454,7 @@ export async function inspectGlobalSources(
   signal?: AbortSignal,
   progress?: (value: InventoryProgress) => void,
   fetcher: typeof fetch = fetch,
+  cache?: SourceCache,
 ): Promise<InventoryResult> {
   const result: InventoryResult = {
     installations: [],
@@ -581,12 +582,19 @@ export async function inspectGlobalSources(
         if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");
         const name = names[next++]!;
         try {
-          const { latest, versions } = await publicPackageVersions(name, fetcher, deadline, signal);
+          const { latest, versions, checkedAt } = await publicPackageVersions(
+            name,
+            fetcher,
+            deadline,
+            signal,
+            cache,
+          );
           if (semver.prerelease(latest) || !versions.includes(latest)) throw new Error();
           for (const item of eligible.filter((candidate) => candidate.packageId === name)) {
             item.availableVersion = semver.gt(latest, item.version) ? latest : null;
             item.updateStatus = item.availableVersion ? "available" : "current";
-            item.updateCheckedAt = now();
+            // Shared metadata keeps the time the registry confirmed it, not the time of this scan.
+            item.updateCheckedAt = new Date(checkedAt).toISOString();
           }
         } catch {
           if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");
@@ -623,6 +631,7 @@ export async function inspectInventory(
   signal?: AbortSignal,
   progress?: (value: InventoryProgress) => void,
   previous: readonly GlobalToolSource[] = [],
+  cache?: SourceCache,
 ): Promise<InventoryResult> {
   progress?.({ stage: "inventory", completed: null, total: null });
   const sources =
@@ -631,7 +640,7 @@ export async function inspectInventory(
     throw new InputError(
       "Owner global locations are not configured. Open Versionstead in the owner session before background scanning.",
     );
-  const result = await inspectGlobalSources(sources, signal, progress);
+  const result = await inspectGlobalSources(sources, signal, progress, undefined, cache);
   for (const old of previous) {
     const current = result.managers.find((source) => source.manager === old.manager);
     if (

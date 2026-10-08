@@ -10,6 +10,7 @@ import {
   inspectGlobalSources,
   validateGlobalToolSources,
 } from "../dist/adapters/inventory.js";
+import { createSourceCache } from "../dist/adapters/lookups.js";
 
 const checkedAt = "2026-10-02T10:00:00.000Z";
 test("Bun roots follow explicit config and environment precedence without listing a parent project", () => {
@@ -217,8 +218,13 @@ test("all global names are checked with bounded concurrency despite individual s
         active--;
       }
     },
+    createSourceCache(async () => {}),
   );
-  assert.deepEqual(calls.sort(), names);
+  assert.deepEqual(
+    calls.sort(),
+    [...names, "tool-010"].sort(),
+    "Every name once, and the unavailable one retried once",
+  );
   assert.equal(peak, 4);
   assert.equal(result.inventoryChecks, "complete");
   assert.equal(result.updateChecks, "partial");

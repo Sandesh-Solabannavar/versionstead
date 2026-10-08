@@ -30,6 +30,7 @@ import {
   ComputerAction,
   ProviderKind,
   decodeApplicationSnapshot,
+  decodeComputerSnapshot,
   decodeRepositoryList,
   decodeInvitation,
 } from "@versionstead/contracts/application";
@@ -167,7 +168,7 @@ export async function startServer(
           if (path === "/api/application/preferences" && request.method === "PATCH") {
             json(
               decodeApplicationSnapshot(
-                application.changePreferences(
+                await application.changePreferences(
                   decode(ChangeApplicationPreferences, await readJson(request)),
                 ),
               ),
@@ -256,6 +257,16 @@ export async function startServer(
                 await application.pairComputer(input.invitation, input.ssh),
               ),
             );
+            return;
+          }
+          // The polled application read leaves out each PC's received evidence; this is where it is read.
+          const evidenceOf = /^\/api\/application\/computers\/([^/]+)\/snapshot$/.exec(path)?.[1];
+          if (evidenceOf && request.method === "GET") {
+            if (!/^[a-f0-9-]{36}$/.test(evidenceOf))
+              throw new HttpError(400, "Invalid computer identity");
+            const evidence = application.computerSnapshot(evidenceOf);
+            if (!evidence) throw new HttpError(404, "This PC is no longer connected.");
+            json(decodeComputerSnapshot(evidence));
             return;
           }
           const action = /^\/api\/application\/computers\/(refresh|scan|remove|revoke)$/.exec(

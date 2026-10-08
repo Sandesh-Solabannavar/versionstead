@@ -31,6 +31,7 @@ import {
 import { useMonitoring } from "./monitoring";
 import { actionKeys } from "./monitoring-actions";
 import { useApplication } from "./application";
+import { latestEvidence } from "./computer-evidence";
 import { AddProjectDialog } from "./add-project";
 import { ProjectBadge } from "./project-icons";
 import { ProjectCommands } from "./project-settings";
@@ -48,6 +49,7 @@ import {
   dependencyUpgradeOption,
   filterInstallations,
   findingSummary,
+  findingsRetained,
   findingUpgradeCommands,
   globalToolSourceState,
   installationCandidate,
@@ -492,13 +494,13 @@ const FindingsTable = memo(
     label,
     findings,
     project,
-    evidenceFailed,
+    retained,
     select,
   }: {
     label: string;
     findings: readonly Finding[];
     project: Project | null;
-    evidenceFailed: boolean;
+    retained: boolean;
     select: (findingId: string) => void;
   }) {
     const names = useMemo(
@@ -549,7 +551,7 @@ const FindingsTable = memo(
                 ) : (
                   <> → {finding.availableVersion}</>
                 ))}
-              {evidenceFailed && <span className="table-subtext">Previous, unverified</span>}
+              {retained && <span className="table-subtext">Previous, unverified</span>}
             </td>
             <td>
               <FindingBadge finding={finding} />
@@ -569,14 +571,14 @@ const FindingsTable = memo(
   (previous, next) =>
     previous.label === next.label &&
     previous.project === next.project &&
-    previous.evidenceFailed === next.evidenceFailed &&
+    previous.retained === next.retained &&
     previous.select === next.select &&
     sameFindings(previous.findings, next.findings),
 );
 
 export function Attention() {
   const { snapshot, connection, pending } = useMonitoring();
-  const { snapshot: application } = useApplication();
+  const { snapshot: application, computerEvidence, unreadableEvidence } = useApplication();
   const { filter = "all" } = useSearch({ from: "/" });
   const navigate = useNavigate({ from: "/" });
   const [query, setQuery] = useState("");
@@ -592,12 +594,15 @@ export function Attention() {
   const remoteGroups = useMemo(
     () =>
       new Map(
-        application?.computers.map((computer) => [
-          computer.id,
-          computer.snapshot ? attentionGroups(computer.snapshot, filter, search) : [],
-        ]),
+        application?.computers.map((computer) => {
+          const evidence = computerEvidence.get(computer.id);
+          return [
+            computer.id,
+            evidence ? attentionGroups(evidence.snapshot, filter, search) : [],
+          ] as const;
+        }),
       ),
-    [application, filter, search],
+    [application, computerEvidence, filter, search],
   );
   const expansion = useGroupExpansion();
   const selected = findings.find((finding) => finding.id === selectedId);
@@ -625,22 +630,35 @@ export function Attention() {
       {application &&
         application.computers.some(
           (computer) =>
-            computer.error || !computer.snapshot || remoteGroups.get(computer.id)?.length,
+            computer.error ||
+            !computerEvidence.has(computer.id) ||
+            latestEvidence(computer, computerEvidence, unreadableEvidence) === "failed" ||
+            remoteGroups.get(computer.id)?.length,
         ) && (
           <section className="setting-section" aria-label="Connected PC attention">
             <h2>Connected PCs</h2>
             <div className="setting-group">
               {application.computers.flatMap((computer) => {
                 const remote = remoteGroups.get(computer.id) ?? [];
-                if (!remote.length && !computer.error && computer.snapshot) return [];
+                const received = computerEvidence.has(computer.id);
+                const latest = latestEvidence(computer, computerEvidence, unreadableEvidence);
+                if (!remote.length && !computer.error && received && latest !== "failed") return [];
                 return (
                   <div className="preference-row" key={computer.id}>
                     <div>
                       <h3>{computer.label}</h3>
                       <p className="muted small">
-                        {computer.snapshot
-                          ? `${plural(remote.length, "target")} ${remote.length === 1 ? "needs" : "need"} attention`
-                          : "No evidence received"}{" "}
+                        {received
+                          ? `${plural(remote.length, "target")} ${remote.length === 1 ? "needs" : "need"} attention${
+                              latest === "current"
+                                ? ""
+                                : ` in earlier evidence; the latest ${latest === "failed" ? "could not be read" : "is being read"}`
+                            }`
+                          : latest === "none"
+                            ? "No evidence received"
+                            : latest === "failed"
+                              ? "Evidence could not be read"
+                              : "Loading evidence…"}{" "}
                         · Last received {timestamp(computer.checkedAt)}
                         {computer.error ? " · Unreachable, evidence retained" : ""}
                       </p>
@@ -880,7 +898,7 @@ export function Attention() {
                             label={group.label + " findings"}
                             findings={packageFindings}
                             project={group.project}
-                            evidenceFailed={group.evidence.status === "failed"}
+                            retained={findingsRetained(group.evidence.status)}
                             select={setSelectedId}
                           />
                         ) : coverageFindings.length === 0 && group.evidence.errors.length === 0 ? (

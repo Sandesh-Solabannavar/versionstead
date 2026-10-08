@@ -47,11 +47,22 @@ export const ConnectedComputer = Schema.Struct({
   deviceId: Schema.String,
   checkedAt: NullableString,
   error: NullableString,
-  snapshot: Schema.NullOr(MonitoringSnapshot),
+  // Identifies the evidence last received (null before any arrived). The evidence itself is read
+  // from /api/application/computers/{id}/snapshot, so the polled application read stays small.
+  snapshotDigest: NullableString,
   enabled: Schema.optional(Schema.Boolean),
   ssh: Schema.optional(SshTarget),
 });
 export type ConnectedComputer = typeof ConnectedComputer.Type;
+/** One paired PC's received evidence with its digest, check time and connection error. */
+export const ComputerSnapshot = Schema.Struct({
+  snapshotDigest: NullableString,
+  checkedAt: NullableString,
+  error: NullableString,
+  snapshot: Schema.NullOr(MonitoringSnapshot),
+});
+export type ComputerSnapshot = typeof ComputerSnapshot.Type;
+export const decodeComputerSnapshot = Schema.decodeUnknownSync(ComputerSnapshot);
 export const PairedClient = Schema.Struct({
   id: Schema.String,
   label: Schema.String,

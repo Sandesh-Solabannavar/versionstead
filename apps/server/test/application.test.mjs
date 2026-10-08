@@ -7,6 +7,8 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
 import { randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import * as Schema from "effect/Schema";
+import { MonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { ApplicationService } from "../dist/application.js";
 import { startServer } from "../dist/server.js";
@@ -21,7 +23,10 @@ import {
   peerOrigin,
   sharedEvidence,
 } from "../dist/adapters/paired-computers.js";
-import { decodeApplicationSnapshot } from "@versionstead/contracts/application";
+import {
+  decodeApplicationSnapshot,
+  decodeComputerSnapshot,
+} from "@versionstead/contracts/application";
 import { runTool, toolExecutable, inspectGit } from "../dist/adapters/development-tools.js";
 
 const sha = "a".repeat(40);
@@ -354,7 +359,7 @@ test(
       !Buffer.from(await readFile(join(dataDir, "monitoring.sqlite"))).includes(Buffer.from(token)),
       "Plaintext credentials must not be in SQLite",
     );
-    app.changePreferences({ automaticRepositoryScans: false });
+    await app.changePreferences({ automaticRepositoryScans: false });
     await app.selectRepository("github", "2", undefined, "watch");
     assert.equal(core.snapshot().projects[1].evidence.status, "not-scanned");
     const evidence = core.snapshot().projects[0];
@@ -464,8 +469,10 @@ test(
     const paired = await client.pairComputer(invitation.invitation);
     assert.equal(paired.computers.length, 1);
     const remote = paired.computers[0];
-    assert.equal(remote.snapshot.device.id, hostCore.snapshot().device.id);
-    assert(!JSON.stringify(remote.snapshot).includes(folder));
+    const evidence = () => client.computerSnapshot(remote.id).snapshot;
+    assert(!("snapshot" in remote), "The application read carries no remote snapshot");
+    assert.equal(evidence().device.id, hostCore.snapshot().device.id);
+    assert(!JSON.stringify(evidence()).includes(folder));
     assert.equal(host.snapshot().sharing.clients.length, 1);
     await assert.rejects(client.pairComputer(invitation.invitation), /already connected/);
     const decoded = JSON.parse(Buffer.from(invitation.invitation, "base64url").toString("utf8"));
@@ -481,7 +488,7 @@ test(
         hostCore.snapshot().history.length >= 2 && hostCore.snapshot().scanProgress.active === null,
     );
     await client.refreshComputer(remote.id);
-    const received = client.snapshot().computers[0].snapshot;
+    const received = evidence();
     assert(received.projects[0].dependencies.length);
     await client.close();
     await host.close();
@@ -490,10 +497,10 @@ test(
     assert.match(client.snapshot().computers[0].error, /not been checked/);
     await client.refreshComputer(remote.id);
     assert.equal(client.snapshot().computers[0].error, null);
-    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    assert.deepEqual(evidence(), received);
     await host.changeSharing(false);
     await client.refreshComputer(remote.id);
-    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    assert.deepEqual(evidence(), received);
     assert.match(client.snapshot().computers[0].error, /retained/);
     await host.changeSharing(true, "127.0.0.1", port);
     await client.refreshComputer(remote.id);
@@ -502,7 +509,7 @@ test(
     host.revokeClient(old.id);
     await client.refreshComputer(remote.id);
     assert.match(client.snapshot().computers[0].error, /revoked/);
-    assert.deepEqual(client.snapshot().computers[0].snapshot, received);
+    assert.deepEqual(evidence(), received);
     await client.removeComputer(remote.id);
     assert.equal(client.snapshot().computers.length, 0);
     assert(
@@ -592,6 +599,33 @@ test(
     assert.equal(shared.projects[0].dependencies[0].origin, "git");
   },
 );
+
+test("shared evidence leaves out the feature marker, so a PC on the previous build still decodes it", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  t.after(async () => {
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  // The receiving side of the previous build (marker v7) accepted only the markers it knew.
+  const previousBuild = Schema.decodeUnknownSync(
+    Schema.Struct({
+      ...MonitoringSnapshot.fields,
+      features: Schema.optional(
+        Schema.Literals(
+          [1, 2, 3, 4, 5, 6, 7].map((version) => `settings-repositories-connections-v${version}`),
+        ),
+      ),
+    }),
+  );
+  const local = core.snapshot();
+  assert.equal(local.features, "settings-repositories-connections-v8");
+  assert.throws(() => previousBuild(local), "The marker alone would make that PC refuse it");
+  const shared = sharedEvidence(local);
+  assert(!("features" in shared), "No receiving PC reads a remote's marker");
+  // Evidence crosses the network as JSON.
+  assert.doesNotThrow(() => previousBuild(JSON.parse(JSON.stringify(shared))));
+});
 
 function seedApplication(core, { computers = [], automaticAppUpdateChecks = false } = {}) {
   core.readApplication(); // Creates the table the first write needs.
@@ -704,6 +738,234 @@ test("a failing app update check never rejects the poll", async (t) => {
   t.mock.timers.tick(30000);
   await app.polling;
   assert.equal(checks, 1);
+});
+
+// A paired PC whose evidence comes from a second coordinator through an injected peer, so a refresh
+// needs neither HTTPS nor protected credentials and runs on every platform.
+async function pairedApplication(t) {
+  const remote = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  remote.changeSettings({ paused: true });
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const computer = { ...pairedComputer("remote"), deviceId: remote.device.id };
+  seedApplication(core, { computers: [computer] });
+  const peer = { offline: false };
+  const opened = [];
+  t.after(async () => {
+    for (const app of opened) await app.close();
+    await core.close();
+    await remote.close();
+    await cleanupTemporary(t);
+  });
+  const open = async () => {
+    const app = await ApplicationService.create(
+      core,
+      undefined,
+      async (_origin, _fingerprint, path, options = {}) => {
+        assert.equal(path, "/evidence");
+        if (peer.offline) throw new Error("offline");
+        return { nonce: options.nonce, snapshot: sharedEvidence(remote.snapshot()) };
+      },
+    );
+    // Pairing stores this token protected; the injected peer only needs the service to find one.
+    app.plainSecrets.set(`computer:${computer.id}`, "fixture-token");
+    opened.push(app);
+    return app;
+  };
+  return { core, remote, computer, peer, open, app: await open() };
+}
+
+test("a refresh that brings the evidence already held is not saved, and a changed one is", async (t) => {
+  const { app, core, remote, computer } = await pairedApplication(t);
+  const writes = t.mock.method(core, "writeApplication");
+  const saved = () => core.readApplication().computers[0];
+
+  await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 1, "The first evidence is a durable change");
+  const first = app.snapshot().computers[0];
+  assert.match(first.snapshotDigest, /^[a-f0-9]{64}$/);
+  assert(!("snapshot" in first), "The record the interface polls does not copy the evidence");
+  assert.equal(saved().snapshot.device.id, remote.device.id);
+  assert.equal(saved().checkedAt, first.checkedAt);
+
+  await delay(20);
+  await app.refreshComputer(computer.id);
+  await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 1, "Identical evidence leaves the saved state alone");
+  const unchanged = app.snapshot().computers[0];
+  assert.equal(unchanged.snapshotDigest, first.snapshotDigest);
+  assert(unchanged.checkedAt > first.checkedAt, "The time of the check still advances in memory");
+  assert.equal(saved().checkedAt, first.checkedAt, "It is saved only along with a durable change");
+
+  remote.changeSettings({ pcIntervalMinutes: 17 });
+  await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 2, "Changed evidence is saved");
+  assert.equal(saved().snapshot.settings.pcIntervalMinutes, 17);
+  const changed = app.snapshot().computers[0];
+  assert.notEqual(changed.snapshotDigest, first.snapshotDigest);
+  assert.equal(saved().checkedAt, changed.checkedAt, "A save carries the latest check time");
+  assert.equal(app.computerSnapshot(computer.id).snapshot.settings.pcIntervalMinutes, 17);
+});
+
+test("a failure that repeats is saved once, and so is the recovery that follows it", async (t) => {
+  const { app, core, computer, peer } = await pairedApplication(t);
+  await app.refreshComputer(computer.id);
+  const received = app.computerSnapshot(computer.id);
+  const writes = t.mock.method(core, "writeApplication");
+  peer.offline = true;
+  for (let attempt = 0; attempt < 3; attempt++) await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 1, "Only the first failure changes what is saved");
+  assert.match(core.readApplication().computers[0].error, /unreachable.*retained/);
+  const failed = app.computerSnapshot(computer.id);
+  assert.deepEqual(failed.snapshot, received.snapshot, "Evidence is retained through the outage");
+  assert.equal(failed.checkedAt, received.checkedAt, "so is the time it was received");
+  assert.deepEqual(
+    core.readApplication().computers[0].snapshot,
+    JSON.parse(JSON.stringify(received.snapshot)),
+    "and the saved copy is untouched by the failure",
+  );
+  peer.offline = false;
+  await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 2, "Recovery clears the saved error");
+  assert.equal(core.readApplication().computers[0].error, null);
+  await app.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 2);
+});
+
+test("pausing a paired PC is saved and survives a restart", async (t) => {
+  const { app, core, computer, open } = await pairedApplication(t);
+  await app.changeComputer(computer.id, false);
+  assert.equal(core.readApplication().computers[0].enabled, false);
+  await app.close();
+  const reopened = await open();
+  assert.equal(reopened.snapshot().computers[0].enabled, false);
+  await reopened.changeComputer(computer.id, true);
+  assert.equal(core.readApplication().computers[0].enabled, true);
+});
+
+test("the evidence digest is the same after a restart, so only the cleared error is saved", async (t) => {
+  const { app, core, computer, open } = await pairedApplication(t);
+  await app.refreshComputer(computer.id);
+  const before = app.snapshot().computers[0].snapshotDigest;
+  await app.close();
+  const reopened = await open();
+  assert.equal(reopened.snapshot().computers[0].snapshotDigest, before);
+  assert.match(reopened.snapshot().computers[0].error, /not been checked/);
+  const writes = t.mock.method(core, "writeApplication");
+  await reopened.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 1, "The error that restart set is cleared and saved");
+  assert.equal(core.readApplication().computers[0].error, null);
+  await reopened.refreshComputer(computer.id);
+  assert.equal(writes.mock.callCount(), 1, "Evidence unchanged by the restart is not rewritten");
+});
+
+test("the polled application read carries no remote snapshot; the snapshot route returns one PC's evidence", async (t) => {
+  const { app, core, remote, computer, peer } = await pairedApplication(t);
+  const token = randomBytes(32).toString("base64url");
+  const server = await startServer({
+    port: 0,
+    monitoring: core,
+    authToken: token,
+    application: app,
+  });
+  t.after(() => server.close());
+  const call = (path, init = {}, authorization = `Bearer ${token}`) =>
+    fetch(server.origin + path, {
+      ...init,
+      headers: { "Content-Type": "application/json", Authorization: authorization },
+    });
+  const route = `/api/application/computers/${computer.id}/snapshot`;
+
+  const empty = await call(route);
+  assert.equal(empty.status, 200);
+  const none = decodeComputerSnapshot(await empty.json());
+  assert.deepEqual(
+    [none.snapshotDigest, none.checkedAt, none.snapshot],
+    [null, null, null],
+    "A PC that has sent nothing has no evidence, digest, or check time",
+  );
+  assert.match(none.error, /not been checked/);
+
+  await app.refreshComputer(computer.id);
+  const polled = await (await call("/api/application")).text();
+  assert(!polled.includes('"snapshot"'), "The polled read must not carry the remote snapshot");
+  const listed = decodeApplicationSnapshot(JSON.parse(polled)).computers[0];
+  assert.match(listed.snapshotDigest, /^[a-f0-9]{64}$/);
+  const evidence = decodeComputerSnapshot(await (await call(route)).json());
+  assert.equal(evidence.snapshot.device.id, remote.device.id);
+  assert.equal(evidence.snapshotDigest, listed.snapshotDigest);
+  assert.equal(evidence.checkedAt, listed.checkedAt);
+  assert.equal(evidence.error, null);
+
+  peer.offline = true;
+  await app.refreshComputer(computer.id);
+  const retained = decodeComputerSnapshot(await (await call(route)).json());
+  assert.match(retained.error, /unreachable/);
+  assert.equal(retained.snapshotDigest, evidence.snapshotDigest);
+  assert.equal(retained.checkedAt, evidence.checkedAt, "Retained evidence keeps its age");
+  assert.deepEqual(retained.snapshot, evidence.snapshot);
+
+  assert.equal((await call(route, {}, "")).status, 401);
+  assert.equal((await call(route, {}, `Bearer ${"x".repeat(43)}`)).status, 401);
+  assert.equal((await call("/api/application/computers/not-an-id/snapshot")).status, 400);
+  assert.equal((await call(`/api/application/computers/${randomUUID()}/snapshot`)).status, 404);
+  assert.equal((await call(route, { method: "POST", body: "{}" })).status, 404);
+});
+
+test("tool discovery runs at startup and when asked, never because the interface polls", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  // Startup probed the tools already, so the first read needs no discovery of its own.
+  if (await toolExecutable("git"))
+    assert.equal((await app.readSnapshot()).tools.git.available, true);
+  const discover = t.mock.method(app, "discover");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  for (let poll = 0; poll < 5; poll++) {
+    await app.readSnapshot();
+    t.mock.timers.tick(61_000);
+  }
+  assert.equal(discover.mock.callCount(), 0, "Polling must not probe the tools again");
+  await app.discover();
+  assert.equal(discover.mock.callCount(), 1, "An explicit refresh still does");
+});
+
+test("a tool discovery that finishes after a later one never replaces its result", async (t) => {
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const answers = [];
+  const tools = () => new Promise((resolve) => answers.push(resolve));
+  const app = await ApplicationService.create(core, undefined, undefined, tools);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  const found = (version) => {
+    const tool = { available: true, version };
+    return { git: tool, github: tool, gitlab: tool, tailscale: tool, ssh: tool };
+  };
+  // answers[0] is the startup probe.
+  const first = app.discover();
+  const second = app.discover();
+  answers[2](found("second"));
+  assert.equal((await second).tools.git.version, "second");
+  answers[1](found("first"));
+  assert.equal((await first).tools.git.version, "second", "The older discovery finished last");
+  answers[0](found("startup"));
+  assert.equal((await app.readSnapshot()).tools.git.version, "second");
+  // An older discovery that finishes first still applies until the later one arrives.
+  const third = app.discover();
+  const fourth = app.discover();
+  answers[3](found("third"));
+  assert.equal((await third).tools.git.version, "third");
+  answers[4](found("fourth"));
+  assert.equal((await fourth).tools.git.version, "fourth");
 });
 
 test("Git context never executes clean/process filters or inherited project overrides", async (t) => {
@@ -822,7 +1084,7 @@ test("a failed Git inspection keeps the recorded Git context; turning Git contex
   await rename(join(folder, ".git"), join(folder, ".git-away"));
   assert.deepEqual(await scanGit(), recorded);
   assert.ok(coverage().includes(retained), "Retained Git context must not read as current");
-  app.changePreferences({ gitEnabled: false });
+  await app.changePreferences({ gitEnabled: false });
   assert.equal(await scanGit(), undefined);
   assert.equal(coverage().includes(retained), false);
 });
@@ -838,8 +1100,34 @@ test("Git discovery follows the Git context preference: located but not run whil
     await cleanupTemporary(t);
   });
   assert.match((await app.discover()).tools.git.version, /^git version/);
-  app.changePreferences({ gitEnabled: false });
+  await app.changePreferences({ gitEnabled: false });
   assert.deepEqual((await app.discover()).tools.git, { available: true, version: null });
-  app.changePreferences({ gitEnabled: true });
+  await app.changePreferences({ gitEnabled: true });
   assert.match((await app.discover()).tools.git.version, /^git version/);
+});
+
+test("changing the Git context preference refreshes the Git status, and no other preference does", async (t) => {
+  if (!(await toolExecutable("git"))) return t.skip("Git is unavailable on this host.");
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const app = await ApplicationService.create(core);
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  assert.match((await app.readSnapshot()).tools.git.version, /^git version/);
+  // The version shown depends on whether Git may run, and polling no longer rediscovers it.
+  const off = await app.changePreferences({ gitEnabled: false });
+  assert.deepEqual(off.tools.git, { available: true, version: null });
+  const on = await app.changePreferences({ gitEnabled: true });
+  assert.match(on.tools.git.version, /^git version/);
+  const discover = t.mock.method(app, "discover");
+  await app.changePreferences({ automaticRepositoryScans: false });
+  await app.changePreferences({ gitEnabled: true });
+  assert.equal(
+    discover.mock.callCount(),
+    0,
+    "Only a change of the Git preference probes the tools",
+  );
 });

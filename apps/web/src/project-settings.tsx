@@ -904,7 +904,7 @@ function ProjectDetail({ members }: { members: Member[] }) {
 
 export function ProjectSettings() {
   const { snapshot } = useMonitoring();
-  const { snapshot: app } = useApplication();
+  const { snapshot: app, computerEvidence } = useApplication();
   const search = useSearch({ from: "/settings/project" });
   const navigate = useNavigate();
   if (!snapshot || !app) return null;
@@ -923,7 +923,7 @@ export function ProjectSettings() {
       project,
     })),
     ...app.computers.flatMap((c) =>
-      (c.snapshot?.projects ?? []).map((project) => ({
+      (computerEvidence.get(c.id)?.snapshot.projects ?? []).map((project) => ({
         environment: c.id,
         label: c.label,
         project,

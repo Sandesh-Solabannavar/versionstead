@@ -404,6 +404,14 @@ function incompleteEvidence(evidence: ScanEvidence): boolean {
   return evidence.status !== "complete" && evidence.status !== "scanning";
 }
 
+/**
+ * Whether a target's findings were kept from earlier scans rather than confirmed by its last one:
+ * a failed or unsupported scan keeps them, so they read "previous, unverified".
+ */
+export function findingsRetained(status: ScanEvidence["status"]): boolean {
+  return status === "failed" || status === "unsupported";
+}
+
 export function projectNeedsAttention(
   project: Project,
   findings: readonly Finding[],

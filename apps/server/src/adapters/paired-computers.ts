@@ -84,8 +84,11 @@ $rsa.Dispose()`;
 }
 
 export function sharedEvidence(snapshot: MonitoringSnapshot): MonitoringSnapshot {
+  // No receiving PC reads the feature marker, and a PC on an older build refuses a marker it does
+  // not know, so the marker is never shared.
+  const { features: _marker, ...evidence } = snapshot;
   return decodeMonitoringSnapshot({
-    ...snapshot,
+    ...evidence,
     inventory: {
       ...snapshot.inventory,
       managers: (snapshot.inventory.managers ?? []).map((m) => ({ ...m, root: null })),

@@ -167,22 +167,23 @@ test(
     const state = await client.app.pairComputer(link);
     const computer = state.computers[0];
     assert.equal(computer.enabled, true);
-    assert.equal(computer.snapshot.device.id, host.core.snapshot().device.id);
+    const evidence = client.app.computerSnapshot(computer.id).snapshot;
+    assert.equal(evidence.device.id, host.core.snapshot().device.id);
     await client.app.changeComputer(computer.id, false);
     assert.equal(client.core.readApplication().computers[0].enabled, false);
-    assert.deepEqual(client.app.snapshot().computers[0].snapshot, computer.snapshot);
+    assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
     await assert.rejects(client.app.scanComputer(computer.id), /Enable this environment/);
     await assert.rejects(client.app.refreshComputer(computer.id), /Enable this environment/);
     await host.app.changeSharing(false);
     await client.app.changeComputer(computer.id, true);
     assert.match(client.app.snapshot().computers[0].error, /retained/);
-    assert.deepEqual(client.app.snapshot().computers[0].snapshot, computer.snapshot);
+    assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
     await client.app.changeComputer(computer.id, false);
     await client.app.close();
     const reopened = await ApplicationService.create(client.core);
     t.after(() => reopened.close());
     assert.equal(reopened.snapshot().computers[0].enabled, false);
-    assert.deepEqual(reopened.snapshot().computers[0].snapshot, computer.snapshot);
+    assert.deepEqual(reopened.computerSnapshot(computer.id).snapshot, evidence);
   },
 );
 

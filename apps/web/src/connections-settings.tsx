@@ -358,7 +358,7 @@ function SavedEnvironment({
     ? "Disabled"
     : computer.error
       ? "Disconnected"
-      : computer.snapshot
+      : computer.snapshotDigest
         ? "Connected"
         : "Connecting…";
   const [removing, setRemoving] = useState(false);

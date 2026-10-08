@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { get } from "node:http";
@@ -13,6 +14,7 @@ import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { InputError } from "../dist/adapters/projects.js";
 import {
   acquireCoordinatorLock,
+  DATABASE_FILE,
   protectSecret,
   readRuntime,
   removeRuntime,
@@ -370,7 +372,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     const tag = initial.headers.get("etag");
     assert.match(tag, /^"[^"]+"$/, "The revision is one quoted entity tag");
     const body = await initial.json();
-    assert.equal(body.features, "settings-repositories-connections-v7");
+    assert.equal(body.features, "settings-repositories-connections-v8");
     assert.deepEqual(body, first.coordinator.snapshot(), "Cached and live parts form the snapshot");
     for (const [method, headers, status] of [
       ["GET", { "If-None-Match": tag }, 304],
@@ -386,6 +388,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     }
     const idle = await progress();
     assert.equal(`"${idle.revision}"`, tag, "Progress names the snapshot revision it belongs to");
+    assert.deepEqual(idle.settings, body.settings, "Progress carries the settings");
     assert.deepEqual(idle.scanProgress, { active: null, queued: [] });
     assert.equal(idle.notificationSummary, null);
     assert.equal(idle.notificationNextAt, null);
@@ -401,6 +404,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     const patch = { method: "PATCH", body: { projectIntervalMinutes: 30 } };
     assert.equal((await call("/api/settings", patch)).status, 200);
     assert.equal((await changed()).settings.projectIntervalMinutes, 30);
+    assert.equal((await progress()).settings.projectIntervalMinutes, 30);
     const add = { method: "POST", body: { path: projectDir, mode: "maintained" } };
     const project = await (await call("/api/projects", add)).json();
     assert.equal((await changed()).projects[0].id, project.id);
@@ -478,6 +482,44 @@ test("runtime descriptor protects the token and an OS database lock prevents dup
     reacquired();
     assert.ok(dataDir.startsWith(join(tmpdir(), "versionstead-runtime-")));
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a coordinator that cannot open its monitoring database says why, without local paths", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-runtime-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const start = () =>
+    spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL("../dist/bin.js", import.meta.url)),
+        "--data-dir",
+        dataDir,
+        "--port",
+        "0",
+      ],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+  for (const [setup, message] of [
+    ["PRAGMA user_version=9", "The monitoring database needs a newer Versionstead version."],
+    [
+      `PRAGMA user_version=1;
+       CREATE TABLE monitoring_state (id INTEGER PRIMARY KEY, snapshot TEXT, due TEXT, notified TEXT);
+       INSERT INTO monitoring_state VALUES (1, '{}', '{}', '[]');`,
+      "The monitoring database contains an invalid monitoring snapshot.",
+    ],
+  ]) {
+    const database = new DatabaseSync(join(dataDir, DATABASE_FILE));
+    database.exec(setup);
+    database.close();
+    const started = start();
+    assert.equal(started.status, 1, started.stderr);
+    assert.match(started.stderr, new RegExp(`^${message.replaceAll(".", "\\.")}$`, "m"));
+    assert(
+      !started.stderr.includes("could not start"),
+      "The specific reason replaces the generic one",
+    );
+    assert(!started.stderr.includes(dataDir), "The data directory's path stays out of the output");
   }
 });
 

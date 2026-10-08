@@ -10,15 +10,30 @@ import {
 } from "react";
 import {
   decodeApplicationSnapshot,
+  decodeComputerSnapshot,
   type ApplicationSnapshot,
   type SshTarget,
 } from "@versionstead/contracts/application";
+import type { MonitoringSnapshot } from "@versionstead/contracts/monitoring";
+import { staleEvidence } from "./computer-evidence";
 import { decodeBody, request, send, useMonitoring, usePageVisible } from "./monitoring";
 import type { ActionOptions } from "./monitoring-actions";
 import { toast } from "./components/ui/toast";
 
+/** What each paired PC last sent, with the digest it was read under. */
+type ComputerEvidence = ReadonlyMap<string, { digest: string; snapshot: MonitoringSnapshot }>;
+
 const Context = createContext<{
   snapshot: ApplicationSnapshot | null;
+  /**
+   * Looked up by the id of a connected PC. A PC missing here has sent nothing, or its evidence is
+   * still being read or could not be read; an entry of a PC since removed is never looked up.
+   */
+  computerEvidence: ComputerEvidence;
+  /** The digest of each PC's evidence that could not be read; see latestEvidence(). */
+  unreadableEvidence: ReadonlyMap<string, string>;
+  /** Reads a PC's evidence again after its read failed. */
+  retryEvidence: (id: string) => void;
   error: string | null;
   refresh: () => Promise<void>;
   discovering: boolean;
@@ -42,6 +57,13 @@ export function ApplicationProvider({ children }: { children: ReactNode }) {
   const discovery = useRef<Promise<void> | null>(null);
   // The last polled body; other snapshot updates clear it so the next poll applies.
   const polled = useRef<string | null>(null);
+  const [computerEvidence, setComputerEvidence] = useState<ComputerEvidence>(new Map());
+  const [unreadableEvidence, setUnreadableEvidence] = useState<ReadonlyMap<string, string>>(
+    new Map(),
+  );
+  // The digest last asked for each PC. A digest is asked for once (a failed or empty answer marks it
+  // unreadable instead), and only the newest request of a PC may store what it receives.
+  const reading = useRef(new Map<string, string>());
   const discover = useCallback(() => {
     if (discovery.current) return discovery.current;
     setDiscovering(true);
@@ -102,6 +124,46 @@ export function ApplicationProvider({ children }: { children: ReactNode }) {
       window.clearInterval(timer);
     };
   }, [connection, refresh, visible]);
+  // The polled read carries each PC's evidence digest, not the evidence. The evidence is read when its
+  // digest is new: on load, after the PC's own refresh, and when the coordinator's 30-second refresh
+  // found changes. A read that fails is shown with a Retry and is not repeated by itself.
+  // ponytail: a failed read runs again only on Retry or when newer evidence arrives, even once a
+  // lost coordinator connection returns; retry on a bounded timer if transient failures linger.
+  useEffect(() => {
+    if (!snapshot || connection !== "connected") return;
+    for (const { id, snapshotDigest } of staleEvidence(
+      snapshot.computers,
+      computerEvidence,
+      unreadableEvidence,
+    )) {
+      if (reading.current.get(id) === snapshotDigest) continue;
+      reading.current.set(id, snapshotDigest);
+      const failed = () => {
+        if (reading.current.get(id) !== snapshotDigest) return;
+        reading.current.delete(id);
+        setUnreadableEvidence((unreadable) => new Map(unreadable).set(id, snapshotDigest));
+      };
+      void request(
+        `/api/application/computers/${encodeURIComponent(id)}/snapshot`,
+        decodeComputerSnapshot,
+        { signal: AbortSignal.timeout(30000) },
+      )
+        .then(({ snapshotDigest: digest, snapshot: evidence }) => {
+          if (reading.current.get(id) !== snapshotDigest) return;
+          if (digest && evidence)
+            setComputerEvidence((held) => new Map(held).set(id, { digest, snapshot: evidence }));
+          else failed();
+        })
+        .catch(failed);
+    }
+  }, [snapshot, computerEvidence, unreadableEvidence, connection]);
+  const retryEvidence = useCallback((id: string) => {
+    setUnreadableEvidence((unreadable) => {
+      const next = new Map(unreadable);
+      next.delete(id);
+      return next;
+    });
+  }, []);
   const change = useCallback(
     async (
       path: string,
@@ -144,8 +206,30 @@ export function ApplicationProvider({ children }: { children: ReactNode }) {
     toast.add({ id: "action-feedback", title: "Remote environment connected.", type: "success" });
   }, []);
   const value = useMemo(
-    () => ({ snapshot, error, refresh, change, discover, discovering, connectComputer }),
-    [snapshot, error, refresh, change, discover, discovering, connectComputer],
+    () => ({
+      snapshot,
+      computerEvidence,
+      unreadableEvidence,
+      retryEvidence,
+      error,
+      refresh,
+      change,
+      discover,
+      discovering,
+      connectComputer,
+    }),
+    [
+      snapshot,
+      computerEvidence,
+      unreadableEvidence,
+      retryEvidence,
+      error,
+      refresh,
+      change,
+      discover,
+      discovering,
+      connectComputer,
+    ],
   );
   return <Context value={value}>{children}</Context>;
 }
