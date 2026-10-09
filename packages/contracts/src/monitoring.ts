@@ -207,6 +207,7 @@ export const MonitoringSnapshot = Schema.Struct({
       "settings-repositories-connections-v6",
       "settings-repositories-connections-v7",
       "settings-repositories-connections-v8",
+      "settings-repositories-connections-v9",
     ]),
   ),
   runtime: Schema.Struct({

@@ -189,6 +189,7 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
       "settings-repositories-connections-v5",
       "settings-repositories-connections-v6",
       "settings-repositories-connections-v7",
+      "settings-repositories-connections-v8",
     ]) {
       fixture = await legacy("interactive", "session", true, true, features);
       assert.equal((await desktop.readyCoordinator()).snapshot.features, features);
@@ -198,7 +199,7 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
         fixture.runtime.pid,
         "Previous settings builds must load the current connections flow",
       );
-      assert.equal(refreshedBuild.snapshot.features, "settings-repositories-connections-v8");
+      assert.equal(refreshedBuild.snapshot.features, "settings-repositories-connections-v9");
       assert.deepEqual(refreshedBuild.snapshot.projects, before.projects);
       assert.deepEqual(refreshedBuild.snapshot.settings, before.settings);
       assert.equal(fixture.shutdowns(), 1);

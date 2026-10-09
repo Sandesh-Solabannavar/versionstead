@@ -42,7 +42,7 @@ type Mutable<T> = T extends readonly (infer U)[]
     ? { -readonly [K in keyof T]: Mutable<T[K]> }
     : T;
 const timestamp = () => new Date().toISOString();
-const features = "settings-repositories-connections-v8" as const;
+const features = "settings-repositories-connections-v9" as const;
 const evidenceNotSaved = "Evidence could not be saved; the previous saved evidence is retained.";
 const emptyEvidence = (): Mutable<ScanEvidence> => ({
   status: "not-scanned",

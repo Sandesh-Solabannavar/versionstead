@@ -376,7 +376,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     const tag = initial.headers.get("etag");
     assert.match(tag, /^"[^"]+"$/, "The revision is one quoted entity tag");
     const body = await initial.json();
-    assert.equal(body.features, "settings-repositories-connections-v8");
+    assert.equal(body.features, "settings-repositories-connections-v9");
     assert.deepEqual(body, first.coordinator.snapshot(), "Cached and live parts form the snapshot");
     for (const [method, headers, status] of [
       ["GET", { "If-None-Match": tag }, 304],

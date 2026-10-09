@@ -272,7 +272,7 @@ async function connectCoordinator(restart: boolean) {
     const session = existing.runtime.host === "session" && existing.runtime.mode === "interactive";
     const current =
       existing.snapshot.scanProgress &&
-      existing.snapshot.features === "settings-repositories-connections-v8" &&
+      existing.snapshot.features === "settings-repositories-connections-v9" &&
       existing.snapshot.inventory.collector === "npm-bun-global-v1";
     if (!restart && (current || !session)) return existing;
     if (!session) throw new Error("Restart this coordinator through its Windows background host.");

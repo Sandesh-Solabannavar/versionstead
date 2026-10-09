@@ -170,7 +170,7 @@ function ConnectionNotice() {
     snapshot &&
     (!snapshot.scanProgress ||
       snapshot.inventory.collector !== "npm-bun-global-v1" ||
-      snapshot.features !== "settings-repositories-connections-v8") &&
+      snapshot.features !== "settings-repositories-connections-v9") &&
     snapshot.runtime.startedAt !== dismissedBuild
   )
     // Nothing is held back by this banner (the PC scan controls say so themselves), so it can be

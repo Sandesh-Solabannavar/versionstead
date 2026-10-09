@@ -682,7 +682,7 @@ test("shared evidence leaves out the feature marker, so a PC on the previous bui
     }),
   );
   const local = core.snapshot();
-  assert.equal(local.features, "settings-repositories-connections-v8");
+  assert.equal(local.features, "settings-repositories-connections-v9");
   assert.throws(() => previousBuild(local), "The marker alone would make that PC refuse it");
   const shared = sharedEvidence(local);
   assert(!("features" in shared), "No receiving PC reads a remote's marker");
