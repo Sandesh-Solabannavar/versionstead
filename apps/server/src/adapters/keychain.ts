@@ -14,7 +14,9 @@ const SECURITY = "/usr/bin/security";
 const MAX_SECURITY_LINE = 4000;
 // A locked keyring can wait on an unlock prompt; the probe gives up sooner than a real read or write.
 const PROBE_TIMEOUT = 5_000;
-const REFERENCE = /^keychain:v1:([A-Za-z0-9-]{1,64}\.[A-Za-z0-9_-]{22})$/;
+// A handle reaches the tools as an argument, so its namespace never starts with "-".
+const NAMESPACE = /^[A-Za-z0-9][A-Za-z0-9-]{0,63}$/;
+const REFERENCE = /^keychain:v1:([A-Za-z0-9][A-Za-z0-9-]{0,63}\.[A-Za-z0-9_-]{22})$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const macMissing =
   "The macOS keychain tool (/usr/bin/security) is unavailable on this monitoring host.";
@@ -138,6 +140,7 @@ async function deleteHandle(handle: string, options: CredentialOptions) {
         ])
       : await run(file, ["clear", "service", KEYCHAIN_SERVICE, "account", handle]);
   if (result.code !== 0 && !notFound(options, result)) throw new InputError(lockedMessage(options));
+  return result.code === 0;
 }
 
 async function storeHandle(handle: string, value: string, options: CredentialOptions) {
@@ -191,8 +194,9 @@ export async function storeInKeychain(
   namespace: string,
   options: CredentialOptions = {},
 ) {
-  if (!/^[A-Za-z0-9-]{1,64}$/.test(namespace))
-    throw new InputError("Invalid credential namespace.");
+  if (!NAMESPACE.test(namespace)) throw new InputError("Invalid credential namespace.");
+  // An empty value would leave a bare `-w` that makes `security` prompt for a password.
+  if (!value) throw new InputError("An empty credential cannot be stored.");
   const handle = `${namespace}.${randomBytes(16).toString("base64url")}`;
   await storeHandle(handle, value, options);
   return `keychain:v1:${handle}`;
@@ -207,9 +211,12 @@ export async function readFromKeychain(reference: string, options: CredentialOpt
   return value;
 }
 
-/** Deletes the item; an item that is already gone counts as deleted. */
+/**
+ * Deletes the item: true when one was deleted, false when there was none to delete. On Linux a
+ * locked keyring also answers false, so a caller that must know checks the store again.
+ */
 export async function deleteFromKeychain(reference: string, options: CredentialOptions = {}) {
-  await deleteHandle(handleOf(reference), options);
+  return deleteHandle(handleOf(reference), options);
 }
 
 /** Null when a probe item round-trips; otherwise what is missing and how to get it. */

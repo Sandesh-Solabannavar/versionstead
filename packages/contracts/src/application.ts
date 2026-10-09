@@ -100,6 +100,8 @@ export const ApplicationSnapshot = Schema.Struct({
   }),
   networkAddresses: Schema.Array(Schema.String),
   credentialStorageAvailable: Schema.Boolean,
+  // What is missing when credentials cannot be stored ("Install libsecret-tools…"); absent from older coordinators.
+  credentialStorageIssue: Schema.optional(NullableString),
   sharing: Sharing,
   computers: Schema.Array(ConnectedComputer),
   update: AppUpdate,

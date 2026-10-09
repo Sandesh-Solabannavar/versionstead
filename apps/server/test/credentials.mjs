@@ -35,34 +35,41 @@ export async function testCredentials(t) {
   return { credentials: available ? {} : { tool: null }, available };
 }
 
-/** An in-memory stand-in for secret-tool; a locked keyring fails every call until unlock(). */
+/**
+ * An in-memory stand-in for secret-tool. As with the real tool, a locked keyring refuses a store with
+ * a message but answers lookup and clear with a silent exit 1, exactly as for a missing item.
+ */
 export function fakeKeyring({ locked = false } = {}) {
   const items = new Map();
   const calls = [];
   let unlocked = !locked;
   const run = async (file, args, input = "") => {
     calls.push({ file, args, input });
-    if (!unlocked)
-      return {
-        code: 1,
-        stdout: "",
-        stderr: "secret-tool: Cannot create an item in a locked collection\n",
-      };
     const account = args[args.indexOf("account") + 1];
     if (args[0] === "store") {
+      if (!unlocked)
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "secret-tool: Cannot create an item in a locked collection\n",
+        };
       items.set(account, input);
       return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "lookup")
-      return items.has(account)
+      return unlocked && items.has(account)
         ? { code: 0, stdout: items.get(account), stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
-    if (args[0] === "clear") return { code: items.delete(account) ? 0 : 1, stdout: "", stderr: "" };
+    if (args[0] === "clear")
+      return { code: unlocked && items.delete(account) ? 0 : 1, stdout: "", stderr: "" };
     return { code: 2, stdout: "", stderr: "usage" };
   };
   return {
     items,
     calls,
+    lock: () => {
+      unlocked = false;
+    },
     unlock: () => {
       unlocked = true;
     },

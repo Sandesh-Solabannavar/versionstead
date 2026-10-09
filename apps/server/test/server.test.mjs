@@ -14,7 +14,10 @@ import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { InputError } from "../dist/adapters/projects.js";
 import {
   acquireCoordinatorLock,
+  CredentialStorageUnavailable,
+  credentialStorageIssue,
   DATABASE_FILE,
+  discardSecret,
   protectSecret,
   readRuntime,
   removeRuntime,
@@ -23,6 +26,7 @@ import {
   writeRuntime,
 } from "../dist/runtime.js";
 import { randomBytes } from "node:crypto";
+import { fakeKeyring } from "./credentials.mjs";
 
 test("live coordinator reports its environment without claiming scanner coverage", async () => {
   const server = await startServer({ port: 0 });
@@ -637,16 +641,53 @@ test("data of an earlier build stays in use until the new folder holds a databas
   );
 });
 
-test("hosts without OS-backed credential storage answer with an input error that says why", async () => {
-  for (const operation of [protectSecret, unprotectSecret])
-    for (const platform of ["linux", "darwin"])
-      await assert.rejects(
-        operation("value", platform),
-        (error) =>
-          error instanceof InputError &&
-          error.message ===
-            "OS-backed connection credentials are currently supported on Windows only.",
-      );
+test("credential storage names what is missing and never reads a reference with the wrong backend", async () => {
+  await assert.rejects(
+    protectSecret("value", { platform: "freebsd" }),
+    (error) => error instanceof InputError && /not supported on this platform/.test(error.message),
+  );
+  assert.match(
+    await credentialStorageIssue({ platform: "freebsd" }),
+    /not supported on this platform/,
+  );
+  assert.equal(await credentialStorageIssue({ platform: "win32" }), null);
+  await assert.rejects(
+    unprotectSecret("AQAAANCMnd8BFdERjHoAwE/Cl+s=", { platform: "linux" }),
+    /protected by Windows on another host/,
+  );
+  await assert.rejects(
+    unprotectSecret(`keychain:v1:device.${"A".repeat(22)}`, { platform: "win32" }),
+    /macOS or Linux keychain/,
+  );
+  await discardSecret("AQAAANCMnd8BFdERjHoAwE/Cl+s=", {
+    platform: "linux",
+    run: () => assert.fail("A DPAPI blob is never sent to a keychain"),
+  });
+  await discardSecret(`keychain:v1:device.${"A".repeat(22)}`, {
+    platform: "win32",
+    run: () => assert.fail("Another host's keychain item cannot be reached from Windows"),
+  });
+});
+
+test("a keychain call that fails or finds nothing checks the store again, so a locked Linux keyring never reads as a missing item", async () => {
+  const keyring = fakeKeyring();
+  const reference = `keychain:v1:device.${"A".repeat(22)}`;
+  const locked = (error) =>
+    error instanceof CredentialStorageUnavailable &&
+    /^Unlock your login keyring/.test(error.message);
+  await assert.rejects(unprotectSecret(reference, keyring.options), /missing from the OS keychain/);
+  await discardSecret(reference, keyring.options); // Already gone counts as deleted.
+  const stored = await protectSecret("value", { ...keyring.options, namespace: "device" });
+  keyring.lock();
+  // secret-tool answers a locked keyring's lookup and clear exactly as it answers a missing item.
+  await assert.rejects(unprotectSecret(stored, keyring.options), locked);
+  await assert.rejects(discardSecret(stored, keyring.options), locked);
+  await assert.rejects(protectSecret("value", { ...keyring.options, namespace: "device" }), locked);
+  assert.equal(keyring.items.size, 1, "Nothing was deleted while the keyring was locked");
+  keyring.unlock();
+  assert.equal(await unprotectSecret(stored, keyring.options), "value");
+  await discardSecret(stored, keyring.options);
+  assert.equal(keyring.items.size, 0);
 });
 
 test("static serving exposes built routes/assets, never arbitrary workspace paths", async () => {

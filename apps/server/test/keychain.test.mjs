@@ -165,13 +165,24 @@ test("the probe says what is missing, removes its item, and nothing runs for a f
   assert.match(await keychainIssue(locked), /Unlock your macOS login keychain/);
   assert.match(await keychainIssue({ platform: "freebsd" }), /not supported on this platform/);
   const calls = keyring.calls.length;
-  for (const reference of ["keychain:v1:../../x", "keychain:v1:device.short", "secret"])
+  for (const reference of [
+    "keychain:v1:../../x",
+    "keychain:v1:device.short",
+    `keychain:v1:-device.${"A".repeat(22)}`,
+    "secret",
+  ])
     await assert.rejects(
       readFromKeychain(reference, keyring.options),
       /Invalid keychain reference/,
     );
+  // A handle reaches the tool as an argument, so it never starts with "-".
+  for (const namespace of ["../bad", "-bad", ""])
+    await assert.rejects(storeInKeychain("x", namespace, keyring.options), /namespace/);
+  await assert.rejects(
+    storeInKeychain("", "device-1", keyring.options),
+    (error) => error instanceof InputError && /empty credential/.test(error.message),
+  );
   assert.equal(keyring.calls.length, calls);
-  await assert.rejects(storeInKeychain("x", "../bad", keyring.options), /namespace/);
 });
 
 test("a probe caps each command at five seconds and stops after a store that failed", async () => {

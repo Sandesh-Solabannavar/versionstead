@@ -26,6 +26,7 @@ import {
   remotePairingFields,
   decodeApplicationSnapshot,
 } from "@versionstead/contracts/application";
+import { keyringSkip, testCredentials } from "./credentials.mjs";
 
 const encode = (data) => Buffer.from(JSON.stringify(data)).toString("base64url");
 const identity = () => ({
@@ -43,11 +44,11 @@ async function freePort() {
   await new Promise((resolve) => server.close(resolve));
   return port;
 }
-async function fixture(t) {
+async function fixture(t, credentials = {}) {
   const path = await mkdtemp(join(tmpdir(), "versionstead-connections-"));
   const core = new MonitoringCoordinator({ dataDir: path, lookup: false });
   core.changeSettings({ paused: true });
-  const app = await ApplicationService.create(core);
+  const app = await ApplicationService.create(core, undefined, undefined, undefined, credentials);
   t.after(async () => {
     await app.close();
     await core.close();
@@ -158,90 +159,92 @@ test("an aborted SSH attempt creates no subprocess or forwarding listener", asyn
   );
 });
 
-test(
-  "real HTTPS pairing links persist enable switches and keep last evidence while disabled",
-  { skip: process.platform !== "win32" },
-  async (t) => {
-    const host = await fixture(t);
-    const client = await fixture(t);
-    await host.app.changeSharing(true, "127.0.0.1", await freePort());
-    const link = parsePairingInvitation(host.app.createInvitation().invitation).url;
-    const state = await client.app.pairComputer(link);
-    const computer = state.computers[0];
-    assert.equal(computer.enabled, true);
-    const evidence = client.app.computerSnapshot(computer.id).snapshot;
-    assert.equal(evidence.device.id, host.core.snapshot().device.id);
-    await client.app.changeComputer(computer.id, false);
-    assert.equal(client.core.readApplication().computers[0].enabled, false);
-    assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
-    await assert.rejects(client.app.scanComputer(computer.id), /Enable this environment/);
-    await assert.rejects(client.app.refreshComputer(computer.id), /Enable this environment/);
-    await host.app.changeSharing(false);
-    await client.app.changeComputer(computer.id, true);
-    assert.match(client.app.snapshot().computers[0].error, /retained/);
-    assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
-    await client.app.changeComputer(computer.id, false);
-    await client.app.close();
-    const reopened = await ApplicationService.create(client.core);
-    t.after(() => reopened.close());
-    assert.equal(reopened.snapshot().computers[0].enabled, false);
-    assert.deepEqual(reopened.computerSnapshot(computer.id).snapshot, evidence);
-  },
-);
+test("real HTTPS pairing links persist enable switches and keep last evidence while disabled", async (t) => {
+  const { credentials, available } = await testCredentials(t);
+  if (!available) return t.skip(keyringSkip);
+  const host = await fixture(t, credentials);
+  const client = await fixture(t, credentials);
+  await host.app.changeSharing(true, "127.0.0.1", await freePort());
+  const link = parsePairingInvitation(host.app.createInvitation().invitation).url;
+  const state = await client.app.pairComputer(link);
+  const computer = state.computers[0];
+  assert.equal(computer.enabled, true);
+  const evidence = client.app.computerSnapshot(computer.id).snapshot;
+  assert.equal(evidence.device.id, host.core.snapshot().device.id);
+  await client.app.changeComputer(computer.id, false);
+  assert.equal(client.core.readApplication().computers[0].enabled, false);
+  assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
+  await assert.rejects(client.app.scanComputer(computer.id), /Enable this environment/);
+  await assert.rejects(client.app.refreshComputer(computer.id), /Enable this environment/);
+  await host.app.changeSharing(false);
+  await client.app.changeComputer(computer.id, true);
+  assert.match(client.app.snapshot().computers[0].error, /retained/);
+  assert.deepEqual(client.app.computerSnapshot(computer.id).snapshot, evidence);
+  await client.app.changeComputer(computer.id, false);
+  await client.app.close();
+  const reopened = await ApplicationService.create(
+    client.core,
+    undefined,
+    undefined,
+    undefined,
+    credentials,
+  );
+  t.after(() => reopened.close());
+  assert.equal(reopened.snapshot().computers[0].enabled, false);
+  assert.deepEqual(reopened.computerSnapshot(computer.id).snapshot, evidence);
+});
 
-test(
-  "forwarded HTTPS preserves peer authority and validates the pin before credentials cross the tunnel",
-  { skip: process.platform !== "win32" },
-  async (t) => {
-    const host = await fixture(t);
-    await host.app.changeSharing(true, "127.0.0.1", await freePort());
-    const invitation = parsePairingInvitation(host.app.createInvitation().invitation).identity;
-    const sockets = new Set();
-    const forward = createServer((socket) => {
-      const upstream = connect({ host: "127.0.0.1", port: host.app.snapshot().sharing.port });
-      for (const stream of [socket, upstream]) {
-        sockets.add(stream);
-        stream.on("close", () => sockets.delete(stream));
-        stream.on("error", () => {
-          socket.destroy();
-          upstream.destroy();
-        });
-      }
-      socket.pipe(upstream).pipe(socket);
-    });
-    await new Promise((resolve) => forward.listen(0, "127.0.0.1", resolve));
-    t.after(async () => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise((resolve) => forward.close(resolve));
-    });
-    const tunnelPort = forward.address().port;
-    await assert.rejects(
-      peerRequest(invitation.origin, "b".repeat(64), "/pair", {
-        tunnelPort,
-        body: { code: invitation.code, label: "Tunnel fixture", deviceId: randomUUID() },
-      }),
-      /verify its certificate/,
-    );
-    assert.equal(host.app.snapshot().sharing.clients.length, 0);
-    const paired = await peerRequest(invitation.origin, invitation.fingerprint, "/pair", {
+test("forwarded HTTPS preserves peer authority and validates the pin before credentials cross the tunnel", async (t) => {
+  const { credentials, available } = await testCredentials(t);
+  if (!available) return t.skip(keyringSkip);
+  const host = await fixture(t, credentials);
+  await host.app.changeSharing(true, "127.0.0.1", await freePort());
+  const invitation = parsePairingInvitation(host.app.createInvitation().invitation).identity;
+  const sockets = new Set();
+  const forward = createServer((socket) => {
+    const upstream = connect({ host: "127.0.0.1", port: host.app.snapshot().sharing.port });
+    for (const stream of [socket, upstream]) {
+      sockets.add(stream);
+      stream.on("close", () => sockets.delete(stream));
+      stream.on("error", () => {
+        socket.destroy();
+        upstream.destroy();
+      });
+    }
+    socket.pipe(upstream).pipe(socket);
+  });
+  await new Promise((resolve) => forward.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => forward.close(resolve));
+  });
+  const tunnelPort = forward.address().port;
+  await assert.rejects(
+    peerRequest(invitation.origin, "b".repeat(64), "/pair", {
       tunnelPort,
       body: { code: invitation.code, label: "Tunnel fixture", deviceId: randomUUID() },
-    });
-    assert.equal(
-      host.app.snapshot().sharing.clients.length,
-      1,
-      "A failed pin must not consume the one-time code",
-    );
-    const nonce = randomBytes(32).toString("base64url");
-    const evidence = await peerRequest(invitation.origin, invitation.fingerprint, "/evidence", {
-      tunnelPort,
-      token: paired.token,
-      nonce,
-    });
-    assert.equal(evidence.nonce, nonce);
-    assert.equal(evidence.snapshot.device.id, host.core.snapshot().device.id);
-  },
-);
+    }),
+    /verify its certificate/,
+  );
+  assert.equal(host.app.snapshot().sharing.clients.length, 0);
+  const paired = await peerRequest(invitation.origin, invitation.fingerprint, "/pair", {
+    tunnelPort,
+    body: { code: invitation.code, label: "Tunnel fixture", deviceId: randomUUID() },
+  });
+  assert.equal(
+    host.app.snapshot().sharing.clients.length,
+    1,
+    "A failed pin must not consume the one-time code",
+  );
+  const nonce = randomBytes(32).toString("base64url");
+  const evidence = await peerRequest(invitation.origin, invitation.fingerprint, "/evidence", {
+    tunnelPort,
+    token: paired.token,
+    nonce,
+  });
+  assert.equal(evidence.nonce, nonce);
+  assert.equal(evidence.snapshot.device.id, host.core.snapshot().device.id);
+});
 
 test("a scan requested again within the peer's cooldown reads as recent, not as an unreachable or revoked PC", async (t) => {
   const certificate = await createPeerCertificate();
@@ -369,7 +372,8 @@ test(
 );
 
 test("environment endpoints require local authentication and validate fields", async (t) => {
-  const { app, core } = await fixture(t);
+  const { credentials } = await testCredentials(t);
+  const { app, core } = await fixture(t, credentials);
   const token = randomBytes(32).toString("base64url");
   const server = await startServer({
     monitoring: core,

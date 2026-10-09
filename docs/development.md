@@ -88,6 +88,16 @@ Read-only Windows boot-script parsing and saved-source checks pass under Windows
 
 GitHub Actions defines workspace checks for Windows, Linux, and macOS; it does not run native desktop smoke checks. LocalService installation/access, boot-before-login, sign-out monitoring, automatic tray startup at login, native macOS/Linux behavior, installers, and signing remain unverified or unimplemented. No release has been published.
 
+## Credential storage tests
+
+Server tests that store connection credentials take their storage from `apps/server/test/credentials.mjs`. Windows uses DPAPI. On macOS, including the `macos-latest` CI job, each test creates a temporary keychain with `/usr/bin/security` and deletes it afterwards; the login keychain is never used. On Linux those tests skip unless `VERSIONSTEAD_KEYRING_TESTS=1` is set; without it the storage check finds no `secret-tool`, so an ordinary run never reaches a developer's keyring. Run them in a disposable Linux container, since they leave items under service `dev.versionstead` in the session's keyring. They need a session bus and an unlocked GNOME Keyring, which `gnome-keyring-daemon --unlock` creates with the password it reads from standard input:
+
+```sh
+apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+pnpm build
+dbus-run-session -- sh -c 'printf versionstead | gnome-keyring-daemon --unlock >/dev/null && VERSIONSTEAD_KEYRING_TESTS=1 pnpm --filter @versionstead/server test'
+```
+
 ## Dependency and tool policy
 
 Reuse the pinned stack before introducing a dependency. Registry clients, package-manager commands, and scanner integrations must follow current official documentation for the pinned version. Capture their external behavior with a small realistic fixture or integration check.

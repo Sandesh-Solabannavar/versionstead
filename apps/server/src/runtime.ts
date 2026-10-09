@@ -6,6 +6,15 @@ import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as Schema from "effect/Schema";
 import { InputError } from "./adapters/projects.ts";
+import {
+  deleteFromKeychain,
+  isKeychainReference,
+  keychainIssue,
+  readFromKeychain,
+  storeInKeychain,
+  unsupportedCredentialStorage,
+  type CredentialOptions,
+} from "./adapters/keychain.ts";
 
 // The only frontend origin a development coordinator accepts besides its own.
 export const DEV_ORIGIN = "http://127.0.0.1:4317";
@@ -110,24 +119,85 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
   });
 }
 
-// An input error, so the interface receives this reason as a 400 rather than a generic 500.
-const secretsUnsupported =
-  "OS-backed connection credentials are currently supported on Windows only.";
+/** A credential store that is missing, locked or unsupported; the message says what to do about it. */
+export class CredentialStorageUnavailable extends InputError {}
 
+const keychainPlatform = (options: CredentialOptions) => {
+  const platform = options.platform ?? process.platform;
+  return platform === "darwin" || platform === "linux";
+};
+
+/**
+ * Asked after a keychain call failed or found nothing. secret-tool answers a locked keyring's lookup
+ * and clear exactly as it answers a missing item, so only a fresh probe tells the two apart.
+ */
+async function unavailable(options: CredentialOptions) {
+  const issue = await keychainIssue(options).catch(() => null);
+  return issue === null ? null : new CredentialStorageUnavailable(issue);
+}
+
+/** A failed keychain call reports a missing or locked store as that, before its own error. */
+async function keychainCall<T>(call: Promise<T>, options: CredentialOptions): Promise<T> {
+  try {
+    return await call;
+  } catch (error) {
+    throw (await unavailable(options)) ?? error;
+  }
+}
+
+/**
+ * Windows protects a secret with machine-scope DPAPI and returns the blob. macOS and Linux keep it in
+ * the OS keychain under a random handle namespaced by the monitoring database and return a
+ * `keychain:v1:` reference. Either result is what SQLite stores.
+ */
 export async function protectSecret(
   value: string,
-  platform: NodeJS.Platform = process.platform,
+  options: CredentialOptions & { namespace?: string } = {},
 ): Promise<string> {
-  if (platform !== "win32") throw new InputError(secretsUnsupported);
-  return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  if (!keychainPlatform(options))
+    throw new CredentialStorageUnavailable(unsupportedCredentialStorage);
+  return keychainCall(
+    storeInKeychain(value, options.namespace ?? "versionstead", options),
+    options,
+  );
 }
 
 export async function unprotectSecret(
-  value: string,
-  platform: NodeJS.Platform = process.platform,
+  reference: string,
+  options: CredentialOptions = {},
 ): Promise<string> {
-  if (platform !== "win32") throw new InputError(secretsUnsupported);
-  return Buffer.from(await dpapi(value, "Unprotect"), "base64").toString("utf8");
+  if (isKeychainReference(reference)) {
+    if (!keychainPlatform(options))
+      throw new InputError(
+        "This credential is in a macOS or Linux keychain. Reconnect it on this host.",
+      );
+    return keychainCall(readFromKeychain(reference, options), options);
+  }
+  if ((options.platform ?? process.platform) !== "win32")
+    throw new InputError(
+      "This credential was protected by Windows on another host. Reconnect it here.",
+    );
+  return Buffer.from(await dpapi(reference, "Unprotect"), "base64").toString("utf8");
+}
+
+/**
+ * Deletes a keychain item; a DPAPI blob lives only in SQLite and leaves with its record, and another
+ * host's keychain is out of reach. A delete that a locked keyring could not run is an error, never a
+ * silent success.
+ */
+export async function discardSecret(reference: string, options: CredentialOptions = {}) {
+  if (!isKeychainReference(reference) || !keychainPlatform(options)) return;
+  if (await keychainCall(deleteFromKeychain(reference, options), options)) return;
+  // Nothing was deleted: the item was gone already, or a locked Linux keyring says the same.
+  const issue = await unavailable(options);
+  if (issue) throw issue;
+}
+
+/** Null when this host can keep protected credentials; otherwise what is missing and how to get it. */
+export async function credentialStorageIssue(options: CredentialOptions = {}) {
+  return (options.platform ?? process.platform) === "win32" ? null : keychainIssue(options);
 }
 
 function validateDescriptor(runtime: RuntimeFile): void {
