@@ -26,8 +26,8 @@ if (parsed.positionals.length !== 1 || !actions.includes(action)) {
   );
   process.exit(2);
 }
-const dataDir = parsed.values["data-dir"];
-if (dataDir !== undefined && !isAbsolute(dataDir)) {
+const explicit = parsed.values["data-dir"];
+if (explicit !== undefined && !isAbsolute(explicit)) {
   console.error("--data-dir must be an absolute path.");
   process.exit(2);
 }
@@ -52,6 +52,20 @@ try {
   );
   process.exit(1);
 }
+// Install pins a data directory: --data-dir, else the one this environment resolves. Every other action
+// works on the installed one, ignoring VERSIONSTEAD_DATA_DIR and the default, and is given a data
+// directory only when --data-dir names one to check against it.
+let dataDir = explicit === undefined ? undefined : resolve(explicit);
+if (action === "install" && dataDir === undefined) {
+  try {
+    dataDir = runtime.resolveDataDir();
+  } catch (error) {
+    console.error(
+      error instanceof Error ? error.message : "The data directory could not be resolved.",
+    );
+    process.exit(1);
+  }
+}
 try {
   await host.runBackgroundHost(action, {
     platform: process.platform,
@@ -60,7 +74,7 @@ try {
     user: userInfo().username,
     node: process.execPath,
     workspace,
-    dataDir: dataDir === undefined ? runtime.resolveDataDir() : resolve(dataDir),
+    dataDir,
     linger: parsed.values.linger === true,
     run: host.runCommand,
     out: (line) => console.log(line),

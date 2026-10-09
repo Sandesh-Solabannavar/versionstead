@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { constants, existsSync } from "node:fs";
-import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { decodeMonitoringProgress } from "@versionstead/contracts/monitoring";
@@ -119,11 +119,21 @@ export const coordinatorAgent = (paths: HostPaths) =>
     keepAliveOnFailure: true,
   });
 
-// systemd expands % specifiers and $ variables in ExecStart and treats quotes and backslashes as syntax.
+/** The data directory a LaunchAgent from coordinatorAgent pins, undoing exactly the entities xml() wrote. */
+export function agentDataDir(plist: string) {
+  const written = /<string>--data-dir<\/string>\s*<string>([^<]*)<\/string>/.exec(plist)?.[1];
+  // &amp; last, so text that merely looks like an entity comes back as it was.
+  return written === undefined
+    ? null
+    : written.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
+}
+
+// systemd expands % specifiers and $ variables in ExecStart, treats quotes and backslashes as syntax, and
+// strips trailing whitespace from assignment values such as WorkingDirectory.
 function unitPath(value: string) {
-  if (!posix.isAbsolute(value) || /["'\\%$]/.test(value) || hasControlCharacter(value))
+  if (!posix.isAbsolute(value) || /["'\\%$]|\s$/.test(value) || hasControlCharacter(value))
     throw new HostError(
-      "systemd paths must be absolute and contain no quotes, backslashes, %, $ or control characters. Move the checkout or choose another data directory with --data-dir.",
+      "systemd paths must be absolute, must not end in a space, and contain no quotes, backslashes, %, $ or control characters. Move the checkout or choose another data directory with --data-dir.",
     );
   return value;
 }
@@ -151,6 +161,10 @@ export function systemdUnit(paths: HostPaths) {
   ].join("\n");
 }
 
+/** The data directory a unit from systemdUnit pins. Paths hold no quotes, so it is the plain quoted word after --data-dir. */
+export const unitDataDir = (unit: string) =>
+  /^ExecStart="[^"]*" "[^"]*" --data-dir "([^"]*)" /m.exec(unit)?.[1] ?? null;
+
 /** The service definition: the LaunchAgents folder, or the user-unit folder of the systemd manager. */
 export function hostFile(platform: NodeJS.Platform, home: string, configHome?: string) {
   if (platform === "darwin")
@@ -160,10 +174,17 @@ export function hostFile(platform: NodeJS.Platform, home: string, configHome?: s
   return posix.join(config, "systemd", "user", SYSTEMD_UNIT);
 }
 
+/**
+ * Who answers on a data directory: the background host, another coordinator (a desktop session that
+ * started first, so the host lost the lock and stayed stopped), or nobody.
+ */
+export type Serving = "host" | "other" | "none";
+
 /** The running coordinator, reached through its authenticated loopback API. */
 export type CoordinatorControl = {
   stop(dataDir: string): Promise<void>;
-  ready(dataDir: string, timeoutMs: number): Promise<boolean>;
+  /** Waits up to `timeoutMs` for a coordinator to answer; another coordinator is reported at once. */
+  ready(dataDir: string, timeoutMs: number): Promise<Serving>;
   captureSources(dataDir: string): Promise<boolean>;
 };
 
@@ -199,14 +220,16 @@ export const coordinatorControl: CoordinatorControl = {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const runtime = await readRuntime(dataDir);
-      if (runtime?.host === "boot-task" && runtime.mode === "background") {
+      if (runtime) {
         try {
-          if ((await authorized(runtime, "/api/status")).ok) return true;
+          // Whichever coordinator answers owns the directory; only a boot-task host in background mode is ours.
+          if ((await authorized(runtime, "/api/status")).ok)
+            return runtime.host === "boot-task" && runtime.mode === "background" ? "host" : "other";
         } catch {
           // Not answering yet.
         }
       }
-      if (Date.now() >= deadline) return false;
+      if (Date.now() >= deadline) return "none";
       await delay(500);
     }
   },
@@ -216,9 +239,10 @@ export const coordinatorControl: CoordinatorControl = {
     const runtime = await readRuntime(dataDir);
     if (!runtime) return false;
     try {
-      // The coordinator rejects new sources while a PC scan runs or is queued; wait it out through the
-      // small progress read instead of the full snapshot.
-      for (let attempt = 0; attempt < 120; attempt++) {
+      // The coordinator rejects new sources while a PC scan runs or is queued. Wait it out, for about a
+      // minute counting the requests, through the small progress read instead of the full snapshot.
+      const deadline = Date.now() + 60_000;
+      for (;;) {
         const { scanProgress } = decodeMonitoringProgress(
           await (await authorized(runtime, "/api/monitoring/progress")).json(),
         );
@@ -227,6 +251,7 @@ export const coordinatorControl: CoordinatorControl = {
           !scanProgress.queued.some((target) => target.kind === "pc")
         )
           break;
+        if (Date.now() >= deadline) return false;
         await delay(500);
       }
       const sources = await discoverGlobalToolSources(AbortSignal.timeout(35_000));
@@ -241,17 +266,24 @@ export const coordinatorControl: CoordinatorControl = {
   },
 };
 
-export type HostContext = HostPaths & {
+export type HostContext = Omit<HostPaths, "dataDir"> & {
   platform: NodeJS.Platform;
   home: string;
   uid: number;
   user: string;
   linger: boolean;
+  /**
+   * What install pins. Every other action takes its data directory from the installed definition, and
+   * is given this only when the owner passed --data-dir, which must then agree with the installed one.
+   */
+  dataDir?: string;
   run: CommandRunner;
   out: (line: string) => void;
   coordinator?: CoordinatorControl;
   /** Fixed tool locations; tests name them, real runs look in /usr/bin and /bin. */
   tools?: { launchctl?: string; systemctl?: string; loginctl?: string };
+  /** How long macOS stop waits for launchd to report the job gone (default 5000); tests shorten it. */
+  settleMs?: number;
 };
 
 async function firstExisting(candidates: readonly string[]) {
@@ -281,20 +313,92 @@ async function requireBuild(context: HostContext) {
   }
 }
 
-async function afterStart(context: HostContext, control: CoordinatorControl, capture: boolean) {
-  if (!(await control.ready(context.dataDir, 45_000)))
+function installPaths(context: HostContext): HostPaths {
+  if (context.dataDir === undefined) throw new HostError("Install needs a data directory.");
+  return { node: context.node, workspace: context.workspace, dataDir: context.dataDir };
+}
+
+/** The installed definition: null when there is none, else the data directory it pins (null if it names none). */
+async function installedHost(file: string, dataDirOf: (definition: string) => string | null) {
+  let definition: string;
+  try {
+    definition = await readFile(file, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw new HostError("The background host definition could not be read. Run install again.");
+  }
+  const dataDir = dataDirOf(definition);
+  return { dataDir: dataDir && posix.isAbsolute(dataDir) ? dataDir : null };
+}
+type Installed = NonNullable<Awaited<ReturnType<typeof installedHost>>>;
+
+/** Every action but install works on the data directory the host was installed with; an explicit --data-dir must agree. */
+function pinnedDataDir(installed: Installed, explicit: string | undefined) {
+  if (!installed.dataDir)
+    throw new HostError(
+      "The installed background host does not name its data directory. Run install again.",
+    );
+  if (explicit !== undefined && posix.resolve(explicit) !== posix.resolve(installed.dataDir))
+    throw new HostError(
+      "The background host is installed for a different data directory. Run install with the data directory you want.",
+    );
+  return installed.dataDir;
+}
+
+/** Install stops the coordinator on the data directory it pins, and on the one it replaces. */
+async function stopForInstall(
+  control: CoordinatorControl,
+  dataDir: string,
+  replaced: Installed | null,
+) {
+  await control.stop(dataDir);
+  if (replaced?.dataDir && replaced.dataDir !== dataDir) await control.stop(replaced.dataDir);
+}
+
+/** Asks the coordinator to stop. A failure is returned, not thrown: the service manager still gets its turn and decides whether it matters. */
+const tryStop = (control: CoordinatorControl, dataDir: string): Promise<Error | null> =>
+  control.stop(dataDir).then(
+    () => null,
+    (error: unknown) =>
+      error instanceof Error
+        ? error
+        : new HostError("The running coordinator could not be stopped."),
+  );
+
+const handBack = "Run restart to hand monitoring to the background host.";
+
+async function afterStart(
+  context: HostContext,
+  control: CoordinatorControl,
+  dataDir: string,
+  capture: boolean,
+) {
+  const serving = await control.ready(dataDir, 45_000);
+  if (serving === "other")
+    throw new HostError(
+      `The desktop's own coordinator serves this data directory, so the background host stayed stopped. ${handBack}`,
+    );
+  if (serving !== "host")
     throw new HostError(
       "The background host did not become ready. Run status, and check that Node.js 24 and the built files are still in place.",
     );
-  if (capture && !(await control.captureSources(context.dataDir)))
+  if (capture && !(await control.captureSources(dataDir)))
     context.out(
       "Owner npm/Bun locations were not saved yet. Open the Versionstead desktop app once, or run install again after the current PC scan.",
     );
 }
 
-async function readiness(context: HostContext, control: CoordinatorControl) {
+async function readiness(context: HostContext, control: CoordinatorControl, dataDir: string) {
+  const serving = await control.ready(dataDir, 0);
   context.out(
-    `Coordinator: ${(await control.ready(context.dataDir, 0)) ? "ready (background host)" : "not running as the background host"}`,
+    `Coordinator: ${
+      serving === "host"
+        ? "ready (background host)"
+        : serving === "other"
+          ? `served by the desktop's own coordinator, so the background host stayed stopped. ${handBack}`
+          : "not running as the background host"
+    }`,
   );
 }
 
@@ -310,51 +414,86 @@ async function launchd(action: HostAction, context: HostContext, control: Coordi
         "launchctl could not load the LaunchAgent. Run this from Terminal in your logged-in Mac desktop session; an SSH session has no gui domain.",
       );
   };
-  if (action !== "install" && action !== "status" && !existsSync(file))
-    throw new HostError("The LaunchAgent is not installed. Run install first.");
+  const state = async () => {
+    const printed = await launchctl("print", service);
+    return printed.code !== 0
+      ? "not loaded"
+      : /\bstate = running\b/.test(printed.stdout)
+        ? "running"
+        : "loaded, not running";
+  };
+  const status = async (isInstalled: boolean, dataDir: string | undefined) => {
+    context.out(`LaunchAgent: ${isInstalled ? "installed" : "not installed"}`);
+    context.out(`launchd: ${await state()}`);
+    if (dataDir) await readiness(context, control, dataDir);
+  };
+  if (action === "install") {
+    const paths = installPaths(context);
+    await requireBuild(context);
+    const contents = coordinatorAgent(paths);
+    await stopForInstall(
+      control,
+      paths.dataDir,
+      await installedHost(file, agentDataDir).catch(() => null),
+    );
+    await mkdir(posix.dirname(file), { recursive: true });
+    await writeFile(file, contents, { mode: 0o644 });
+    await launchctl("bootout", service); // Not loaded yet is fine.
+    await bootstrap();
+    await afterStart(context, control, paths.dataDir, true);
+    context.out(
+      "Versionstead LaunchAgent installed. It starts when you log in and stops when you log out.",
+    );
+    return;
+  }
+  const installed = await installedHost(file, agentDataDir);
+  if (!installed) {
+    if (action === "status") return status(false, context.dataDir);
+    if (action !== "uninstall")
+      throw new HostError("The LaunchAgent is not installed. Run install first.");
+    // Best effort: a job can stay loaded after its file is gone.
+    await launchctl("bootout", service).catch(() => null);
+    context.out("The background host is not installed.");
+    return;
+  }
+  const dataDir = pinnedDataDir(installed, context.dataDir);
   switch (action) {
-    case "install": {
-      await requireBuild(context);
-      const contents = coordinatorAgent(context);
-      await control.stop(context.dataDir);
-      await mkdir(posix.dirname(file), { recursive: true });
-      await writeFile(file, contents, { mode: 0o644 });
-      await launchctl("bootout", service); // Not loaded yet is fine.
-      await bootstrap();
-      await afterStart(context, control, true);
-      context.out(
-        "Versionstead LaunchAgent installed. It starts when you log in and stops when you log out.",
-      );
-      return;
-    }
     case "start":
     case "restart": {
-      if (action === "restart") await control.stop(context.dataDir);
-      if ((await launchctl("print", service)).code === 0) await launchctl("kickstart", service);
-      else await bootstrap();
-      await afterStart(context, control, false);
+      // kickstart -k below replaces a host that is hung and would not stop.
+      if (action === "restart") await tryStop(control, dataDir);
+      if ((await state()) === "not loaded") await bootstrap();
+      else await launchctl("kickstart", ...(action === "restart" ? ["-k"] : []), service);
+      await afterStart(context, control, dataDir, false);
       context.out("The LaunchAgent is running.");
       return;
     }
-    case "stop":
-      await control.stop(context.dataDir);
+    case "stop": {
+      const failure = await tryStop(control, dataDir);
+      // The descriptor going away is not proof the job ended; ask launchd, giving it a moment to reap.
+      const deadline = Date.now() + (context.settleMs ?? 5_000);
+      let current = await state();
+      while (current === "running" && Date.now() < deadline) {
+        await delay(250);
+        current = await state();
+      }
+      if (current === "running")
+        throw new HostError(
+          `${failure instanceof HostError ? `${failure.message} ` : ""}The LaunchAgent is still running. Run restart to replace it, or uninstall to remove it.`,
+        );
       context.out("Stopped. The LaunchAgent stays installed and starts again at your next login.");
       return;
-    case "status": {
-      context.out(`LaunchAgent: ${existsSync(file) ? "installed" : "not installed"}`);
-      const printed = await launchctl("print", service);
-      context.out(
-        `launchd: ${printed.code !== 0 ? "not loaded" : /\bstate = running\b/.test(printed.stdout) ? "running" : "loaded, not running"}`,
-      );
-      await readiness(context, control);
-      return;
     }
-    case "uninstall":
-      await control.stop(context.dataDir);
+    case "status":
+      return status(true, dataDir);
+    case "uninstall": {
+      const failure = await tryStop(control, dataDir);
       await launchctl("bootout", service);
+      if (failure && (await state()) === "running") throw failure;
       await rm(file, { force: true });
       context.out("LaunchAgent removed. Evidence in the data directory is kept.");
       return;
+    }
   }
 }
 
@@ -370,69 +509,91 @@ async function systemd(action: HostAction, context: HostContext, control: Coordi
       "systemd --user is unavailable in this session. Log in to a systemd-based desktop or SSH session (XDG_RUNTIME_DIR must be set), then retry.",
     );
   // The manager, not this shell, decides where user units live.
-  const file = hostFile(
-    "linux",
-    context.home,
-    /^XDG_CONFIG_HOME=(.+)$/m.exec(environment.stdout)?.[1],
-  );
+  const configHome = /^XDG_CONFIG_HOME=(.+)$/m.exec(environment.stdout)?.[1];
+  // ponytail: an XDG_CONFIG_HOME that systemd prints in its $'...' quoting (it holds spaces or shell
+  // characters) is refused; decode that quoting if owners hit this.
+  if (configHome?.startsWith("$'"))
+    throw new HostError(
+      "The systemd user manager's XDG_CONFIG_HOME contains spaces or shell characters, which this script cannot read. Use a configuration folder without them, then retry.",
+    );
+  const file = hostFile("linux", context.home, configHome);
   const required = async (result: Promise<CommandResult>, message: string) => {
     if ((await result).code !== 0) throw new HostError(message);
   };
-  if (action !== "install" && action !== "status" && !existsSync(file))
-    throw new HostError("The systemd user service is not installed. Run install first.");
+  const status = async (isInstalled: boolean, dataDir: string | undefined) => {
+    context.out(`Unit file: ${isInstalled ? "installed" : "not installed"}`);
+    context.out(`Enabled: ${(await user("is-enabled", SYSTEMD_UNIT)).stdout.trim() || "unknown"}`);
+    context.out(`Active: ${(await user("is-active", SYSTEMD_UNIT)).stdout.trim() || "unknown"}`);
+    await linger(context, false);
+    if (dataDir) await readiness(context, control, dataDir);
+  };
+  if (action === "install") {
+    const paths = installPaths(context);
+    await requireBuild(context);
+    const contents = systemdUnit(paths);
+    await stopForInstall(
+      control,
+      paths.dataDir,
+      await installedHost(file, unitDataDir).catch(() => null),
+    );
+    await mkdir(posix.dirname(file), { recursive: true });
+    await writeFile(file, contents, { mode: 0o644 });
+    await required(user("daemon-reload"), "systemd could not reload its user units.");
+    await required(
+      user("enable", "--now", SYSTEMD_UNIT),
+      "systemd could not enable versionstead.service. Run: systemctl --user status versionstead.service",
+    );
+    await afterStart(context, control, paths.dataDir, true);
+    await linger(context, true);
+    context.out("Versionstead systemd user service installed.");
+    return;
+  }
+  const installed = await installedHost(file, unitDataDir);
+  if (!installed) {
+    if (action === "status") return status(false, context.dataDir);
+    if (action !== "uninstall")
+      throw new HostError("The systemd user service is not installed. Run install first.");
+    // Best effort: a unit can stay enabled after its file is gone.
+    await user("disable", "--now", SYSTEMD_UNIT).catch(() => null);
+    context.out("The background host is not installed.");
+    return;
+  }
+  const dataDir = pinnedDataDir(installed, context.dataDir);
   switch (action) {
-    case "install": {
-      await requireBuild(context);
-      const contents = systemdUnit(context);
-      await control.stop(context.dataDir);
-      await mkdir(posix.dirname(file), { recursive: true });
-      await writeFile(file, contents, { mode: 0o644 });
-      await required(user("daemon-reload"), "systemd could not reload its user units.");
-      await required(
-        user("enable", "--now", SYSTEMD_UNIT),
-        "systemd could not enable versionstead.service. Run: systemctl --user status versionstead.service",
-      );
-      await afterStart(context, control, true);
-      await linger(context, true);
-      context.out("Versionstead systemd user service installed.");
-      return;
-    }
     case "start":
     case "restart": {
-      if (action === "restart") await control.stop(context.dataDir);
-      await required(
-        user("start", SYSTEMD_UNIT),
-        "systemd could not start versionstead.service. Run: systemctl --user status versionstead.service",
-      );
-      await afterStart(context, control, false);
+      // systemd restart replaces a host that is hung and would not stop, so a refusal to stop only matters if it fails too.
+      const failure = action === "restart" ? await tryStop(control, dataDir) : null;
+      if ((await user(action, SYSTEMD_UNIT)).code !== 0)
+        throw (
+          failure ??
+          new HostError(
+            `systemd could not ${action} versionstead.service. Run: systemctl --user status versionstead.service`,
+          )
+        );
+      await afterStart(context, control, dataDir, false);
       context.out("The systemd user service is running.");
       return;
     }
-    case "stop":
-      await control.stop(context.dataDir);
-      await user("stop", SYSTEMD_UNIT);
+    case "stop": {
+      const failure = await tryStop(control, dataDir);
+      if ((await user("stop", SYSTEMD_UNIT)).code !== 0 && failure) throw failure;
       context.out(
         "Stopped. The service stays enabled and starts again at your next login, or at boot with lingering.",
       );
       return;
-    case "status": {
-      context.out(`Unit file: ${existsSync(file) ? "installed" : "not installed"}`);
-      context.out(
-        `Enabled: ${(await user("is-enabled", SYSTEMD_UNIT)).stdout.trim() || "unknown"}`,
-      );
-      context.out(`Active: ${(await user("is-active", SYSTEMD_UNIT)).stdout.trim() || "unknown"}`);
-      await linger(context, false);
-      await readiness(context, control);
-      return;
     }
-    case "uninstall":
-      await control.stop(context.dataDir);
-      await user("disable", "--now", SYSTEMD_UNIT);
+    case "status":
+      return status(true, dataDir);
+    case "uninstall": {
+      const failure = await tryStop(control, dataDir);
+      if ((await user("disable", "--now", SYSTEMD_UNIT)).code !== 0 && failure) throw failure;
       await rm(file, { force: true });
       await user("daemon-reload");
       await user("reset-failed", SYSTEMD_UNIT);
       context.out("systemd user service removed. Evidence in the data directory is kept.");
       return;
+    }
   }
 }
 
@@ -465,10 +626,13 @@ async function linger(context: HostContext, install: boolean) {
 
 /** Installs or operates the macOS LaunchAgent or Linux systemd user service that hosts the coordinator. */
 export async function runBackgroundHost(action: HostAction, context: HostContext) {
+  if (context.platform !== "darwin" && context.platform !== "linux")
+    throw new HostError(
+      "This script manages macOS LaunchAgents and Linux systemd user services. On Windows use scripts/windows-background.ps1.",
+    );
+  if (context.uid === 0) throw new HostError("Run this script as your own user, not with sudo.");
   const control = context.coordinator ?? coordinatorControl;
-  if (context.platform === "darwin") return launchd(action, context, control);
-  if (context.platform === "linux") return systemd(action, context, control);
-  throw new HostError(
-    "This script manages macOS LaunchAgents and Linux systemd user services. On Windows use scripts/windows-background.ps1.",
-  );
+  return context.platform === "darwin"
+    ? launchd(action, context, control)
+    : systemd(action, context, control);
 }
