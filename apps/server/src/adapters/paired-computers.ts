@@ -1,14 +1,13 @@
-import { execFile } from "node:child_process";
-import { randomBytes, X509Certificate } from "node:crypto";
 import { createServer, request as httpsRequest, Agent } from "node:https";
 import { connect } from "node:tls";
 import { networkInterfaces } from "node:os";
-import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
 import type { MonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { decodeMonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { normalizePeerOrigin, privatePeerAddress } from "@versionstead/contracts/application";
 import { InputError, object } from "./projects.ts";
+
+export { createPeerCertificate } from "./certificate.ts";
 
 export const privateAddress = privatePeerAddress;
 
@@ -32,55 +31,22 @@ export function peerOrigin(value: string) {
   }
 }
 
-export type PeerCertificate = { pfx: string; password: string; fingerprint: string };
-export async function createPeerCertificate(): Promise<PeerCertificate> {
-  if (process.platform !== "win32")
-    throw new InputError("Creating the paired-PC HTTPS host currently requires Windows.");
-  const password = randomBytes(32).toString("base64url");
-  const script = `$ErrorActionPreference = 'Stop'
-$password = [Console]::In.ReadToEnd()
-$rsa = [Security.Cryptography.RSACng]::new(2048)
-$request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Versionstead paired device', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
-$request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false, $false, 0, $true))
-$certificate = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5), [DateTimeOffset]::UtcNow.AddYears(1))
-$pfx = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $password))
-$der = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-[Console]::Out.Write((@{pfx=$pfx; der=$der} | ConvertTo-Json -Compress))
-$certificate.Dispose()
-$rsa.Dispose()`;
-  const text = await new Promise<string>((resolve, reject) => {
-    const child = execFile(
-      join(
-        process.env.SystemRoot ?? "C:\\Windows",
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-        "powershell.exe",
-      ),
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        Buffer.from(script, "utf16le").toString("base64"),
-      ],
-      { timeout: 10000, maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
-      (error, stdout) =>
-        error
-          ? reject(new InputError("The PC's HTTPS certificate could not be created."))
-          : resolve(stdout),
-    );
-    child.stdin?.end(password);
-  });
-  const data = object(JSON.parse(text));
-  if (typeof data.pfx !== "string" || typeof data.der !== "string")
-    throw new InputError("Invalid HTTPS certificate output.");
-  const certificate = new X509Certificate(Buffer.from(data.der, "base64"));
-  return {
-    pfx: data.pfx,
-    password,
-    fingerprint: certificate.fingerprint256.replaceAll(":", "").toLowerCase(),
-  };
+/** A Node-generated P-256 PEM pair, or the password-protected PFX that earlier Windows builds created. */
+export type PeerCertificate =
+  | { key: string; cert: string; fingerprint: string }
+  | { pfx: string; password: string; fingerprint: string };
+
+/** Validates a stored certificate record before it reaches the TLS listener. */
+export function peerCertificate(value: unknown): PeerCertificate {
+  const data: Record<string, unknown> =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  if (typeof data.fingerprint === "string" && /^[a-f0-9]{64}$/.test(data.fingerprint)) {
+    if (typeof data.key === "string" && typeof data.cert === "string")
+      return { key: data.key, cert: data.cert, fingerprint: data.fingerprint };
+    if (typeof data.pfx === "string" && typeof data.password === "string")
+      return { pfx: data.pfx, password: data.password, fingerprint: data.fingerprint };
+  }
+  throw new InputError("The saved HTTPS certificate of this PC is invalid.");
 }
 
 export function sharedEvidence(snapshot: MonitoringSnapshot): MonitoringSnapshot {
@@ -152,8 +118,12 @@ export async function startPeerServer(options: {
   const lastScan = new Map<string, number>();
   const server = createServer(
     {
-      pfx: Buffer.from(options.certificate.pfx, "base64"),
-      passphrase: options.certificate.password,
+      ...("pfx" in options.certificate
+        ? {
+            pfx: Buffer.from(options.certificate.pfx, "base64"),
+            passphrase: options.certificate.password,
+          }
+        : { key: options.certificate.key, cert: options.certificate.cert }),
       minVersion: "TLSv1.2",
       maxHeaderSize: 8192,
     },

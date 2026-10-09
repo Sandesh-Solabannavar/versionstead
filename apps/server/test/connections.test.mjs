@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { randomBytes, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { randomBytes, randomUUID, X509Certificate } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { ApplicationService } from "../dist/application.js";
 import { startServer } from "../dist/server.js";
 import {
   createPeerCertificate,
+  peerCertificate,
   peerRequest,
   startPeerServer,
 } from "../dist/adapters/paired-computers.js";
@@ -241,12 +243,106 @@ test(
   },
 );
 
+test("a scan requested again within the peer's cooldown reads as recent, not as an unreachable or revoked PC", async (t) => {
+  const certificate = await createPeerCertificate();
+  let scans = 0;
+  const peer = await startPeerServer({
+    address: "127.0.0.1",
+    port: 0,
+    certificate,
+    snapshot: () => {
+      throw new Error("unused");
+    },
+    pair: () => {
+      throw new Error("unused");
+    },
+    authenticate: (token) => (token === "fixture-token" ? "fixture-client" : null),
+    scan: () => {
+      scans++;
+    },
+    revoke: () => {},
+  });
+  t.after(() => peer.close());
+  const scan = () =>
+    peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
+      token: "fixture-token",
+      body: {},
+    });
+  assert.deepEqual(await scan(), { accepted: true });
+  await assert.rejects(scan(), {
+    message: "This PC was asked to scan recently. Try again in a minute.",
+  });
+  assert.equal(scans, 1, "The cooldown must not start a second scan");
+  await assert.rejects(
+    peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
+      token: "revoked-token",
+      body: {},
+    }),
+    /rejected access or is unavailable/,
+  );
+});
+
+test("a stored certificate is a Node PEM pair or an earlier Windows PFX; anything else is refused", () => {
+  const fingerprint = "c".repeat(64);
+  assert.deepEqual(peerCertificate({ key: "k", cert: "c", fingerprint, extra: 1 }), {
+    key: "k",
+    cert: "c",
+    fingerprint,
+  });
+  assert.deepEqual(peerCertificate({ pfx: "p", password: "w", fingerprint }), {
+    pfx: "p",
+    password: "w",
+    fingerprint,
+  });
+  for (const value of [null, [], {}, { key: "k", cert: "c" }, { key: 1, cert: "c", fingerprint }])
+    assert.throws(() => peerCertificate(value), /certificate of this PC is invalid/);
+});
+
+// The PowerShell that earlier Windows builds ran to create a host certificate.
+function legacyWindowsCertificate() {
+  const password = randomBytes(32).toString("base64url");
+  const script = `$ErrorActionPreference = 'Stop'
+$password = [Console]::In.ReadToEnd()
+$rsa = [Security.Cryptography.RSACng]::new(2048)
+$request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Versionstead paired device', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+$request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false, $false, 0, $true))
+$certificate = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5), [DateTimeOffset]::UtcNow.AddYears(1))
+$pfx = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $password))
+$der = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+[Console]::Out.Write((@{pfx=$pfx; der=$der} | ConvertTo-Json -Compress))`;
+  const output = JSON.parse(
+    execFileSync(
+      join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        Buffer.from(script, "utf16le").toString("base64"),
+      ],
+      {
+        input: password,
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 30_000,
+        stdio: ["pipe", "pipe", "ignore"],
+      },
+    ),
+  );
+  const der = Buffer.from(output.der, "base64");
+  return {
+    pfx: output.pfx,
+    password,
+    fingerprint: new X509Certificate(der).fingerprint256.replaceAll(":", "").toLowerCase(),
+  };
+}
+
 test(
-  "a scan requested again within the peer's cooldown reads as recent, not as an unreachable or revoked PC",
+  "an existing Windows host keeps serving its PFX certificate and pin",
   { skip: process.platform !== "win32" },
   async (t) => {
-    const certificate = await createPeerCertificate();
-    let scans = 0;
+    const certificate = legacyWindowsCertificate();
+    assert.deepEqual(peerCertificate(certificate), certificate);
     const peer = await startPeerServer({
       address: "127.0.0.1",
       port: 0,
@@ -258,28 +354,16 @@ test(
         throw new Error("unused");
       },
       authenticate: (token) => (token === "fixture-token" ? "fixture-client" : null),
-      scan: () => {
-        scans++;
-      },
+      scan: () => {},
       revoke: () => {},
     });
     t.after(() => peer.close());
-    const scan = () =>
-      peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
+    assert.deepEqual(
+      await peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
         token: "fixture-token",
         body: {},
-      });
-    assert.deepEqual(await scan(), { accepted: true });
-    await assert.rejects(scan(), {
-      message: "This PC was asked to scan recently. Try again in a minute.",
-    });
-    assert.equal(scans, 1, "The cooldown must not start a second scan");
-    await assert.rejects(
-      peerRequest(`https://127.0.0.1:${peer.port}`, certificate.fingerprint, "/scan", {
-        token: "revoked-token",
-        body: {},
       }),
-      /rejected access or is unavailable/,
+      { accepted: true },
     );
   },
 );

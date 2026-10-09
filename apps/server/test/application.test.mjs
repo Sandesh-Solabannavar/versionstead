@@ -525,7 +525,7 @@ test(
     const certificate = await createPeerCertificate();
     let requests = 0;
     const server = createHttpsServer(
-      { pfx: Buffer.from(certificate.pfx, "base64"), passphrase: certificate.password },
+      { key: certificate.key, cert: certificate.cert },
       (req, res) => {
         requests++;
         res.end("{}");

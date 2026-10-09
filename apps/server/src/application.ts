@@ -29,6 +29,7 @@ import { providerAccount, listRepositories, inspectRepository } from "./adapters
 import {
   createPeerCertificate,
   networkAddresses,
+  peerCertificate,
   peerOrigin,
   peerRequest,
   privateAddress,
@@ -571,9 +572,9 @@ export class ApplicationService {
       );
     let certificate: PeerCertificate;
     if (this.state.secrets.some((s) => s.key === "certificate"))
-      certificate = JSON.parse(await this.secret("certificate")) as PeerCertificate;
+      certificate = peerCertificate(JSON.parse(await this.secret("certificate")));
     else {
-      certificate = await createPeerCertificate();
+      certificate = createPeerCertificate(address);
       await this.storeSecret("certificate", JSON.stringify(certificate));
     }
     this.peerServer = await startPeerServer({
