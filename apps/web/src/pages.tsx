@@ -59,6 +59,7 @@ import {
   pcUpdateState,
   plural,
   attentionGroups,
+  backgroundSetup,
   findingCounts,
   projectNeedsAttention,
   dependencyNeedsAttention,
@@ -2081,6 +2082,7 @@ export function Service() {
   const unavailable = (field: string) => !connected || pending.has(actionKeys.setting(field));
   // The host's platform decides what startup and sign-out can mean; only the desktop has a tray.
   const platform = snapshot.runtime.platform;
+  const setup = backgroundSetup(platform);
   return (
     <>
       <PageHeading
@@ -2138,19 +2140,12 @@ export function Service() {
             ),
           )}
           <p className="settings-note">{lifecycleNote(platform)}</p>
-          {platform === "win32" && (
+          {setup && (
             <details className="startup-help">
-              <summary>Windows startup setup</summary>
-              <p>From the Versionstead project folder, run this in an administrator PowerShell:</p>
-              <CommandBlock
-                className="mt-2.5"
-                command=".\scripts\windows-background.ps1 -Action Install"
-                label="Copy Windows startup setup command"
-              />
-              <p>
-                Use the documented ProjectRoots option to grant read access to selected folders.
-                Verify boot, sign-out, and source coverage after setup.
-              </p>
+              <summary>{setup.summary}</summary>
+              <p>{setup.intro}</p>
+              <CommandBlock className="mt-2.5" command={setup.command} label={setup.label} />
+              <p>{setup.note}</p>
             </details>
           )}
         </section>

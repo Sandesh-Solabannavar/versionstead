@@ -12,8 +12,13 @@ import { acquireCoordinatorLock, readRuntime, writeRuntime } from "@versionstead
 const temporary = await mkdtemp(join(tmpdir(), "versionstead-reliability-"));
 const dataDir = join(temporary, "coordinator");
 process.env.VERSIONSTEAD_DATA_DIR = dataDir;
-const { forwardRequest, recoverCoordinator, shouldRecoverCoordinator } =
-  await import("../dist/coordinator.js");
+const {
+  backgroundRestartMessage,
+  forwardRequest,
+  recoverCoordinator,
+  shouldRecoverCoordinator,
+  stopMonitoringDetail,
+} = await import("../dist/coordinator.js");
 after(() => rm(temporary, { recursive: true, force: true }));
 
 async function listen(server) {
@@ -39,6 +44,20 @@ test("the tray restarts only a dead interactive session coordinator, at most onc
       false,
       "Boot/background hosts are never replaced",
     );
+});
+
+test("background-host advice names the platform's own tool and never Windows elsewhere", () => {
+  assert.match(backgroundRestartMessage("win32"), /Windows background host/);
+  for (const platform of ["darwin", "linux"])
+    assert.equal(
+      backgroundRestartMessage(platform),
+      "Restart this coordinator with node scripts/background-host.mjs restart.",
+    );
+  assert.match(stopMonitoringDetail("boot-task", "win32"), /Windows startup registration/);
+  assert.match(stopMonitoringDetail("boot-task", "darwin"), /LaunchAgent stays installed/);
+  assert.match(stopMonitoringDetail("boot-task", "linux"), /systemd user service stays enabled/);
+  for (const platform of ["win32", "darwin", "linux"])
+    assert.equal(stopMonitoringDetail("session", platform), "Use Start monitoring to resume.");
 });
 
 test("recovery replaces only a crashed session coordinator, never a live or stopping owner", async () => {

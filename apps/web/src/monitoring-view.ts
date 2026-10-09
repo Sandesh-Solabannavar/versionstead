@@ -125,11 +125,13 @@ export type LifecycleRow = {
 
 const signOutUnavailable =
   "Background monitoring after sign-out is not available yet on this platform.";
+const posixSetup = "node scripts/background-host.mjs";
 
 /**
- * The startup and sign-out rows of Background service, for the coordinator host's platform. Only
- * Windows has a boot host; elsewhere monitoring after sign-out is not available yet. The tray
- * belongs to the desktop app, so a browser is not told about it; on macOS it is in the menu bar.
+ * The startup and sign-out rows of Background service, for the coordinator host's platform: the
+ * Windows boot task, the macOS LaunchAgent (login to logout) or the Linux systemd user service (with
+ * lingering, also before login and after logout). The tray belongs to the desktop app, so a browser is
+ * not told about it; on macOS it is in the menu bar.
  */
 export function lifecycleRows(
   platform: string,
@@ -148,6 +150,47 @@ export function lifecycleRows(
         },
       ]
     : [];
+  const boot = host === "boot-task";
+  if (mac)
+    return [
+      {
+        title: "macOS login",
+        text: boot
+          ? "Connected to the LaunchAgent host. It starts when you log in and keeps running when the app quits."
+          : "No LaunchAgent host is connected. This coordinator belongs to the app session.",
+        badge: boot
+          ? { label: "LaunchAgent", tone: "info" }
+          : { label: "Setup required", tone: "warning" },
+      },
+      ...tray,
+      {
+        title: "After logout",
+        text: "macOS stops LaunchAgents when you log out, so monitoring pauses until you log in again.",
+        badge: { label: "Login session only", tone: "neutral" },
+      },
+    ];
+  if (platform === "linux")
+    return [
+      {
+        title: "Linux startup",
+        text: boot
+          ? "Connected to the systemd user service. It starts at login, or at boot when lingering is enabled."
+          : "No systemd user service is connected. This coordinator belongs to the app session.",
+        badge: boot
+          ? { label: "User service", tone: "info" }
+          : { label: "Setup required", tone: "warning" },
+      },
+      ...tray,
+      {
+        title: "After logout",
+        text: boot
+          ? "With lingering enabled the service keeps scanning after logout. Provider and paired-PC credentials stay locked in your keyring until you log in."
+          : "Monitoring ends at logout. Install the systemd user service with lingering to keep scanning.",
+        badge: boot
+          ? { label: "Verify lingering", tone: "info" }
+          : { label: "Not configured", tone: "warning" },
+      },
+    ];
   if (platform !== "win32")
     return [
       ...tray,
@@ -157,7 +200,6 @@ export function lifecycleRows(
         badge: { label: "Not available", tone: "neutral" },
       },
     ];
-  const boot = host === "boot-task";
   return [
     {
       title: "Windows boot",
@@ -193,34 +235,86 @@ export function lifecycleRows(
  */
 export function restartAdvice(host: Runtime["host"], desktop: boolean, platform: string): string {
   if (host === "boot-task")
-    return "Run the Windows background setup command with -Action Restart in administrator PowerShell.";
+    return platform === "win32"
+      ? "Run the Windows background setup command with -Action Restart in administrator PowerShell."
+      : `Run ${posixSetup} restart from the Versionstead project folder.`;
   return desktop
     ? `Quit Versionstead UI from the ${platform === "darwin" ? "menu bar icon" : "tray"} and launch the rebuilt desktop app. It replaces an older session coordinator automatically.`
     : "Restart the coordinator, or launch the rebuilt desktop app, which replaces an older session coordinator automatically.";
 }
 
-/** The closing note of Background service. Startup registration exists only on Windows. */
+/** The closing note of Background service. */
 export function lifecycleNote(platform: string): string {
   const sleeping = "A sleeping or powered-off PC cannot scan.";
-  return platform === "win32"
-    ? `Startup registration requires the Windows setup command in the development documentation. Pausing schedules keeps the coordinator running; it does not remove startup registration. ${sleeping}`
-    : `Pausing schedules keeps the coordinator running. ${sleeping}`;
+  if (platform === "win32")
+    return `Startup registration requires the Windows setup command in the development documentation. Pausing schedules keeps the coordinator running; it does not remove startup registration. ${sleeping}`;
+  if (platform === "darwin" || platform === "linux")
+    return `Startup registration uses ${posixSetup}; Stop monitoring keeps it installed. Pausing schedules keeps the coordinator running. ${sleeping}`;
+  return `Pausing schedules keeps the coordinator running. ${sleeping}`;
 }
 
-/** What Connections says about background monitoring; the sign-out advice is for Windows only. */
+/** What Connections says about background monitoring on the coordinator's platform. */
 export function backgroundSummary({
   host,
   mode,
   platform,
 }: Pick<Runtime, "host" | "mode" | "platform">): string {
   if (host === "boot-task")
-    return "Windows boot host is configured. Verify connectivity and scan history after sign-out.";
+    return platform === "darwin"
+      ? "LaunchAgent host is configured. It runs while you are logged in."
+      : platform === "linux"
+        ? "systemd user service is configured. Verify lingering for monitoring after logout."
+        : "Windows boot host is configured. Verify connectivity and scan history after sign-out.";
   if (mode === "background") return "Background host. The app window can stay closed.";
-  return `Monitoring keeps running when the app window closes. ${
+  const advice =
     platform === "win32"
       ? "Install the Windows boot host for access after sign-out."
-      : signOutUnavailable
-  }`;
+      : platform === "darwin"
+        ? "Install the LaunchAgent host to start monitoring at login."
+        : platform === "linux"
+          ? "Install the systemd user service to monitor outside the app session."
+          : signOutUnavailable;
+  return `Monitoring keeps running when the app window closes. ${advice}`;
+}
+
+/** The copyable startup command on Background service, or null where none exists. */
+export function backgroundSetup(platform: string) {
+  if (platform === "win32")
+    return {
+      summary: "Windows startup setup",
+      intro: "From the Versionstead project folder, run this in an administrator PowerShell:",
+      command: ".\\scripts\\windows-background.ps1 -Action Install",
+      label: "Copy Windows startup setup command",
+      note: "Use the documented ProjectRoots option to grant read access to selected folders. Verify boot, sign-out, and source coverage after setup.",
+    };
+  if (platform === "darwin")
+    return {
+      summary: "macOS LaunchAgent setup",
+      intro:
+        "From the Versionstead project folder, after pnpm build, run this in Terminal with Node.js 24:",
+      command: `${posixSetup} install`,
+      label: "Copy macOS LaunchAgent setup command",
+      note: "The LaunchAgent runs from login to logout. Protected credentials use your login keychain.",
+    };
+  if (platform === "linux")
+    return {
+      summary: "Linux user service setup",
+      intro: "From the Versionstead project folder, after pnpm build, run this with Node.js 24:",
+      command: `${posixSetup} install --linger`,
+      label: "Copy Linux user service setup command",
+      note: "--linger keeps the service running before login and after logout; keyring credentials stay locked until you log in. Leave it out to monitor only while logged in.",
+    };
+  return null;
+}
+
+/** The host line on Settings › General. */
+export function hostLabel(host: Runtime["host"], platform: string) {
+  if (host !== "boot-task") return "Signed-in session";
+  return platform === "darwin"
+    ? "macOS LaunchAgent"
+    : platform === "linux"
+      ? "systemd user service"
+      : "Windows boot task";
 }
 
 /** The singular or plural of a noun for a count, without the count. */

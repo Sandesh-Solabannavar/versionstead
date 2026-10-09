@@ -25,6 +25,7 @@ import {
   readyCoordinator,
   recoverCoordinator,
   restartCoordinator,
+  stopMonitoringDetail,
   webRoot,
   type CoordinatorPoll,
   type CoordinatorRuntime,
@@ -363,10 +364,7 @@ async function stopMonitoring() {
     title: "Stop background monitoring?",
     message:
       "This stops the coordinator. Closing or quitting the interface normally keeps monitoring running.",
-    detail:
-      runtime.host === "boot-task"
-        ? "Windows startup registration stays installed; the task can start again at the next boot."
-        : "Use Start monitoring to resume.",
+    detail: stopMonitoringDetail(runtime.host),
   });
   if (result.response === 1) {
     monitoringStopped = true;

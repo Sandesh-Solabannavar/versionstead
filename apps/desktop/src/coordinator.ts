@@ -76,6 +76,26 @@ export function shouldRecoverCoordinator(
   );
 }
 
+/** How the owner restarts a boot/background host, which the desktop never replaces. */
+export function backgroundRestartMessage(platform: NodeJS.Platform = process.platform) {
+  return platform === "win32"
+    ? "Restart this coordinator through its Windows background host."
+    : "Restart this coordinator with node scripts/background-host.mjs restart.";
+}
+
+/** The Stop monitoring dialog's detail: what happens to startup registration afterwards. */
+export function stopMonitoringDetail(
+  host: CoordinatorRuntime["host"],
+  platform: NodeJS.Platform = process.platform,
+) {
+  if (host !== "boot-task") return "Use Start monitoring to resume.";
+  if (platform === "darwin")
+    return "The LaunchAgent stays installed and starts again at your next login.";
+  if (platform === "linux")
+    return "The systemd user service stays enabled and starts again at your next login, or at boot with lingering.";
+  return "Windows startup registration stays installed; the task can start again at the next boot.";
+}
+
 export async function readyCoordinator() {
   const runtime = await readRuntime(dataDir);
   if (!runtime) return null;
@@ -266,7 +286,7 @@ async function connectCoordinator(restart: boolean) {
   if (!existing) {
     const descriptor = await readRuntime(dataDir);
     if (descriptor && (descriptor.host !== "session" || descriptor.mode !== "interactive"))
-      throw new Error("Restart this coordinator through its Windows background host.");
+      throw new Error(backgroundRestartMessage());
   }
   if (existing) {
     const session = existing.runtime.host === "session" && existing.runtime.mode === "interactive";
@@ -275,7 +295,7 @@ async function connectCoordinator(restart: boolean) {
       existing.snapshot.features === "settings-repositories-connections-v9" &&
       existing.snapshot.inventory.collector === "npm-bun-global-v1";
     if (!restart && (current || !session)) return existing;
-    if (!session) throw new Error("Restart this coordinator through its Windows background host.");
+    if (!session) throw new Error(backgroundRestartMessage());
   }
   const executable = await nodeExecutable();
   const entry = fileURLToPath(new URL("../../server/dist/bin.js", import.meta.url));

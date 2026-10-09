@@ -14,6 +14,7 @@ import {
   advisoryTone,
   attentionSearch,
   attentionGroups,
+  backgroundSetup,
   backgroundSummary,
   compareFindings,
   dependencyFindings,
@@ -26,6 +27,7 @@ import {
   findingsRetained,
   findingUpgradeCommands,
   globalToolSourceState,
+  hostLabel,
   installationCandidate,
   lifecycleNote,
   lifecycleRows,
@@ -974,15 +976,31 @@ test("Background service describes startup and sign-out for the host's own platf
   const session = lifecycleRows("win32", "session", false);
   assert.deepEqual(session[0]?.badge, { label: "Setup required", tone: "warning" });
   assert.deepEqual(session[1]?.badge, { label: "Not configured", tone: "warning" });
-  for (const platform of ["darwin", "linux"])
-    for (const host of lifecycleHosts) {
-      assert.deepEqual(titles(platform, host, true), ["When the window closes", "After sign-out"]);
-      assert.deepEqual(titles(platform, host, false), ["After sign-out"]);
-    }
+  for (const host of lifecycleHosts) {
+    assert.deepEqual(titles("darwin", host, true), [
+      "macOS login",
+      "When the window closes",
+      "After logout",
+    ]);
+    assert.deepEqual(titles("linux", host, false), ["Linux startup", "After logout"]);
+    assert.deepEqual(titles("freebsd", host, false), ["After sign-out"]);
+  }
+  assert.deepEqual(lifecycleRows("darwin", "boot-task", false)[0]?.badge, {
+    label: "LaunchAgent",
+    tone: "info",
+  });
+  assert.deepEqual(lifecycleRows("linux", "boot-task", false)[0]?.badge, {
+    label: "User service",
+    tone: "info",
+  });
+  assert.deepEqual(lifecycleRows("linux", "session", false)[0]?.badge, {
+    label: "Setup required",
+    tone: "warning",
+  });
 });
 
-test("elsewhere there is no boot or Windows wording and sign-out monitoring is not available yet", () => {
-  for (const platform of ["darwin", "linux", "freebsd"])
+test("macOS and Linux name their own background host and never Windows or PowerShell", () => {
+  for (const platform of ["darwin", "linux"])
     for (const host of lifecycleHosts)
       for (const desktop of [true, false]) {
         const text = [
@@ -992,20 +1010,39 @@ test("elsewhere there is no boot or Windows wording and sign-out monitoring is n
             row.badge?.label ?? "",
           ]),
           lifecycleNote(platform),
+          backgroundSummary({
+            host,
+            mode: host === "boot-task" ? "background" : "interactive",
+            platform,
+          }),
+          restartAdvice(host, desktop, platform),
         ].join("\n");
         const where = `${platform} ${host} ${desktop}`;
-        assert.doesNotMatch(text, /Windows|boot|PowerShell/i, where);
-        assert.match(
-          text,
-          /Background monitoring after sign-out is not available yet on this platform\./,
-        );
+        assert.doesNotMatch(text, /Windows|PowerShell/, where);
         assert.match(text, /sleeping or powered-off PC cannot scan/, where);
+        assert.match(lifecycleNote(platform), /node scripts\/background-host\.mjs/, where);
       }
+  assert.match(
+    lifecycleRows("darwin", "boot-task", false).at(-1)?.text ?? "",
+    /stops LaunchAgents when you log out/,
+  );
+  assert.match(
+    lifecycleRows("linux", "boot-task", false).at(-1)?.text ?? "",
+    /lingering.*keyring until you log in/s,
+  );
+  for (const host of lifecycleHosts)
+    assert.match(
+      lifecycleRows("freebsd", host, false)
+        .map((row) => row.text)
+        .join("\n"),
+      /not available yet on this platform/,
+    );
   assert.match(lifecycleNote("win32"), /Windows setup command/);
-  assert.match(lifecycleNote("win32"), /sleeping or powered-off PC cannot scan/);
+  for (const platform of ["win32", "freebsd"])
+    assert.match(lifecycleNote(platform), /sleeping or powered-off PC cannot scan/, platform);
 });
 
-test("the Connections summary gives sign-out advice only where it can be followed", () => {
+test("the Connections summary names each platform's own background host", () => {
   const session = { host: "session", mode: "interactive" } as const;
   assert.match(
     backgroundSummary({ ...session, platform: "win32" }),
@@ -1016,14 +1053,44 @@ test("the Connections summary gives sign-out advice only where it can be followe
     /Windows boot host is configured/,
   );
   assert.match(
+    backgroundSummary({ ...session, platform: "darwin" }),
+    /Install the LaunchAgent host/,
+  );
+  assert.match(
+    backgroundSummary({ host: "boot-task", mode: "background", platform: "darwin" }),
+    /LaunchAgent host is configured/,
+  );
+  assert.match(backgroundSummary({ ...session, platform: "linux" }), /systemd user service/);
+  assert.match(
+    backgroundSummary({ host: "boot-task", mode: "background", platform: "linux" }),
+    /systemd user service is configured.*lingering/,
+  );
+  assert.match(
     backgroundSummary({ host: "session", mode: "background", platform: "darwin" }),
     /Background host/,
   );
-  for (const platform of ["darwin", "linux"]) {
-    const text = backgroundSummary({ ...session, platform });
-    assert.doesNotMatch(text, /Windows|boot/i, platform);
-    assert.match(text, /not available yet on this platform/, platform);
-  }
+  assert.match(
+    backgroundSummary({ ...session, platform: "freebsd" }),
+    /not available yet on this platform/,
+  );
+});
+
+test("the startup setup command and host label follow the coordinator's platform", () => {
+  assert.equal(
+    backgroundSetup("win32")?.command,
+    ".\\scripts\\windows-background.ps1 -Action Install",
+  );
+  assert.equal(backgroundSetup("darwin")?.command, "node scripts/background-host.mjs install");
+  assert.equal(
+    backgroundSetup("linux")?.command,
+    "node scripts/background-host.mjs install --linger",
+  );
+  assert.equal(backgroundSetup("freebsd"), null);
+  assert.equal(hostLabel("boot-task", "win32"), "Windows boot task");
+  assert.equal(hostLabel("boot-task", "darwin"), "macOS LaunchAgent");
+  assert.equal(hostLabel("boot-task", "linux"), "systemd user service");
+  for (const platform of ["win32", "darwin", "linux"])
+    assert.equal(hostLabel("session", platform), "Signed-in session");
 });
 
 test("the tray is mentioned only in the desktop app, on every platform and host, as the menu bar on macOS", () => {
@@ -1071,6 +1138,11 @@ test("the older-build advice names the tray only in the desktop app, and the men
   for (const desktop of [true, false]) {
     assert.match(restartAdvice("boot-task", desktop, "win32"), /-Action Restart/);
     assert.doesNotMatch(restartAdvice("boot-task", desktop, "win32"), /tray/i);
+    for (const platform of ["darwin", "linux"])
+      assert.equal(
+        restartAdvice("boot-task", desktop, platform),
+        "Run node scripts/background-host.mjs restart from the Versionstead project folder.",
+      );
   }
   // A browser still gets a step it can follow.
   assert.match(restartAdvice("session", false, "win32"), /Restart the coordinator/);

@@ -54,7 +54,13 @@ import {
   ScanProgress,
   timestamp,
 } from "./ui";
-import { attentionGroups, installationCandidate, plural, workspaceLabel } from "./monitoring-view";
+import {
+  attentionGroups,
+  hostLabel,
+  installationCandidate,
+  plural,
+  workspaceLabel,
+} from "./monitoring-view";
 import { latestEvidence } from "./computer-evidence";
 import { settingsSections } from "./settings-navigation";
 import { SettingsSearchTargets } from "./components/settings-controls";
@@ -173,7 +179,7 @@ function GeneralSettings() {
         </SettingRow>
       </SettingGroup>
       <p className="muted">
-        Host: {snapshot.runtime.host === "boot-task" ? "Windows boot task" : "Signed-in session"}.{" "}
+        Host: {hostLabel(snapshot.runtime.host, snapshot.runtime.platform)}.{" "}
         <Link to="/service" className="text-link">
           View background setup, scan history, and service health
         </Link>
