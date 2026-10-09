@@ -45,6 +45,36 @@ async function waitRun(runner, id) {
   }
   throw new Error("Command did not finish");
 }
+// Commands print a marker once they are ready; tests poll for it instead of sleeping and hoping.
+async function until(check, what, limit = 5_000) {
+  const end = performance.now() + limit;
+  for (;;) {
+    const found = await check();
+    if (found) return found;
+    if (performance.now() > end) throw new Error(`Timed out waiting for ${what}`);
+    await delay(25);
+  }
+}
+const printed = (runner, id, pattern) => () => runner.read(id).output.match(pattern);
+// A killed process still answers signal 0 until its parent reaps it, and a Node or pnpm that is PID 1
+// in a container never does: the zombie state in /proc counts as gone. macOS has no /proc; launchd reaps.
+const gone = (pid) => async () => {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") return true;
+    throw error;
+  }
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+  return stat.replace(/^.*\) /s, "")[0] === "Z";
+};
+const kill = (pid) => {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+};
 test(
   "manual Windows actions run only saved local commands and retain output/exit codes",
   { skip: process.platform !== "win32" },
@@ -152,6 +182,35 @@ test(
   },
 );
 
+// start() must run the owner's shell as a login shell and strip Node overrides from its environment.
+const bash =
+  process.platform !== "win32" && (await loginShell({ SHELL: "/bin/bash" })) === "/bin/bash";
+test(
+  "POSIX actions start the owner's shell as a login shell without Node overrides",
+  { skip: !bash },
+  async (t) => {
+    const { runner, project, path } = await fixture(t);
+    // The fixture restores SHELL. A scratch HOME keeps the owner's own profile out of the result.
+    const saved = { HOME: process.env.HOME, NODE_OPTIONS: process.env.NODE_OPTIONS };
+    t.after(() => {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    });
+    process.env.SHELL = "/bin/bash";
+    process.env.HOME = path;
+    process.env.NODE_OPTIONS = "--no-warnings";
+    project.actions[0].command =
+      'shopt -q login_shell && echo login-shell; echo "shell=$0"; echo "node-options=${NODE_OPTIONS-unset}"';
+    const done = await waitRun(runner, (await runner.start(project, "test")).id);
+    assert.equal(done.status, "completed");
+    assert.match(done.output, /^login-shell$/m);
+    assert.match(done.output, /^shell=\/bin\/bash$/m);
+    assert.match(done.output, /^node-options=unset$/m);
+  },
+);
+
 test(
   "POSIX action stop, deadline, output bounds, removal and shutdown terminate the process group",
   { skip: process.platform === "win32" },
@@ -187,18 +246,47 @@ test(
 );
 
 test(
+  "POSIX Stop ends a background job too, by SIGTERM and by SIGKILL when the command ignores SIGTERM",
+  { skip: process.platform === "win32", timeout: 20_000 },
+  async (t) => {
+    const { runner, project } = await fixture(t, 30_000, 200);
+    const jobs = [];
+    t.after(() => jobs.forEach((pid) => kill(pid)));
+    for (const command of [
+      "sleep 30 & echo $!; wait",
+      // The job inherits the ignored SIGTERM, so only the SIGKILL after the grace period ends it.
+      "trap '' TERM; sleep 30 & echo $!; wait",
+    ]) {
+      project.actions[0].command = command;
+      const run = await runner.start(project, "test");
+      const [, pid] = await until(printed(runner, run.id, /^(\d+)$/m), `the pid from ${command}`);
+      jobs.push(Number(pid));
+      assert.equal((await runner.stop(run.id)).status, "stopped");
+      // A signal to the shell alone would leave the job running.
+      await until(gone(Number(pid)), `the background job of "${command}" to end`);
+    }
+  },
+);
+
+test(
   "POSIX stop finishes when a command ignores SIGTERM or leaves a detached child holding its output",
   { skip: process.platform === "win32", timeout: 20_000 },
   async (t) => {
     const { runner, project } = await fixture(t, 30_000, 200);
-    project.actions[0].command = "trap '' TERM; sleep 30";
+    let detachedPid;
+    t.after(() => detachedPid && kill(detachedPid));
+    project.actions[0].command = "trap '' TERM; echo ready; sleep 30";
     const ignoring = await runner.start(project, "test");
-    await delay(300);
+    await until(printed(runner, ignoring.id, /^ready$/m), "the command to ignore SIGTERM");
     assert.equal((await runner.stop(ignoring.id)).status, "stopped");
     // A child in its own session keeps the output pipes open after the whole group is gone.
-    project.actions[0].command = `"${process.execPath}" -e "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},15000)'],{detached:true,stdio:['ignore','inherit','inherit']}).unref()"; sleep 30`;
+    project.actions[0].command = `"${process.execPath}" -e "const c=require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},15000)'],{detached:true,stdio:['ignore','inherit','inherit']});console.log('detached='+c.pid);c.unref()"; sleep 30`;
     const detached = await runner.start(project, "test");
-    await delay(500);
+    const [, pid] = await until(
+      printed(runner, detached.id, /^detached=(\d+)$/m),
+      "its child's pid",
+    );
+    detachedPid = Number(pid);
     const stopping = performance.now();
     assert.equal((await runner.stop(detached.id)).status, "stopped");
     assert(

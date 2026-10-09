@@ -19,7 +19,7 @@ type Running = {
 /** The owner's login shell: $SHELL when it is an absolute path listed in /etc/shells, else /bin/sh. */
 export async function loginShell(env: NodeJS.ProcessEnv = process.env, shells = "/etc/shells") {
   const shell = env.SHELL;
-  // csh and tcsh accept -l only as their sole option, so they cannot run `-lc <command>`.
+  // csh and tcsh accept -l only as their sole option, so they cannot run `-l -c <command>`.
   if (shell && isAbsolute(shell) && !/^t?csh$/.test(basename(shell))) {
     try {
       const listed = (await readFile(shells, "utf8")).split("\n").map((line) => line.trim());
@@ -39,8 +39,13 @@ export async function projectActionShell(platform: NodeJS.Platform = process.pla
   return platform === "win32" ? "Windows PowerShell" : loginShell();
 }
 
-/** The inherited environment without Node/Electron overrides; on macOS and Linux PATH also gains the
- * tool directories that a Finder, Dock or desktop-menu launch lacks. */
+/**
+ * The inherited environment without Node/Electron overrides. On macOS and Linux PATH also gains the
+ * tool directories that a Finder, Dock or desktop-menu launch lacks; the login shell starts from that
+ * PATH, and the owner's profile has the last word on it.
+ */
+// ponytail: a login profile that resets PATH (Debian /etc/profile) drops these directories; resolve
+// the owner's shell environment ($SHELL -ilc env) if owners report missing tools.
 export function actionEnvironment(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
@@ -154,7 +159,7 @@ export class ProjectActionRunner {
               },
             )
           : // A process group of its own, so Stop reaches everything the shell starts.
-            spawn(shell, ["-lc", action.command], {
+            spawn(shell, ["-l", "-c", action.command], {
               cwd: path,
               detached: true,
               shell: false,
