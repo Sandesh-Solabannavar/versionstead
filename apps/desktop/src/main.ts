@@ -36,8 +36,9 @@ import {
   decodeActionRequest,
   decodeRunActionRequest,
   decodeActionRun,
+  decodeActionShell,
 } from "@versionstead/contracts/project-settings";
-import { ProjectActionRunner } from "./project-actions.js";
+import { ProjectActionRunner, projectActionShell } from "./project-actions.js";
 import {
   decodeGlobalToolUpdateRequest,
   decodeGlobalToolUpdateRun,
@@ -1418,7 +1419,10 @@ async function runSmoke() {
     await clickButton("Add action");
     await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Add Action'");
     await fillProjectField('dialog[open] input[placeholder="Test"]', "Native action");
-    await fillProjectField("dialog[open] textarea", "Write-Output 'native-action-ok'");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Write-Output 'native-action-ok'" : "printf native-action-ok",
+    );
     // The keybinding field never traps focus, and Tab is not recorded as a shortcut.
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Action keybinding\"]').focus()",
@@ -1465,7 +1469,10 @@ async function runSmoke() {
     await clickButton("Close dialog");
     await waitSettings("!document.querySelector('dialog[open]')");
     await clickButton("Edit Native action");
-    await fillProjectField("dialog[open] textarea", "Start-Sleep -Seconds 30");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30",
+    );
     await clickButton("Save changes");
     await waitSettings(
       "!document.querySelector('dialog[open]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
@@ -2165,6 +2172,10 @@ if (!app.requestSingleInstanceLock()) {
         if (project.actions?.find((a) => a.id === actionId)?.command !== expectedCommand)
           throw new Error("This command changed. Refresh and review it before running.");
         return decodeActionRun(await projectActionRunner.start(project, actionId));
+      });
+      ipcMain.handle("versionstead:project-action-shell", async (event) => {
+        assertActionSender(event);
+        return decodeActionShell(await projectActionShell());
       });
       for (const operation of ["status", "stop"] as const)
         ipcMain.handle(`versionstead:project-action-${operation}`, async (event, id: unknown) => {

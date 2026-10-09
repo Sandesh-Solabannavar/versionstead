@@ -13,26 +13,20 @@ contextBridge.exposeInMainWorld("versionstead", {
     ipcRenderer.invoke("versionstead:window-theme", theme),
   selectProjectDirectory: (): Promise<string | null> =>
     ipcRenderer.invoke("versionstead:select-project-directory"),
-  // Project commands run only through Windows PowerShell; other platforms omit the bridge.
-  ...(process.platform === "win32"
-    ? {
-        runProjectAction: (
-          projectId: string,
-          actionId: string,
-          expectedCommand: string,
-        ): Promise<unknown> =>
-          ipcRenderer.invoke("versionstead:run-project-action", {
-            projectId,
-            actionId,
-            expectedCommand,
-          }),
-        projectActionStatus: (
-          input: string | { projectId: string; actionId: string },
-        ): Promise<unknown> => ipcRenderer.invoke("versionstead:project-action-status", input),
-        stopProjectAction: (id: string): Promise<unknown> =>
-          ipcRenderer.invoke("versionstead:project-action-stop", id),
-      }
-    : {}),
+  // Windows PowerShell or the owner's login shell runs these; a browser has no bridge.
+  runProjectAction: (
+    projectId: string,
+    actionId: string,
+    expectedCommand: string,
+  ): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:run-project-action", { projectId, actionId, expectedCommand }),
+  projectActionStatus: (
+    input: string | { projectId: string; actionId: string },
+  ): Promise<unknown> => ipcRenderer.invoke("versionstead:project-action-status", input),
+  stopProjectAction: (id: string): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:project-action-stop", id),
+  projectActionShell: (): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:project-action-shell"),
   updateGlobalTool: (input: unknown): Promise<unknown> =>
     ipcRenderer.invoke("versionstead:global-tool-update-start", input),
   globalToolUpdateCommand: (input: unknown): Promise<unknown> =>

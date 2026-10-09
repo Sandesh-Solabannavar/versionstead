@@ -24,6 +24,7 @@ import {
   projectIconColors,
   validateProjectChanges,
   decodeActionRun,
+  decodeActionShell,
   type ProjectIcon,
   type ProjectAction,
   type ActionRun,
@@ -39,6 +40,9 @@ import { Choice, SettingGroup, SettingRow } from "./components/settings-controls
 import { ProjectBadge, projectIdentity, iconComponents, readProjectIcon } from "./project-icons";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
 import {
+  commandRunnerNote,
+  commandSyntaxNote,
+  commandsNote,
   groupSettingsProjects,
   actionForChord,
   actionShortcutConflict,
@@ -55,9 +59,8 @@ const actionGlyphs = {
   package: Package,
 };
 
-// Only the Windows desktop runs commands; every other platform and a browser have no bridge.
+// The desktop app runs commands on every platform; a browser has no bridge.
 const canRunCommands = () => Boolean(window.versionstead?.runProjectAction);
-const commandsNote = "Custom commands run in the Windows desktop app.";
 
 export function ProjectCommands({ project }: { project: Project }) {
   const [running, setRunning] = useState<ProjectAction | null>(null);
@@ -138,6 +141,21 @@ export function ProjectActionOutput({
   const [pending, setPending] = useState(canRunCommands());
   const [error, setError] = useState<string | null>(null);
   const bridge = window.versionstead;
+  const [shell, setShell] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void bridge
+      ?.projectActionShell?.()
+      .then((value) => {
+        if (!cancelled) setShell(decodeActionShell(value));
+      })
+      .catch(() => {
+        // The dialog then says "your login shell" without naming it.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridge]);
   useEffect(() => {
     let cancelled = false;
     void bridge
@@ -157,8 +175,7 @@ export function ProjectActionOutput({
   }, [bridge, project.id, action.id]);
   const runId = run?.id;
   const running = run?.status === "running";
-  // PowerShell is the Windows desktop's runner; where its bridge is missing, nothing runs.
-  const runner = canRunCommands() ? " PowerShell runs as your signed-in Windows user." : "";
+  const runner = canRunCommands() ? commandRunnerNote(bridge?.platform, shell) : "";
   useEffect(() => {
     if (!runId || !running || !bridge) return;
     let cancelled = false;
@@ -545,7 +562,7 @@ function ActionEditor({
             disabled={pending}
           />
         </label>
-        <p className="muted small">Windows PowerShell syntax. Saving does not run this command.</p>
+        <p className="muted small">{commandSyntaxNote(window.versionstead?.platform)}</p>
         {error && (
           <p role="alert" className="error-text">
             {error}

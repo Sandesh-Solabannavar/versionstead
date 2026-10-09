@@ -342,7 +342,7 @@ declare global {
       onNotificationSummary: (listener: (summary: unknown) => void) => () => void;
       setWindowTheme: (theme: unknown) => Promise<void>;
       selectProjectDirectory: () => Promise<string | null>;
-      // Project commands run only through Windows PowerShell; the desktop omits these elsewhere.
+      // Windows PowerShell or the owner's login shell runs project commands; a browser has no bridge.
       runProjectAction?: (
         projectId: string,
         actionId: string,
@@ -352,6 +352,7 @@ declare global {
         input: string | { projectId: string; actionId: string },
       ) => Promise<unknown>;
       stopProjectAction?: (id: string) => Promise<unknown>;
+      projectActionShell?: () => Promise<unknown>;
       updateGlobalTool: (input: unknown) => Promise<unknown>;
       globalToolUpdateCommand: (input: unknown) => Promise<unknown>;
       globalToolUpdateStatus: () => Promise<unknown>;

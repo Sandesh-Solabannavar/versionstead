@@ -113,7 +113,7 @@ test("the desktop proxy waits for slow work and only a failed connection detache
   assert.equal(await forwardRequest(fetch, `${stoppedOrigin}/api/status`, {}, idle), null);
 });
 
-test("the project command bridge is exposed only on Windows", async () => {
+test("the project command bridge is exposed on every desktop platform", async () => {
   const source = await readFile(new URL("../dist/preload.cjs", import.meta.url), "utf8");
   const bridge = (platform) => {
     let api;
@@ -127,12 +127,17 @@ test("the project command bridge is exposed only on Windows", async () => {
     });
     return api;
   };
-  const actions = ["runProjectAction", "projectActionStatus", "stopProjectAction"];
-  for (const name of actions) assert.equal(typeof bridge("win32")[name], "function");
-  for (const platform of ["darwin", "linux"]) {
+  const actions = [
+    "runProjectAction",
+    "projectActionStatus",
+    "stopProjectAction",
+    "projectActionShell",
+  ];
+  for (const platform of ["win32", "darwin", "linux"]) {
     const api = bridge(platform);
     assert.equal(api.platform, platform);
     assert.equal(typeof api.selectProjectDirectory, "function");
-    for (const name of actions) assert.equal(name in api, false, `${platform} omits ${name}`);
+    for (const name of actions)
+      assert.equal(typeof api[name], "function", `${platform} exposes ${name}`);
   }
 });
