@@ -9,12 +9,7 @@ import { useAppearance } from "./theme";
 import { ConnectionsSettings } from "./connections-settings";
 import { ProjectSettings } from "./project-settings";
 import { AppearanceSettings } from "./appearance-settings";
-import {
-  SettingRow,
-  SettingGroup,
-  Choice,
-  credentialStorageNote,
-} from "./components/settings-controls";
+import { SettingRow, SettingGroup, Choice } from "./components/settings-controls";
 import { SourceControlRow } from "./components/source-control-row";
 import {
   GitIcon,
@@ -25,7 +20,11 @@ import {
   BitbucketIcon,
   ForgejoIcon,
 } from "./components/source-control-icons";
-import { providerPresentation } from "./source-control-status";
+import {
+  credentialStorageLocation,
+  credentialStorageMessage,
+  providerPresentation,
+} from "./source-control-status";
 import { AddProjectDialog } from "./add-project";
 import { RedactedSensitiveText } from "./components/redacted-sensitive-text";
 import { RefreshIcon } from "./components/ui/refresh-icon";
@@ -299,6 +298,7 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
   const name = kind === "github" ? "GitHub" : "GitLab";
   const key = actionKeys.provider(kind);
   const connecting = pending.has(key);
+  const storageNote = snapshot ? credentialStorageMessage(snapshot) : null;
   return (
     // Closing mid-request would lose the message, so the dialog stays until the request settles.
     <Dialog title={`Connect ${name}`} onClose={onClose} dismissible={!connecting}>
@@ -339,8 +339,8 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
           />
         </label>
         <p className="muted small">
-          Stored with Windows DPAPI on this monitoring host. Tokens never appear in saved browser
-          preferences.
+          {credentialStorageLocation(monitoring?.runtime.platform ?? "")} Tokens never appear in
+          saved browser preferences.
         </p>
         <div className="dialog-actions">
           <Button
@@ -374,7 +374,7 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
             Use signed-in {kind === "github" ? "gh" : "glab"} CLI
           </Button>
         </div>
-        {!snapshot?.credentialStorageAvailable && <p role="alert">{credentialStorageNote}</p>}
+        {storageNote && <p role="alert">{storageNote}</p>}
         {error && (
           <p className="error-text" role="alert">
             {error}
@@ -394,6 +394,7 @@ function SourceControlSettings() {
     disconnecting !== null,
   );
   if (!app || !snapshot) return null;
+  const storageNote = credentialStorageMessage(app);
   const disabled = connection !== "connected";
   // Each control waits only for its own save, so changing one never holds back another.
   const unavailable = (key: string) => disabled || pending.has(key);
@@ -605,7 +606,7 @@ function SourceControlSettings() {
                   ))}
                 </ul>
               )}
-              {!app.credentialStorageAvailable && <p role="status">{credentialStorageNote}</p>}
+              {storageNote && <p role="status">{storageNote}</p>}
               <div className="provider-actions">
                 <Button
                   size="sm"

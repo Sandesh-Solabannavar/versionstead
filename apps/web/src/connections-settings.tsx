@@ -23,12 +23,8 @@ import { useApplication } from "./application";
 import { request, useMonitoring } from "./monitoring";
 import { actionKeys } from "./monitoring-actions";
 import { backgroundSummary } from "./monitoring-view";
-import {
-  SettingGroup,
-  SettingRow,
-  Choice,
-  credentialStorageNote,
-} from "./components/settings-controls";
+import { SettingGroup, SettingRow, Choice } from "./components/settings-controls";
+import { credentialStorageMessage } from "./source-control-status";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
 import { Switch } from "./components/ui/switch";
 import { RefreshIcon } from "./components/ui/refresh-icon";
@@ -517,6 +513,7 @@ export function ConnectionsSettings() {
     return () => window.clearInterval(timer);
   }, [invite]);
   if (!app || !snapshot) return null;
+  const storageNote = credentialStorageMessage(app);
   const connected = connection === "connected";
   // Each control waits only for its own action, so a slow one never holds back the rest.
   const waiting = (key: string) => !connected || pending.has(key);
@@ -578,10 +575,9 @@ export function ConnectionsSettings() {
               : "Check for updates";
   return (
     <div className="connections-settings">
-      {!protectedCredentials && (
+      {storageNote && (
         <p id={credentialNoteId} role="status" className="source-control-note">
-          {credentialStorageNote} Network access, Tailscale setup, and Add environment stay off
-          here.
+          {storageNote} Network access, Tailscale setup, and Add environment stay off here.
         </p>
       )}
       <SettingGroup

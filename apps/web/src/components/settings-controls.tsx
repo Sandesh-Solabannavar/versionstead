@@ -3,9 +3,6 @@ import { useLocation } from "@tanstack/react-router";
 import { settingTargetId } from "../settings-navigation";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
 
-/** Why a connection that needs a protected credential is unavailable; shown with what it disables. */
-export const credentialStorageNote = "Protected connections require Windows.";
-
 const SearchTarget = createContext<string | null>(null);
 export function SettingsSearchTargets({ children }: { children: ReactNode }) {
   const hash = useLocation({ select: (location) => location.hash });
