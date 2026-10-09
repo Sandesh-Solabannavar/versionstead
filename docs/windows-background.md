@@ -1,6 +1,6 @@
 # Windows background monitoring
 
-Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out.
+Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out. For macOS and Linux, see [macOS and Linux background host](background-host.md).
 
 Paired-PC access over Tailscale after sign-out also requires **Preferences → Run unattended** in each Windows PC's Tailscale tray menu. Tailscale normally disconnects after Windows sign-out; see its [unattended-mode guide](https://tailscale.com/docs/how-to/run-unattended). Installing Versionstead's boot host does not change Tailscale configuration or Windows Firewall. Verify both separately using the [connection setup](settings-and-connections.md).
 
