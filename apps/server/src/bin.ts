@@ -98,16 +98,29 @@ if (values.help) {
     process.once("SIGINT", signalStop);
     process.once("SIGTERM", signalStop);
   } catch (error) {
-    // Only these fixed, path-free messages are shown as they are.
-    console.error(
-      error instanceof Error &&
-        /^(A coordinator already|Port must|Invalid |Data directory must|Web root must|The monitoring database )/.test(
-          error.message,
-        )
-        ? error.message
-        : "Versionstead could not start. Check the local data directory and Node 24 runtime.",
-    );
-    await stop();
-    process.exitCode = 1;
+    const conflict = error instanceof Error && error.message.startsWith("A coordinator already");
+    if (conflict && values.host === "boot-task") {
+      // A desktop session that started first (both open at login) serves this data directory; a clean
+      // exit keeps launchd's KeepAlive and systemd's Restart=on-failure from retrying every ten seconds.
+      // ponytail: monitoring stays with that session coordinator until `background-host.mjs restart`;
+      // let the desktop hand over to an installed host if owners hit this often.
+      console.error(
+        "Another Versionstead coordinator already serves this data directory; this background host stays stopped.",
+      );
+      await stop();
+      process.exitCode = 0;
+    } else {
+      // Only these fixed, path-free messages are shown as they are.
+      console.error(
+        error instanceof Error &&
+          /^(A coordinator already|Port must|Invalid |Data directory must|Web root must|The monitoring database )/.test(
+            error.message,
+          )
+          ? error.message
+          : "Versionstead could not start. Check the local data directory and Node 24 runtime.",
+      );
+      await stop();
+      process.exitCode = 1;
+    }
   }
 }

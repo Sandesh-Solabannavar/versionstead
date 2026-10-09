@@ -489,6 +489,32 @@ test("runtime descriptor protects the token and an OS database lock prevents dup
   }
 });
 
+test("a boot-task host that finds its data directory in use exits 0, so launchd and systemd keep it stopped", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-lock-"));
+  const release = acquireCoordinatorLock(dataDir);
+  try {
+    const bin = fileURLToPath(new URL("../dist/bin.js", import.meta.url));
+    const run = (host, mode) =>
+      spawnSync(
+        process.execPath,
+        [bin, "--data-dir", dataDir, "--port", "0", "--mode", mode, "--host", host],
+        { encoding: "utf8", timeout: 30_000 },
+      );
+    const boot = run("boot-task", "background");
+    assert.equal(boot.status, 0);
+    assert.match(
+      boot.stderr,
+      /Another Versionstead coordinator already serves this data directory/,
+    );
+    const session = run("session", "interactive");
+    assert.equal(session.status, 1, "A session host still reports the conflict as a failure");
+    assert.match(session.stderr, /A coordinator already owns this data directory/);
+  } finally {
+    release();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("a coordinator that cannot open its monitoring database says why, without local paths", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "versionstead-runtime-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
