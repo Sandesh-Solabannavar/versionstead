@@ -187,7 +187,7 @@ export async function inspectRepository(
     )
       throw new InputError("A repository file has incomplete or mismatched commit evidence.");
     return bytes.toString("utf8");
-  });
+  }, signal);
   inputs.repositoryCommit = commit;
   inputs.coverage.unshift(
     `${source.provider === "github" ? "GitHub" : "GitLab"} read-only repository files at commit ${commit}`,

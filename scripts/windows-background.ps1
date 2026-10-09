@@ -95,9 +95,9 @@ try {
     if (!snapshot) {
       const database = new DatabaseSync(join(process.argv[4], 'monitoring.sqlite'), { readOnly: true, timeout: 3000 });
       try {
-        const row = database.prepare('SELECT snapshot FROM monitoring_state WHERE id=1').get();
-        if (!row || typeof row.snapshot !== 'string' || Buffer.byteLength(row.snapshot) > 32 * 1024 * 1024) throw new Error('No saved owner sources');
-        snapshot = decodeMonitoringSnapshot(JSON.parse(row.snapshot));
+        const row = database.prepare('SELECT value FROM monitoring_meta WHERE id=1').get();
+        if (!row || typeof row.value !== 'string' || Buffer.byteLength(row.value) > 32 * 1024 * 1024) throw new Error('No saved owner sources');
+        snapshot = decodeMonitoringSnapshot({ ...JSON.parse(row.value).snapshot, projects: [], findings: [] });
       } finally { database.close(); }
     }
     sources = snapshot.inventory.managers;

@@ -100,6 +100,9 @@ export const ActionRun = Schema.Struct({
 });
 export type ActionRun = typeof ActionRun.Type;
 export const decodeActionRun = Schema.decodeUnknownSync(ActionRun);
+/** What runs owner commands, shown in the command dialog: "Windows PowerShell" or a shell path. */
+export const ActionShell = text(4096);
+export const decodeActionShell = Schema.decodeUnknownSync(ActionShell);
 
 export function validActionShortcut(value: string) {
   return /^(?:(?:mod|ctrl|meta|alt|shift)\+)+(?:[a-z0-9,/.-]|f(?:[1-9]|1[0-2]))$/.test(value);

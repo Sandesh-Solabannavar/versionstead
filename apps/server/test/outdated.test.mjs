@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 import {
   checkNativeVersions,
+  outdatedExecutable,
   parseOutdated,
   runOutdatedCommand,
 } from "../dist/adapters/outdated.js";
@@ -84,6 +85,12 @@ test("pnpm checks each workspace and obtains compatible/latest separately, prese
       calls.push({ args, cwd });
       assert.equal(env.NODE_OPTIONS, "");
       assert.equal(env.COREPACK_ENABLE_NETWORK, "0");
+      for (const key of [
+        "MISE_AUTO_INSTALL",
+        "MISE_EXEC_AUTO_INSTALL",
+        "MISE_NOT_FOUND_AUTO_INSTALL",
+      ])
+        assert.equal(env[key], "false", `${key}: a shim must not install during a scan`);
       assert.ok(args.includes("--config.ignore-pnpmfile=true"));
       assert.ok(args.includes("--config.manage-package-manager-versions=false"));
       assert.ok(!args.includes("--recursive"));
@@ -166,6 +173,234 @@ test("npm duplicate workspace rows stay scoped to their actual package locations
   assert.equal(result.checked.get("child").compatible, "2.9.0");
   assert.deepEqual(progress.at(-1), [42, 42]);
 });
+
+test("a native stage that outlasts its time budget stops and leaves later records to the registry fallback", async (t) => {
+  const root = await temporary(t);
+  await mkdir(join(root, "child"));
+  const deps = [dependency("root"), dependency("child", "child")];
+  t.mock.timers.enable({ apis: ["Date"] });
+  const started = [];
+  const progress = [];
+  const result = await checkNativeVersions(
+    root,
+    "npm",
+    deps,
+    undefined,
+    (completed, total) => progress.push([completed, total]),
+    {
+      executable,
+      run: async (_command, _args, cwd) => {
+        started.push(cwd);
+        t.mock.timers.tick(91000); // One slow command outlasts the 90 s minimum budget.
+        const location = join(cwd, "node_modules", "example");
+        const row = { current: "1.0.0", wanted: "1.9.0", latest: "2.0.0", location };
+        return { code: 1, stdout: JSON.stringify({ example: row }), stderr: "" };
+      },
+    },
+  );
+  assert.deepEqual(started, [root], "No batch may start after the deadline");
+  assert.deepEqual([...result.checked.keys()], ["root"]);
+  assert.ok(result.coverage.some((line) => /time budget.*public-registry fallback/.test(line)));
+  assert.deepEqual(progress.at(-1), [2, 2]);
+  // The skipped record is unreported like any other, so the lookup sends it to the registry.
+  const queried = [];
+  const lookedUp = await lookupDependencies(
+    deps,
+    async (url) => {
+      if (url.endsWith("querybatch")) return Response.json({ results: [{}, {}] });
+      queried.push(url);
+      return Response.json({
+        name: "example",
+        versions: { "1.0.0": {}, "1.3.0": {} },
+        "dist-tags": { latest: "1.3.0" },
+      });
+    },
+    undefined,
+    undefined,
+    async () => result,
+  );
+  assert.equal(queried.length, 1);
+  assert.equal(lookedUp.dependencies[0].versionSource, "npm outdated 11.7.0");
+  assert.equal(lookedUp.dependencies[1].versionSource, "npm registry");
+});
+
+// A registry outage: every command runs to its 30 s timeout, which the mocked clock lets the stage observe.
+async function nativeStage(t, manager, importers, perCommand) {
+  const root = await temporary(t);
+  const deps = [];
+  for (let index = 0; index < importers; index++) {
+    await mkdir(join(root, `pkg-${index}`));
+    deps.push(dependency(`dep-${index}`, `pkg-${index}`));
+  }
+  t.mock.timers.enable({ apis: ["Date"] });
+  try {
+    const started = new Set();
+    const result = await checkNativeVersions(root, manager, deps, undefined, undefined, {
+      executable,
+      run: async (_command, _args, cwd) => {
+        started.add(cwd);
+        t.mock.timers.tick(perCommand);
+        return { code: 0, stdout: "{}", stderr: "" };
+      },
+    });
+    return {
+      started: started.size,
+      cutoff: result.coverage.some((line) => /time budget/.test(line)),
+    };
+  } finally {
+    t.mock.timers.reset();
+  }
+}
+
+test("the native stage budget binds under a registry outage: 10 s per npm command plus 30 s", async (t) => {
+  // 20 importers: the budget is 20 x 10 s + 30 s. Commands that all run to their 30 s timeout are cut off
+  // after eight importers; the former 30 s-per-command allowance never fired before the commands finished.
+  assert.deepEqual(await nativeStage(t, "npm", 20, 30000), { started: 8, cutoff: true });
+  assert.deepEqual(await nativeStage(t, "npm", 20, 1000), { started: 20, cutoff: false });
+});
+
+test("the native stage budget allows pnpm twice as long per batch, as it runs two commands", async (t) => {
+  // 20 importers x 2 commands: 20 x 2 x 10 s + 30 s. At 30 s per importer, fifteen start.
+  assert.deepEqual(await nativeStage(t, "pnpm", 20, 15000), { started: 15, cutoff: true });
+  assert.deepEqual(await nativeStage(t, "pnpm", 20, 500), { started: 20, cutoff: false });
+});
+
+test("an exhausted budget stops before the next importer is opened", async (t) => {
+  const root = await temporary(t);
+  // A workspace directory that no longer exists would end the whole stage if it were opened.
+  const deps = [dependency("root"), dependency("gone", "does-not-exist")];
+  t.mock.timers.enable({ apis: ["Date"] });
+  const result = await checkNativeVersions(root, "npm", deps, undefined, undefined, {
+    executable,
+    run: async (_command, _args, cwd) => {
+      t.mock.timers.tick(91000);
+      const row = {
+        current: "1.0.0",
+        wanted: "1.9.0",
+        latest: "2.0.0",
+        location: join(cwd, "node_modules", "example"),
+      };
+      return { code: 1, stdout: JSON.stringify({ example: row }), stderr: "" };
+    },
+  });
+  assert.deepEqual([...result.checked.keys()], ["root"]);
+  assert.ok(result.coverage.some((line) => /time budget.*public-registry fallback/.test(line)));
+  assert.ok(!result.coverage.some((line) => /could not complete/.test(line)));
+});
+
+test("an exhausted budget stops before the next batch of the same importer", async (t) => {
+  const root = await temporary(t);
+  // 41 unique names are two batches of at most 40.
+  const deps = Array.from({ length: 41 }, (_, index) =>
+    dependency(`extra-${index}`, ".", "1.0.0", {
+      name: `extra-${index}`,
+      packageName: `extra-${index}`,
+    }),
+  );
+  t.mock.timers.enable({ apis: ["Date"] });
+  const calls = [];
+  const progress = [];
+  const result = await checkNativeVersions(
+    root,
+    "npm",
+    deps,
+    undefined,
+    (completed, total) => progress.push([completed, total]),
+    {
+      executable,
+      run: async (_command, args) => {
+        calls.push(args);
+        t.mock.timers.tick(91000);
+        const json = Object.fromEntries(
+          deps
+            .filter((dep) => args.includes(dep.name))
+            .map((dep) => [
+              dep.name,
+              {
+                current: "1.0.0",
+                wanted: "1.9.0",
+                latest: "2.0.0",
+                location: join(root, "node_modules", dep.name),
+              },
+            ]),
+        );
+        return { code: 1, stdout: JSON.stringify(json), stderr: "" };
+      },
+    },
+  );
+  assert.equal(calls.length, 1, "No batch may start after the deadline");
+  assert.equal(result.checked.size, 40);
+  assert.equal(result.checked.has("extra-40"), false);
+  assert.ok(result.coverage.some((line) => /time budget.*public-registry fallback/.test(line)));
+  assert.deepEqual(progress.at(-1), [41, 41]);
+});
+
+async function script(path, body) {
+  await mkdir(join(path, ".."), { recursive: true });
+  await writeFile(path, `#!/bin/sh\n${body}\n`);
+  await chmod(path, 0o755);
+}
+
+test(
+  "a version-manager Bun is asked once outside any project, and only its real executable runs in the project",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const base = await temporary(t);
+    const root = await temporary(t); // The selected project.
+    const log = join(base, "invocations.log");
+    const real = join(base, "real", "bun");
+    const reply = JSON.stringify({ version: "1.4.0", execPath: real });
+    // mise, asdf and Volta shims choose the tool from the directory they run in (here: the log shows where),
+    // and may install a missing one. Otherwise they run the real tool, so a shim run in a project still works.
+    await script(
+      join(base, "shims", "bun"),
+      `echo "shim $(pwd -P)" >> "${log}"
+case "$1" in
+  -e) printf '%s' '${reply}' ;;
+  *) exec "${real}" "$@" ;;
+esac`,
+    );
+    await script(
+      real,
+      `echo "real $(pwd -P)" >> "${log}"
+case "$1" in
+  --version) echo 1.4.0 ;;
+  *)
+    echo '| Package | Current | Update | Latest |'
+    echo '| --- | --- | --- | --- |'
+    echo '| example | 1.0.0 | 1.9.0 | 2.0.0 |' ;;
+esac`,
+    );
+    const result = await checkNativeVersions(
+      root,
+      "bun",
+      [dependency("root")],
+      undefined,
+      undefined,
+      {
+        executable: (manager, directory) =>
+          outdatedExecutable(manager, directory, [join(base, "shims")]),
+      },
+    );
+    assert.deepEqual([...result.checked.keys()], ["root"]);
+    assert.equal(result.checked.get("root").source, "bun outdated 1.4.0");
+    const runs = (await readFile(log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => [line.slice(0, line.indexOf(" ")), line.slice(line.indexOf(" ") + 1)]);
+    const inProject = (directory) => directory === root || directory.startsWith(root + sep);
+    assert.ok(runs.some(([who, directory]) => who === "real" && directory === root));
+    assert.deepEqual(
+      runs.filter(([who, directory]) => who === "shim" && inProject(directory)),
+      [],
+      "the shim must never run inside the project",
+    );
+    assert.ok(
+      runs.some(([who]) => who === "shim"),
+      "the shim is still asked once, elsewhere",
+    );
+  },
+);
 
 test("unreported records, absent managers, malformed output, warnings and timeouts retain registry fallback", async (t) => {
   const root = await temporary(t);

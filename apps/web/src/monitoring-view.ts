@@ -9,9 +9,319 @@ import type {
   ScanEvidence,
   ScanProgress,
 } from "@versionstead/contracts/monitoring";
+import { dependencyUpgradeCommand, globalUpgradeCommand } from "./upgrade-commands.ts";
+import { versionAtLeast } from "./versions.ts";
 
 export type InventoryFilter = "updates" | "all" | "current" | "unverified";
 export type AttentionFilter = "all" | "updates" | "advisories" | "coverage";
+
+const minute = 60_000;
+// Always numeric: "auto" would say "yesterday" or "last month", wrong by a calendar unit for spans
+// that are floored to whole units (47 hours ago is not yesterday).
+const relativeFormat = new Intl.RelativeTimeFormat("en", { numeric: "always" });
+const relativeUnits = [
+  ["month", 30 * 24 * 60 * minute],
+  ["day", 24 * 60 * minute],
+  ["hour", 60 * minute],
+  ["minute", minute],
+] as const;
+
+/** "5 minutes ago" or "in 2 hours": whole units rounded down, "just now" under 45 seconds. */
+export function relativeTime(value: string, now: number): string {
+  const time = Date.parse(value);
+  if (Number.isNaN(time)) return "Unknown time";
+  const elapsed = now - time;
+  const age = Math.abs(elapsed);
+  if (age < 45_000) return elapsed < 0 ? "in under a minute" : "just now";
+  const [unit, size] = relativeUnits.find(([, span]) => age >= span) ?? relativeUnits[3];
+  return relativeFormat.format(-Math.sign(elapsed) * Math.max(1, Math.floor(age / size)), unit);
+}
+
+/**
+ * Whether evidence is older than twice its scan interval. A pause does not make it fresher, and
+ * a target that never succeeded has no age to call stale.
+ */
+export function evidenceStale(
+  lastSuccess: string | null,
+  intervalMinutes: number,
+  now: number,
+): boolean {
+  return now - (lastSuccess ? Date.parse(lastSuccess) : Number.NaN) > 2 * intervalMinutes * minute;
+}
+
+const severities = {
+  critical: { rank: 0, label: "Critical advisory", tone: "error" },
+  high: { rank: 1, label: "High advisory", tone: "error" },
+  moderate: { rank: 2, label: "Moderate advisory", tone: "warning" },
+  // Unassessed risk ranks above low, so an unknown severity is never buried under it.
+  unknown: { rank: 3, label: "Unknown severity", tone: "neutral" },
+  low: { rank: 4, label: "Low advisory", tone: "neutral" },
+  info: { rank: 5, label: "Info advisory", tone: "neutral" },
+} as const satisfies Record<
+  Finding["severity"],
+  { rank: number; label: string; tone: "error" | "warning" | "neutral" }
+>;
+
+export function severityPresentation(severity: Finding["severity"]) {
+  const { label, tone } = severities[severity];
+  return { label, tone };
+}
+
+/** Most severe first, then by name. */
+export const compareFindings = (
+  a: Pick<Finding, "severity" | "name">,
+  b: Pick<Finding, "severity" | "name">,
+) => severities[a.severity].rank - severities[b.severity].rank || a.name.localeCompare(b.name);
+
+/** What a finding says in a few words: its severity for an advisory, else its kind. */
+export function findingSummary(finding: Pick<Finding, "kind" | "severity">): string {
+  return finding.kind === "advisory"
+    ? severities[finding.severity].label
+    : finding.kind === "coverage"
+      ? "Incomplete check"
+      : "Update available";
+}
+
+/**
+ * A name for each item that is unique within the list, for a control that repeats on every row:
+ * the base name, numbered ("(2 of 3)") only where it repeats. Keyed by the item's id.
+ */
+export function uniqueRowLabels<T>(
+  items: readonly T[],
+  label: (item: T) => string,
+  id: (item: T) => string,
+): Map<string, string> {
+  const totals = new Map<string, number>();
+  for (const item of items) totals.set(label(item), (totals.get(label(item)) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return new Map(
+    items.map((item) => {
+      const base = label(item);
+      const total = totals.get(base) ?? 1;
+      const position = (seen.get(base) ?? 0) + 1;
+      seen.set(base, position);
+      return [id(item), total > 1 ? `${base} (${position} of ${total})` : base];
+    }),
+  );
+}
+
+/** The tone of a group of advisories: its most severe member decides. */
+export function advisoryTone(findings: readonly Pick<Finding, "severity">[]) {
+  const tones = findings.map((finding) => severities[finding.severity].tone);
+  return tones.includes("error") ? "error" : tones.includes("warning") ? "warning" : "neutral";
+}
+
+export const workspaceLabel = (importer: string) => (importer === "." ? "root" : importer);
+
+const platforms: Record<string, string> = { win32: "Windows", darwin: "macOS", linux: "Linux" };
+export const platformLabel = (platform: string) => platforms[platform] ?? platform;
+
+type Runtime = MonitoringSnapshot["runtime"];
+export type LifecycleRow = {
+  title: string;
+  text: string;
+  badge: { label: string; tone: "info" | "warning" | "neutral" } | null;
+};
+
+const signOutUnavailable =
+  "Background monitoring after sign-out is not available yet on this platform.";
+const posixSetup = "node scripts/background-host.mjs";
+
+/**
+ * The startup and sign-out rows of Background service, for the coordinator host's platform: the
+ * Windows boot task, the macOS LaunchAgent (login to logout) or the Linux systemd user service (with
+ * lingering, also before login and after logout). The tray belongs to the desktop app, so a browser is
+ * not told about it; on macOS it is in the menu bar.
+ */
+export function lifecycleRows(
+  platform: string,
+  host: Runtime["host"],
+  desktop: boolean,
+): LifecycleRow[] {
+  const mac = platform === "darwin";
+  const tray: LifecycleRow[] = desktop
+    ? [
+        {
+          title: "When the window closes",
+          text: mac
+            ? "Electron remains in the menu bar. Reopen the app or pause schedules from its menu bar icon."
+            : "Electron remains in the system tray. Reopen the app or pause schedules from its tray menu.",
+          badge: { label: mac ? "Menu bar" : "Tray", tone: "neutral" },
+        },
+      ]
+    : [];
+  const boot = host === "boot-task";
+  if (mac)
+    return [
+      {
+        title: "macOS login",
+        text: boot
+          ? "Connected to the LaunchAgent host. It starts when you log in and keeps running when the app quits."
+          : "No LaunchAgent host is connected. This coordinator belongs to the app session.",
+        badge: boot
+          ? { label: "LaunchAgent", tone: "info" }
+          : { label: "Setup required", tone: "warning" },
+      },
+      ...tray,
+      {
+        title: "After logout",
+        text: "macOS stops LaunchAgents when you log out, so monitoring pauses until you log in again.",
+        badge: { label: "Login session only", tone: "neutral" },
+      },
+    ];
+  if (platform === "linux")
+    return [
+      {
+        title: "Linux startup",
+        text: boot
+          ? "Connected to the systemd user service. It starts at login, or at boot when lingering is enabled."
+          : "No systemd user service is connected. This coordinator belongs to the app session.",
+        badge: boot
+          ? { label: "User service", tone: "info" }
+          : { label: "Setup required", tone: "warning" },
+      },
+      ...tray,
+      {
+        title: "After logout",
+        text: boot
+          ? "With lingering enabled the service keeps scanning after logout. Provider and paired-PC credentials stay locked in your keyring until you log in."
+          : "Monitoring ends at logout. Install the systemd user service with lingering to keep scanning.",
+        badge: boot
+          ? { label: "Verify lingering", tone: "info" }
+          : { label: "Not configured", tone: "warning" },
+      },
+    ];
+  if (platform !== "win32")
+    return [
+      ...tray,
+      {
+        title: "After sign-out",
+        text: signOutUnavailable,
+        badge: { label: "Not available", tone: "neutral" },
+      },
+    ];
+  return [
+    {
+      title: "Windows boot",
+      text: boot
+        ? "Connected to the Windows boot-task host. Verify reboot and sign-out behavior before relying on unattended coverage."
+        : "Startup registration has not been confirmed. This coordinator currently belongs to the signed-in session.",
+      badge: boot
+        ? { label: "Boot host", tone: "info" }
+        : { label: "Setup required", tone: "warning" },
+    },
+    ...tray,
+    {
+      title: "After Windows sign-out",
+      text: boot
+        ? "The independent boot host is designed to continue collecting accessible sources after sign-out. Folder access and session-dependent sources still need verification."
+        : `${desktop ? "A tray process cannot survive sign-out." : "Monitoring ends at sign-out."} Configure the Windows background host to enable monitoring outside your signed-in session.`,
+      badge: boot
+        ? { label: "Verify access", tone: "info" }
+        : { label: "Not configured", tone: "warning" },
+    },
+    {
+      title: "Account and folder coverage",
+      text: "The desktop saves the owner's npm and Bun global locations for the boot host. Inaccessible folders and unverified package origins produce explicit coverage errors.",
+      badge: null,
+    },
+  ];
+}
+
+/**
+ * How to restart monitoring when the UI is newer than its coordinator. A boot host has its own
+ * script; the tray belongs to the desktop app, so a browser is not sent to it. The desktop runs on
+ * the coordinator's own platform, whose macOS menu bar holds the tray icon.
+ */
+export function restartAdvice(host: Runtime["host"], desktop: boolean, platform: string): string {
+  if (host === "boot-task")
+    return platform === "win32"
+      ? "Run the Windows background setup command with -Action Restart in administrator PowerShell."
+      : `Run ${posixSetup} restart from the Versionstead project folder.`;
+  return desktop
+    ? `Quit Versionstead UI from the ${platform === "darwin" ? "menu bar icon" : "tray"} and launch the rebuilt desktop app. It replaces an older session coordinator automatically.`
+    : "Restart the coordinator, or launch the rebuilt desktop app, which replaces an older session coordinator automatically.";
+}
+
+/** The closing note of Background service. */
+export function lifecycleNote(platform: string): string {
+  const sleeping = "A sleeping or powered-off PC cannot scan.";
+  if (platform === "win32")
+    return `Startup registration requires the Windows setup command in the development documentation. Pausing schedules keeps the coordinator running; it does not remove startup registration. ${sleeping}`;
+  if (platform === "darwin" || platform === "linux")
+    return `Startup registration uses ${posixSetup}; Stop monitoring keeps it installed. Pausing schedules keeps the coordinator running. ${sleeping}`;
+  return `Pausing schedules keeps the coordinator running. ${sleeping}`;
+}
+
+/** What Connections says about background monitoring on the coordinator's platform. */
+export function backgroundSummary({
+  host,
+  mode,
+  platform,
+}: Pick<Runtime, "host" | "mode" | "platform">): string {
+  if (host === "boot-task")
+    return platform === "darwin"
+      ? "LaunchAgent host is configured. It runs while you are logged in."
+      : platform === "linux"
+        ? "systemd user service is configured. Verify lingering for monitoring after logout."
+        : "Windows boot host is configured. Verify connectivity and scan history after sign-out.";
+  if (mode === "background") return "Background host. The app window can stay closed.";
+  const advice =
+    platform === "win32"
+      ? "Install the Windows boot host for access after sign-out."
+      : platform === "darwin"
+        ? "Install the LaunchAgent host to start monitoring at login."
+        : platform === "linux"
+          ? "Install the systemd user service to monitor outside the app session."
+          : signOutUnavailable;
+  return `Monitoring keeps running when the app window closes. ${advice}`;
+}
+
+/** The copyable startup command on Background service, or null where none exists. */
+export function backgroundSetup(platform: string) {
+  if (platform === "win32")
+    return {
+      summary: "Windows startup setup",
+      intro: "From the Versionstead project folder, run this in an administrator PowerShell:",
+      command: ".\\scripts\\windows-background.ps1 -Action Install",
+      label: "Copy Windows startup setup command",
+      note: "Use the documented ProjectRoots option to grant read access to selected folders. Verify boot, sign-out, and source coverage after setup.",
+    };
+  if (platform === "darwin")
+    return {
+      summary: "macOS LaunchAgent setup",
+      intro:
+        "From the Versionstead project folder, after pnpm build, run this in Terminal with Node.js 24:",
+      command: `${posixSetup} install`,
+      label: "Copy macOS LaunchAgent setup command",
+      note: "The LaunchAgent runs from login to logout. Protected credentials use your login keychain.",
+    };
+  if (platform === "linux")
+    return {
+      summary: "Linux user service setup",
+      intro: "From the Versionstead project folder, after pnpm build, run this with Node.js 24:",
+      command: `${posixSetup} install --linger`,
+      label: "Copy Linux user service setup command",
+      note: "--linger keeps the service running before login and after logout; keyring credentials stay locked until you log in. Leave it out to monitor only while logged in.",
+    };
+  return null;
+}
+
+/** The host line on Settings › General. */
+export function hostLabel(host: Runtime["host"], platform: string) {
+  if (host !== "boot-task") return "Signed-in session";
+  return platform === "darwin"
+    ? "macOS LaunchAgent"
+    : platform === "linux"
+      ? "systemd user service"
+      : "Windows boot task";
+}
+
+/** The singular or plural of a noun for a count, without the count. */
+export const noun = (count: number, one: string, many = `${one}s`) => (count === 1 ? one : many);
+
+export const plural = (count: number, one: string, many?: string) =>
+  `${count} ${noun(count, one, many)}`;
 
 export function findingCounts(findings: readonly Finding[], deviceId: string) {
   const updates = new Set<string>();
@@ -69,6 +379,104 @@ export function dependencyFindings(
   );
 }
 
+export type UpgradeOption = { where: string; command: string; version: string };
+
+/** The command for a dependency's checked candidate: the compatible release, else the latest. */
+export function dependencyUpgradeOption(
+  project: Pick<Project, "packageManager" | "dependencies">,
+  dependency: Dependency,
+): UpgradeOption | null {
+  const version =
+    dependency.versionStatus === "checked"
+      ? (dependency.availableVersion ?? dependency.latestVersion)
+      : null;
+  const command = dependencyUpgradeCommand(project, dependency, version);
+  return command && version
+    ? { where: workspaceLabel(dependency.importer), command, version }
+    : null;
+}
+
+/**
+ * Whether the PC's update results are unverified or in flux (a failed or running scan or check),
+ * so that nothing built from them should be offered. The desktop's Update now is blocked by the
+ * same condition, plus a lost connection.
+ */
+export function pcUpdatesUnverified(
+  snapshot: Pick<MonitoringSnapshot, "inventory" | "scanProgress">,
+): boolean {
+  const { evidence, updateEvidence } = snapshot.inventory;
+  return (
+    evidence.status === "scanning" ||
+    evidence.status === "failed" ||
+    updateEvidence?.status === "failed" ||
+    snapshot.scanProgress?.active?.kind === "pc" ||
+    (snapshot.scanProgress?.queued.some((target) => target.kind === "pc") ?? false)
+  );
+}
+
+/**
+ * Why the desktop's Update now and the commands built from the PC's update results are held back,
+ * as the start of a sentence: a lost connection, or unverified or in-flux results. Null otherwise.
+ */
+export function pcUpdateHold(
+  connected: boolean,
+  snapshot: Pick<MonitoringSnapshot, "inventory" | "scanProgress"> | null,
+): string | null {
+  if (!connected) return "Reconnect to the coordinator";
+  return snapshot !== null && pcUpdatesUnverified(snapshot) ? "Finish a successful PC scan" : null;
+}
+
+/**
+ * Upgrade commands for a finding, one per distinct place it applies. A finding does not name its
+ * workspace or manager, so every dependency record or installation it matches contributes one.
+ * An advisory offers its dependency's update only when that reaches the provider-listed fixed
+ * boundary: none when no fixed version is listed or the boundary cannot be compared, since an
+ * update is not known to fix it. The boundary is not a target itself. PC commands are withheld
+ * while its update results are unverified.
+ */
+export function findingUpgradeCommands(
+  finding: Finding,
+  project: Project | null,
+  pc: Pick<MonitoringSnapshot, "inventory" | "scanProgress">,
+): UpgradeOption[] {
+  const options = new Map<string, UpgradeOption>();
+  if (project) {
+    for (const dependency of project.dependencies) {
+      const option = dependencyFindings(dependency, [finding]).length
+        ? dependencyUpgradeOption(project, dependency)
+        : null;
+      // An update's own candidate always answers it; an advisory needs its provider-listed fixed
+      // boundary, and with none listed no update is known to fix it.
+      if (
+        option &&
+        (finding.kind === "update" ||
+          (finding.availableVersion !== null &&
+            versionAtLeast(option.version, finding.availableVersion)))
+      )
+        options.set(option.command, option);
+    }
+  } else if (finding.kind === "update" && !pcUpdatesUnverified(pc)) {
+    for (const tool of pc.inventory.installations) {
+      if (
+        tool.updateStatus !== "available" ||
+        tool.name !== finding.name ||
+        (tool.packageId ?? tool.name) !== (finding.packageName ?? finding.name) ||
+        tool.version !== finding.installedVersion ||
+        tool.availableVersion !== finding.availableVersion
+      )
+        continue;
+      const command = globalUpgradeCommand(tool, tool.availableVersion);
+      if (command && tool.availableVersion)
+        options.set(command, {
+          where: tool.manager === "bun" ? "Bun" : "npm",
+          command,
+          version: tool.availableVersion,
+        });
+    }
+  }
+  return [...options.values()];
+}
+
 export function dependencyNeedsAttention(
   dependency: Dependency,
   findings: readonly Finding[] = [],
@@ -88,6 +496,14 @@ export function dependencyNeedsAttention(
 
 function incompleteEvidence(evidence: ScanEvidence): boolean {
   return evidence.status !== "complete" && evidence.status !== "scanning";
+}
+
+/**
+ * Whether a target's findings were kept from earlier scans rather than confirmed by its last one:
+ * a failed or unsupported scan keeps them, so they read "previous, unverified".
+ */
+export function findingsRetained(status: ScanEvidence["status"]): boolean {
+  return status === "failed" || status === "unsupported";
 }
 
 export function projectNeedsAttention(
@@ -159,15 +575,17 @@ export function attentionGroups(
     const matchesTarget = `${target.label} ${target.project?.path ?? ""}`
       .toLowerCase()
       .includes(search);
-    const findings = snapshot.findings.filter(
-      (finding) =>
-        finding.subjectId === target.id &&
-        (kind === "all" || finding.kind === kind) &&
-        (matchesTarget ||
-          `${finding.name} ${finding.packageName ?? ""} ${finding.source} ${finding.description}`
-            .toLowerCase()
-            .includes(search)),
-    );
+    const findings = snapshot.findings
+      .filter(
+        (finding) =>
+          finding.subjectId === target.id &&
+          (kind === "all" || finding.kind === kind) &&
+          (matchesTarget ||
+            `${finding.name} ${finding.packageName ?? ""} ${finding.source} ${finding.description}`
+              .toLowerCase()
+              .includes(search)),
+      )
+      .sort(compareFindings);
     const active =
       snapshot.scanProgress?.active?.targetId === target.id ||
       target.evidence.status === "scanning";

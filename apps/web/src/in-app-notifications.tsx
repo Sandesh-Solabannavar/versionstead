@@ -17,8 +17,10 @@ function readHistory() {
     return new NotificationHistory();
   }
 }
+// A lost connection is reported by its banner, and an unauthorized one by the access-code prompt, so
+// neither gets a toast; a failed action is reported by `mutate` itself.
 export function InAppNotifications() {
-  const { snapshot, connection, notice, error } = useMonitoring();
+  const { snapshot, connection, notice } = useMonitoring();
   const { error: applicationError } = useApplication();
   const navigate = useNavigate();
   const history = useRef<NotificationHistory | null>(null);
@@ -26,16 +28,6 @@ export function InAppNotifications() {
   useEffect(() => {
     if (notice) toast.add({ id: "action-feedback", title: notice, type: "success" });
   }, [notice]);
-  useEffect(() => {
-    if (error)
-      toast.add({
-        id: "action-error",
-        title: "Versionstead needs attention",
-        description: error,
-        type: "error",
-        timeout: 8000,
-      });
-  }, [error]);
   useEffect(() => {
     if (applicationError)
       toast.add({

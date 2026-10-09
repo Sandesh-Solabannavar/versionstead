@@ -53,6 +53,7 @@
   border-top: 1px solid var(--border);
 }
 .project-badge {
+  --project-color: var(--foreground);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -62,7 +63,10 @@
   border-radius: 6px;
   font-size: 12px;
   font-weight: 700;
-  background: color-mix(in srgb, currentColor 12%, var(--surface));
+  /* The colour names the project through the tint; its letters lean toward the text colour so every
+     one of the eighteen stays above 4.5:1 on that tint, in both themes. */
+  color: color-mix(in srgb, var(--project-color) 45%, var(--foreground));
+  background: color-mix(in srgb, var(--project-color) 12%, var(--surface));
   overflow: hidden;
 }
 .project-badge img {
@@ -76,7 +80,7 @@
   margin-bottom: 18px;
 }
 .project-icon-types [aria-pressed="true"] {
-  color: var(--accent);
+  color: var(--link);
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
 }
@@ -90,67 +94,67 @@
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: currentColor;
+  background: var(--project-color);
   border: 2px solid transparent;
   outline-offset: 3px;
   cursor: pointer;
 }
 .project-color-swatch[aria-pressed="true"] {
-  outline: 2px solid var(--text);
+  outline: 2px solid var(--foreground);
 }
 .project-color-slate {
-  color: #64748b;
+  --project-color: #64748b;
 }
 .project-color-red {
-  color: #ef4444;
+  --project-color: #ef4444;
 }
 .project-color-orange {
-  color: #f97316;
+  --project-color: #f97316;
 }
 .project-color-amber {
-  color: #f59e0b;
+  --project-color: #f59e0b;
 }
 .project-color-yellow {
-  color: #eab308;
+  --project-color: #eab308;
 }
 .project-color-lime {
-  color: #84cc16;
+  --project-color: #84cc16;
 }
 .project-color-green {
-  color: #22c55e;
+  --project-color: #22c55e;
 }
 .project-color-emerald {
-  color: #10b981;
+  --project-color: #10b981;
 }
 .project-color-teal {
-  color: #14b8a6;
+  --project-color: #14b8a6;
 }
 .project-color-cyan {
-  color: #06b6d4;
+  --project-color: #06b6d4;
 }
 .project-color-sky {
-  color: #0ea5e9;
+  --project-color: #0ea5e9;
 }
 .project-color-blue {
-  color: #3b82f6;
+  --project-color: #3b82f6;
 }
 .project-color-indigo {
-  color: #6366f1;
+  --project-color: #6366f1;
 }
 .project-color-violet {
-  color: #8b5cf6;
+  --project-color: #8b5cf6;
 }
 .project-color-purple {
-  color: #a855f7;
+  --project-color: #a855f7;
 }
 .project-color-fuchsia {
-  color: #d946ef;
+  --project-color: #d946ef;
 }
 .project-color-pink {
-  color: #ec4899;
+  --project-color: #ec4899;
 }
 .project-color-rose {
-  color: #f43f5e;
+  --project-color: #f43f5e;
 }
 .project-icon-grid {
   display: grid;
@@ -199,7 +203,7 @@
   font-size: calc(13px * var(--monospace-scale, 1));
   color: var(--text);
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--control-radius);
   resize: vertical;
 }

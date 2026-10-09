@@ -3,7 +3,13 @@ import { isAbsolute, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { MonitoringCoordinator } from "./monitoring.ts";
-import { acquireCoordinatorLock, removeRuntime, resolveDataDir, writeRuntime } from "./runtime.ts";
+import {
+  acquireCoordinatorLock,
+  DEV_ORIGIN,
+  removeRuntime,
+  resolveDataDir,
+  writeRuntime,
+} from "./runtime.ts";
 import { startServer } from "./server.ts";
 
 const { values } = parseArgs({
@@ -57,7 +63,7 @@ if (values.help) {
       throw new Error("Data directory must be absolute");
     if (values["web-root"] && !isAbsolute(values["web-root"]))
       throw new Error("Web root must be absolute");
-    if (values["dev-origin"] && values["dev-origin"] !== "http://127.0.0.1:4317")
+    if (values["dev-origin"] && values["dev-origin"] !== DEV_ORIGIN)
       throw new Error("Invalid development origin");
     dataDir = values["data-dir"] ? resolve(values["data-dir"]) : resolveDataDir();
     release = acquireCoordinatorLock(dataDir);
@@ -81,6 +87,7 @@ if (values.help) {
       token,
       mode: values.mode,
       host: values.host,
+      ...(values["dev-origin"] ? { devOrigin: values["dev-origin"] } : {}),
     });
     console.log(`Versionstead coordinator: ${server.origin}`);
     const signalStop = () => {
@@ -91,15 +98,29 @@ if (values.help) {
     process.once("SIGINT", signalStop);
     process.once("SIGTERM", signalStop);
   } catch (error) {
-    console.error(
-      error instanceof Error &&
-        /^(A coordinator already|Port must|Invalid |Data directory must|Web root must)/.test(
-          error.message,
-        )
-        ? error.message
-        : "Versionstead could not start. Check the local data directory and Node 24 runtime.",
-    );
-    await stop();
-    process.exitCode = 1;
+    const conflict = error instanceof Error && error.message.startsWith("A coordinator already");
+    if (conflict && values.host === "boot-task") {
+      // A desktop session that started first (both open at login) serves this data directory; a clean
+      // exit keeps launchd's KeepAlive and systemd's Restart=on-failure from retrying every ten seconds.
+      // ponytail: monitoring stays with that session coordinator until `background-host.mjs restart`;
+      // let the desktop hand over to an installed host if owners hit this often.
+      console.error(
+        "Another Versionstead coordinator already serves this data directory; this background host stays stopped.",
+      );
+      await stop();
+      process.exitCode = 0;
+    } else {
+      // Only these fixed, path-free messages are shown as they are.
+      console.error(
+        error instanceof Error &&
+          /^(A coordinator already|Port must|Invalid |Data directory must|Web root must|The monitoring database )/.test(
+            error.message,
+          )
+          ? error.message
+          : "Versionstead could not start. Check the local data directory and Node 24 runtime.",
+      );
+      await stop();
+      process.exitCode = 1;
+    }
   }
 }

@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("versionstead", {
     ipcRenderer.invoke("versionstead:window-theme", theme),
   selectProjectDirectory: (): Promise<string | null> =>
     ipcRenderer.invoke("versionstead:select-project-directory"),
+  // Windows PowerShell or the owner's login shell runs these; a browser has no bridge.
   runProjectAction: (
     projectId: string,
     actionId: string,
@@ -24,6 +25,8 @@ contextBridge.exposeInMainWorld("versionstead", {
   ): Promise<unknown> => ipcRenderer.invoke("versionstead:project-action-status", input),
   stopProjectAction: (id: string): Promise<unknown> =>
     ipcRenderer.invoke("versionstead:project-action-stop", id),
+  projectActionShell: (): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:project-action-shell"),
   updateGlobalTool: (input: unknown): Promise<unknown> =>
     ipcRenderer.invoke("versionstead:global-tool-update-start", input),
   globalToolUpdateCommand: (input: unknown): Promise<unknown> =>

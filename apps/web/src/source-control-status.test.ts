@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { providerPresentation } from "./source-control-status.ts";
+import {
+  credentialStorageLocation,
+  credentialStorageMessage,
+  providerPresentation,
+} from "./source-control-status.ts";
 import { redactedPlaceholder } from "./redacted-text.ts";
-import { repositoryLocation, repositoryMatches } from "./project-sources.ts";
+import { folderPlaceholder, repositoryLocation, repositoryMatches } from "./project-sources.ts";
 
 test("provider rows distinguish tool discovery, connected accounts, paused scans, and retained errors", () => {
   const provider = {
@@ -77,4 +81,35 @@ test("account placeholders and pasted repository URLs preserve privacy and sourc
       "https://github.com/owner/repo.git",
     ),
   );
+});
+
+test("the folder placeholder is an absolute path in the shape of the platform being typed on", () => {
+  // Desktop reports process.platform; a browser reports navigator.platform or userAgentData's.
+  for (const platform of ["win32", "Win32", "Windows"])
+    assert.equal(folderPlaceholder(platform), "D:\\projects\\my-app", platform);
+  // The folder field takes absolute paths only; it never expands ~.
+  for (const platform of ["darwin", "MacIntel", "macOS"])
+    assert.equal(folderPlaceholder(platform), "/Users/you/projects/my-app", platform);
+  for (const platform of ["linux", "Linux x86_64", "freebsd", ""])
+    assert.equal(folderPlaceholder(platform), "/home/you/projects/my-app", platform);
+});
+
+test("credential storage messages say what is missing and where tokens live", () => {
+  assert.equal(
+    credentialStorageMessage({ credentialStorageAvailable: true, credentialStorageIssue: null }),
+    null,
+  );
+  const issue =
+    "Install libsecret-tools (secret-tool) and unlock your login keyring to store connection credentials.";
+  assert.equal(
+    credentialStorageMessage({ credentialStorageAvailable: false, credentialStorageIssue: issue }),
+    issue,
+  );
+  const older = credentialStorageMessage({ credentialStorageAvailable: false }) ?? "";
+  assert.match(older, /Restart monitoring/);
+  assert.doesNotMatch(older, /Windows/);
+  assert.match(credentialStorageLocation("darwin"), /macOS login keychain/);
+  assert.match(credentialStorageLocation("linux"), /login keyring \(Secret Service\)/);
+  assert.match(credentialStorageLocation("win32"), /DPAPI/);
+  assert.doesNotMatch(credentialStorageLocation("freebsd"), /Windows|macOS/);
 });

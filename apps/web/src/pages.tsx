@@ -1,4 +1,13 @@
-import { useState } from "react";
+import {
+  memo,
+  useCallback,
+  useDeferredValue,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { flushSync } from "react-dom";
 import {
   ChevronDown,
   Clock3,
@@ -20,27 +29,46 @@ import {
   type Project,
 } from "@versionstead/contracts/monitoring";
 import { useMonitoring } from "./monitoring";
+import { actionKeys } from "./monitoring-actions";
 import { useApplication } from "./application";
+import { latestEvidence } from "./computer-evidence";
 import { AddProjectDialog } from "./add-project";
 import { ProjectBadge } from "./project-icons";
 import { ProjectCommands } from "./project-settings";
+import { Switch } from "./components/ui/switch";
 import {
   GlobalToolUpdateButton,
   GlobalToolUpdateDetails,
   useGlobalToolUpdates,
 } from "./global-tool-updates";
 import { versionCandidate } from "./versions";
+import { npmPackageUrl } from "./upgrade-commands";
 import {
+  advisoryTone,
+  compareFindings,
+  dependencyUpgradeOption,
   filterInstallations,
+  findingSummary,
+  findingsRetained,
+  findingUpgradeCommands,
   globalToolSourceState,
   installationCandidate,
+  lifecycleNote,
+  lifecycleRows,
+  noun,
   pcUpdateState,
+  plural,
   attentionGroups,
+  backgroundSetup,
   findingCounts,
   projectNeedsAttention,
   dependencyNeedsAttention,
   dependencyFindings,
+  restartAdvice,
+  workspaceLabel,
+  uniqueRowLabels,
   type InventoryFilter,
+  type UpgradeOption,
 } from "./monitoring-view";
 import {
   Badge,
@@ -48,13 +76,19 @@ import {
   Collapsible,
   CollapsiblePanel,
   CollapsibleTrigger,
+  CommandBlock,
+  CopyMenuItem,
   Dialog,
   EmptyState,
   Evidence,
   EvidenceBadge,
+  FindingBadge,
+  LinkMenuItem,
   PageHeading,
+  RowActions,
   safeExternalUrl,
   ScanProgress,
+  StaleBadge,
   Input,
   Select,
   SelectItem,
@@ -63,6 +97,8 @@ import {
   SelectValue,
   Table,
   timestamp,
+  UpdateKindBadge,
+  useFailure,
 } from "./ui";
 
 const maintenanceItems = [
@@ -124,33 +160,179 @@ function useGroupExpansion() {
     isOpen: (id: string) => expanded[id] ?? false,
     setOpen: (id: string, open: boolean) =>
       setExpanded((previous) => ({ ...previous, [id]: open })),
+    setAll: (ids: readonly string[], open: boolean) =>
+      setExpanded((previous) => ({
+        ...previous,
+        ...Object.fromEntries(ids.map((id) => [id, open])),
+      })),
   };
 }
 
+function ExpandCollapseAll({
+  ids,
+  expansion,
+}: {
+  ids: readonly string[];
+  expansion: ReturnType<typeof useGroupExpansion>;
+}) {
+  return (
+    <div className="action-row">
+      <Button variant="ghost" size="compact" onClick={() => expansion.setAll(ids, true)}>
+        Expand all
+      </Button>
+      <Button variant="ghost" size="compact" onClick={() => expansion.setAll(ids, false)}>
+        Collapse all
+      </Button>
+    </div>
+  );
+}
+
+const pageSize = 200;
+
+/** Shows rows 200 at a time; give it a new `key` when its filters or search change. */
+function PagedTable<T>({
+  label,
+  head,
+  rows,
+  renderRow,
+}: {
+  label: string;
+  head: ReactNode;
+  rows: readonly T[];
+  renderRow: (item: T) => ReactNode;
+}) {
+  const [limit, setLimit] = useState(pageSize);
+  const body = useRef<HTMLTableSectionElement>(null);
+  const remaining = rows.length - limit;
+  return (
+    <>
+      <Table label={label}>
+        <thead>{head}</thead>
+        <tbody ref={body}>{rows.slice(0, limit).map(renderRow)}</tbody>
+      </Table>
+      {remaining > 0 && (
+        <Button
+          size="sm"
+          className="mt-3"
+          onClick={() => {
+            flushSync(() => setLimit(limit + pageSize));
+            // Continue at the first revealed row instead of after the table.
+            body.current?.rows[limit]?.querySelector("button")?.focus();
+          }}
+        >
+          Show {Math.min(pageSize, remaining)} more ({remaining} remaining)
+        </Button>
+      )}
+    </>
+  );
+}
+
+// How a version or advisory lookup ended, in words rather than enum values.
+const lookupLabels = {
+  checked: "Checked",
+  "not-checked": "Not checked",
+  failed: "Lookup failed",
+  unsupported: "Not covered",
+} as const;
+
+const matchesProject = (project: Project, search: string) =>
+  `${project.name} ${project.path} ${project.packageManager}`.toLowerCase().includes(search);
+const matchesDependency = (item: Dependency, search: string) =>
+  `${item.name} ${item.packageName} ${item.importer} ${item.origin}`.toLowerCase().includes(search);
+const noFindings: readonly Finding[] = [];
+
 function FindingCounts({ counts }: { counts: ReturnType<typeof findingCounts> }) {
   return (
-    <div className="monitoring-stats" aria-label="Recorded evidence summary">
+    <div className="monitoring-stats" aria-label="Findings summary">
       <div>
         <PackageIcon size={16} aria-hidden="true" />
         <strong>{counts.packages}</strong>
-        <span>packages with findings</span>
+        <span>{noun(counts.packages, "package with findings", "packages with findings")}</span>
       </div>
       <div>
         <RefreshCw size={15} aria-hidden="true" />
         <strong>{counts.updates}</strong>
-        <span>recorded updates</span>
+        <span>{noun(counts.updates, "update available", "updates available")}</span>
       </div>
       <div>
         <ShieldAlert size={16} aria-hidden="true" />
         <strong>{counts.advisories}</strong>
-        <span>advisory findings</span>
+        <span>{noun(counts.advisories, "advisory finding", "advisory findings")}</span>
       </div>
       <div>
         <Clock3 size={15} aria-hidden="true" />
         <strong>{counts.incomplete}</strong>
-        <span>incomplete checks</span>
+        <span>{noun(counts.incomplete, "incomplete check", "incomplete checks")}</span>
       </div>
     </div>
+  );
+}
+
+/** Where a package can be copied or opened from; items mount only while the menu is open. */
+function PackageMenuItems({
+  packageName,
+  upgrades,
+  advisoryUrl = null,
+  project,
+}: {
+  packageName: string | null;
+  upgrades: readonly UpgradeOption[];
+  advisoryUrl?: string | null;
+  project: Project | null;
+}) {
+  const npm = packageName ? npmPackageUrl(packageName) : null;
+  const advisory = safeExternalUrl(advisoryUrl);
+  const repository = safeExternalUrl(project?.repository?.url ?? null);
+  return (
+    <>
+      {upgrades.map(({ where, command }) => (
+        <CopyMenuItem
+          key={command}
+          label={upgrades.length > 1 ? `Copy upgrade command (${where})` : "Copy upgrade command"}
+          text={command}
+          done="Upgrade command copied."
+        />
+      ))}
+      {/* Without a command to copy (an alias, a source that is not the registry, no candidate), the name is still useful. */}
+      {upgrades.length === 0 && npm && packageName && (
+        <CopyMenuItem label="Copy package name" text={packageName} done="Package name copied." />
+      )}
+      {npm && <LinkMenuItem label="Open on npm" href={npm} />}
+      {advisory && <LinkMenuItem label="Open advisory" href={advisory} />}
+      {repository && <LinkMenuItem label="Open repository" href={repository} />}
+      {project && !project.repository && (
+        <CopyMenuItem label="Copy path" text={project.path} done="Path copied." />
+      )}
+    </>
+  );
+}
+
+function FindingMenuItems({ finding, project }: { finding: Finding; project: Project | null }) {
+  const { snapshot } = useMonitoring();
+  return (
+    <PackageMenuItems
+      packageName={finding.packageName ?? finding.name}
+      upgrades={snapshot ? findingUpgradeCommands(finding, project, snapshot) : []}
+      advisoryUrl={finding.advisoryUrl}
+      project={project}
+    />
+  );
+}
+
+function DependencyMenuItems({
+  dependency,
+  project,
+}: {
+  dependency: Dependency;
+  project: Project;
+}) {
+  const upgrade = dependencyUpgradeOption(project, dependency);
+  return (
+    <PackageMenuItems
+      packageName={dependency.origin === "registry" ? dependency.packageName : null}
+      upgrades={upgrade ? [upgrade] : []}
+      project={project}
+    />
   );
 }
 
@@ -161,15 +343,17 @@ declare global {
       onNotificationSummary: (listener: (summary: unknown) => void) => () => void;
       setWindowTheme: (theme: unknown) => Promise<void>;
       selectProjectDirectory: () => Promise<string | null>;
-      runProjectAction: (
+      // Windows PowerShell or the owner's login shell runs project commands; a browser has no bridge.
+      runProjectAction?: (
         projectId: string,
         actionId: string,
         expectedCommand: string,
       ) => Promise<unknown>;
-      projectActionStatus: (
+      projectActionStatus?: (
         input: string | { projectId: string; actionId: string },
       ) => Promise<unknown>;
-      stopProjectAction: (id: string) => Promise<unknown>;
+      stopProjectAction?: (id: string) => Promise<unknown>;
+      projectActionShell?: () => Promise<unknown>;
       updateGlobalTool: (input: unknown) => Promise<unknown>;
       globalToolUpdateCommand: (input: unknown) => Promise<unknown>;
       globalToolUpdateStatus: () => Promise<unknown>;
@@ -182,15 +366,18 @@ function ScanButton({
   projectId,
   label = "Scan now",
   compact = false,
-  ariaLabel,
+  subject,
 }: {
   target: "pc" | "projects" | "all";
   projectId?: string;
   label?: string;
   compact?: boolean;
-  ariaLabel?: string;
+  /** What a repeated button scans, so each one has its own accessible name. */
+  subject?: string;
 }) {
-  const { snapshot, connection, busy, mutate } = useMonitoring();
+  const { snapshot, connection, pending, mutate } = useMonitoring();
+  // Requesting a scan holds back only this scan button, not every other control.
+  const key = actionKeys.scan(target, projectId);
   const unsupportedPc =
     !!snapshot && target !== "projects" && snapshot.inventory.collector !== "npm-bun-global-v1";
   const matches = (item: { kind: "pc" | "project"; targetId: string }) =>
@@ -209,23 +396,29 @@ function ScanButton({
             (project) =>
               (!projectId || project.id === projectId) && project.evidence.status === "scanning",
           );
+  const text = scanning ? "Scanning…" : queued ? "Queued…" : label;
   return (
     <Button
       variant={compact ? "outline" : "primary"}
       size={compact ? "compact" : "sm"}
-      aria-label={ariaLabel}
-      disabled={connection !== "connected" || busy || scanning || queued || unsupportedPc}
+      // The name starts with the visible text, as speech-control users say what they see.
+      aria-label={subject ? `${text.replace("…", "")}: ${subject}` : undefined}
+      disabled={
+        connection !== "connected" || pending.has(key) || scanning || queued || unsupportedPc
+      }
       onClick={() => {
         void mutate(
           "/api/scans",
           { target, ...(projectId ? { projectId } : {}) },
           decodeAcceptedResponse,
           "Scan requested. Results will appear as collection finishes.",
+          "POST",
+          { key },
         );
       }}
     >
       <RefreshCw size={13} aria-hidden="true" />
-      {scanning ? "Scanning…" : queued ? "Queued…" : label}
+      {text}
     </Button>
   );
 }
@@ -241,17 +434,7 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
   const url = safeExternalUrl(finding.advisoryUrl);
   return (
     <Dialog title="Finding evidence" onClose={close} drawer>
-      <Badge
-        tone={
-          finding.kind === "advisory" ? "error" : finding.kind === "coverage" ? "warning" : "info"
-        }
-      >
-        {finding.kind === "advisory"
-          ? `${finding.severity} advisory`
-          : finding.kind === "coverage"
-            ? "Incomplete check"
-            : "Update available"}
-      </Badge>
+      <FindingBadge finding={finding} />
       <h3 className="detail-title">{finding.name}</h3>
       <p>{finding.description}</p>
       <dl className="details-list">
@@ -272,6 +455,7 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
       </dl>
       {evidence && (
         <Evidence
+          level={3}
           evidence={evidence}
           {...(project ? { inputFingerprint: project.inputFingerprint ?? null } : {})}
         />
@@ -300,16 +484,128 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
   );
 }
 
+const sameFindings = (a: readonly Finding[], b: readonly Finding[]) =>
+  a.length === b.length && a.every((finding, index) => finding === b[index]);
+
+// Collapsed groups stay mounted so browser find can reach their rows, and scan progress reaches
+// the page every second. Skipping a re-render unless this table's own findings change keeps both
+// cheap, and rows page 200 at a time so entering the page has a ceiling. Give it a new `key` when
+// the filter or search changes.
+const FindingsTable = memo(
+  function FindingsTable({
+    label,
+    findings,
+    project,
+    retained,
+    select,
+  }: {
+    label: string;
+    findings: readonly Finding[];
+    project: Project | null;
+    retained: boolean;
+    select: (findingId: string) => void;
+  }) {
+    const names = useMemo(
+      () =>
+        uniqueRowLabels(
+          findings,
+          (finding) => `${finding.name}, ${findingSummary(finding)}`,
+          (finding) => finding.id,
+        ),
+      [findings],
+    );
+    return (
+      <PagedTable
+        label={label}
+        head={
+          <tr>
+            <th scope="col">Affected package</th>
+            <th scope="col">Version evidence</th>
+            <th scope="col">Finding</th>
+            <th scope="col">Source</th>
+            <th scope="col">Last seen</th>
+            <th scope="col">
+              <span className="sr-only">Actions</span>
+            </th>
+          </tr>
+        }
+        rows={findings}
+        renderRow={(finding) => (
+          <tr key={finding.id}>
+            <td>
+              <div className="package-label">
+                <PackageIcon size={14} aria-hidden="true" />
+                <button className="item-label" onClick={() => select(finding.id)}>
+                  {finding.name}
+                </button>
+              </div>
+              {finding.packageName && finding.packageName !== finding.name && (
+                <span className="table-subtext mono">{finding.packageName}</span>
+              )}
+            </td>
+            <td className="mono">
+              {finding.installedVersion ?? "Unknown"}
+              {finding.availableVersion &&
+                (finding.kind === "advisory" ? (
+                  <span className="table-subtext">
+                    Provider boundary: {finding.availableVersion}
+                  </span>
+                ) : (
+                  <> → {finding.availableVersion}</>
+                ))}
+              {retained && <span className="table-subtext">Previous, unverified</span>}
+            </td>
+            <td>
+              <FindingBadge finding={finding} />
+            </td>
+            <td className="muted">{finding.source}</td>
+            <td className="muted">{timestamp(finding.lastSeenAt)}</td>
+            <td>
+              <RowActions label={`Actions for ${names.get(finding.id)}`}>
+                <FindingMenuItems finding={finding} project={project} />
+              </RowActions>
+            </td>
+          </tr>
+        )}
+      />
+    );
+  },
+  (previous, next) =>
+    previous.label === next.label &&
+    previous.project === next.project &&
+    previous.retained === next.retained &&
+    previous.select === next.select &&
+    sameFindings(previous.findings, next.findings),
+);
+
 export function Attention() {
-  const { snapshot, connection } = useMonitoring();
-  const { snapshot: application } = useApplication();
+  const { snapshot, connection, pending } = useMonitoring();
+  const { snapshot: application, computerEvidence, unreadableEvidence } = useApplication();
   const { filter = "all" } = useSearch({ from: "/" });
   const navigate = useNavigate({ from: "/" });
   const [query, setQuery] = useState("");
+  const search = useDeferredValue(query);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
   const findings = snapshot?.findings ?? [];
-  const allGroups = snapshot ? attentionGroups(snapshot) : [];
-  const groups = snapshot ? attentionGroups(snapshot, filter, query) : [];
+  const allGroups = useMemo(() => (snapshot ? attentionGroups(snapshot) : []), [snapshot]);
+  const groups = useMemo(
+    () => (snapshot ? attentionGroups(snapshot, filter, search) : []),
+    [snapshot, filter, search],
+  );
+  const remoteGroups = useMemo(
+    () =>
+      new Map(
+        application?.computers.map((computer) => {
+          const evidence = computerEvidence.get(computer.id);
+          return [
+            computer.id,
+            evidence ? attentionGroups(evidence.snapshot, filter, search) : [],
+          ] as const;
+        }),
+      ),
+    [application, computerEvidence, filter, search],
+  );
   const expansion = useGroupExpansion();
   const selected = findings.find((finding) => finding.id === selectedId);
   const counts = allGroups.reduce(
@@ -337,25 +633,34 @@ export function Attention() {
         application.computers.some(
           (computer) =>
             computer.error ||
-            !computer.snapshot ||
-            attentionGroups(computer.snapshot, filter, query).length > 0,
+            !computerEvidence.has(computer.id) ||
+            latestEvidence(computer, computerEvidence, unreadableEvidence) === "failed" ||
+            remoteGroups.get(computer.id)?.length,
         ) && (
           <section className="setting-section" aria-label="Connected PC attention">
             <h2>Connected PCs</h2>
             <div className="setting-group">
               {application.computers.flatMap((computer) => {
-                const remote = computer.snapshot
-                  ? attentionGroups(computer.snapshot, filter, query)
-                  : [];
-                if (!remote.length && !computer.error && computer.snapshot) return [];
+                const remote = remoteGroups.get(computer.id) ?? [];
+                const received = computerEvidence.has(computer.id);
+                const latest = latestEvidence(computer, computerEvidence, unreadableEvidence);
+                if (!remote.length && !computer.error && received && latest !== "failed") return [];
                 return (
                   <div className="preference-row" key={computer.id}>
                     <div>
                       <h3>{computer.label}</h3>
                       <p className="muted small">
-                        {computer.snapshot
-                          ? `${remote.length} targets need attention`
-                          : "No evidence received"}{" "}
+                        {received
+                          ? `${plural(remote.length, "target")} ${remote.length === 1 ? "needs" : "need"} attention${
+                              latest === "current"
+                                ? ""
+                                : ` in earlier evidence; the latest ${latest === "failed" ? "could not be read" : "is being read"}`
+                            }`
+                          : latest === "none"
+                            ? "No evidence received"
+                            : latest === "failed"
+                              ? "Evidence could not be read"
+                              : "Loading evidence…"}{" "}
                         · Last received {timestamp(computer.checkedAt)}
                         {computer.error ? " · Unreachable, evidence retained" : ""}
                       </p>
@@ -386,9 +691,12 @@ export function Attention() {
           action={
             <>
               <ScanButton target="pc" label="Scan this PC" />
-              <Link to="/projects" className="button">
+              <Button
+                disabled={connection !== "connected" || pending.has(actionKeys.addProject)}
+                onClick={() => setAdding(true)}
+              >
                 Select project folders
-              </Link>
+              </Button>
             </>
           }
         >
@@ -422,7 +730,7 @@ export function Attention() {
                   }
                   <Badge>
                     {item === "all"
-                      ? findings.length
+                      ? counts.updates + counts.advisories + counts.incomplete
                       : item === "updates"
                         ? counts.updates
                         : item === "advisories"
@@ -444,15 +752,13 @@ export function Attention() {
             </label>
           </div>
           <div className="monitoring-summary">
-            <span>{groups.length} targets shown</span>
-            <span>
-              Package counts combine duplicate project importers; PC locations remain distinct.
-            </span>
+            <span>{plural(groups.length, "target")} shown</span>
+            <ExpandCollapseAll ids={groups.map((group) => group.id)} expansion={expansion} />
           </div>
           {groups.length === 0 ? (
             <EmptyState
               title={
-                filter === "all" && !query.trim()
+                filter === "all" && !search.trim()
                   ? "No recorded findings"
                   : "No findings match this view"
               }
@@ -505,12 +811,32 @@ export function Attention() {
                           </span>
                           <span className="target-group-badges">
                             {group.counts.updates > 0 && (
-                              <Badge tone="info">{group.counts.updates} updates</Badge>
+                              <Badge tone="info">
+                                {plural(
+                                  group.counts.updates,
+                                  "update available",
+                                  "updates available",
+                                )}
+                              </Badge>
                             )}
                             {group.counts.advisories > 0 && (
-                              <Badge tone="error">{group.counts.advisories} advisories</Badge>
+                              <Badge
+                                tone={advisoryTone(
+                                  packageFindings.filter((finding) => finding.kind === "advisory"),
+                                )}
+                              >
+                                {plural(group.counts.advisories, "advisory", "advisories")}
+                              </Badge>
                             )}
                             <EvidenceBadge status={group.evidence.status} />
+                            <StaleBadge
+                              lastSuccess={group.evidence.lastSuccess}
+                              intervalMinutes={
+                                group.kind === "pc"
+                                  ? snapshot.settings.pcIntervalMinutes
+                                  : snapshot.settings.projectIntervalMinutes
+                              }
+                            />
                             {group.queued && <Badge tone="info">Queued</Badge>}
                           </span>
                           <span className="target-group-time">
@@ -528,11 +854,11 @@ export function Attention() {
                           compact
                           target={group.kind === "pc" ? "pc" : "projects"}
                           {...(group.project ? { projectId: group.id } : {})}
-                          ariaLabel={"Scan " + (group.kind === "pc" ? "this PC" : group.label)}
+                          subject={group.kind === "pc" ? "this PC" : group.label}
                         />
                       </div>
                     </div>
-                    <CollapsiblePanel className="target-group-panel">
+                    <CollapsiblePanel className="target-group-panel" hiddenUntilFound>
                       <div className="target-group-body">
                         {group.project && (
                           <div className="group-context">
@@ -553,7 +879,7 @@ export function Attention() {
                                   size="compact"
                                   onClick={() => setSelectedId(finding.id)}
                                 >
-                                  Review collector evidence
+                                  View scan details
                                 </Button>
                               </div>
                             ))}
@@ -569,65 +895,17 @@ export function Attention() {
                           </section>
                         ) : null}
                         {packageFindings.length > 0 ? (
-                          <Table label={group.label + " findings"}>
-                            <thead>
-                              <tr>
-                                <th scope="col">Affected package</th>
-                                <th scope="col">Version evidence</th>
-                                <th scope="col">Finding</th>
-                                <th scope="col">Source</th>
-                                <th scope="col">Last seen</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {packageFindings.map((finding) => (
-                                <tr key={finding.id}>
-                                  <td>
-                                    <div className="package-label">
-                                      <PackageIcon size={14} aria-hidden="true" />
-                                      <button
-                                        className="item-label"
-                                        onClick={() => setSelectedId(finding.id)}
-                                      >
-                                        {finding.name}
-                                      </button>
-                                    </div>
-                                    {finding.packageName &&
-                                      finding.packageName !== finding.name && (
-                                        <span className="table-subtext mono">
-                                          {finding.packageName}
-                                        </span>
-                                      )}
-                                  </td>
-                                  <td className="mono">
-                                    {finding.installedVersion ?? "Unknown"}
-                                    {finding.availableVersion &&
-                                      (finding.kind === "advisory" ? (
-                                        <span className="table-subtext">
-                                          Provider boundary: {finding.availableVersion}
-                                        </span>
-                                      ) : (
-                                        <> → {finding.availableVersion}</>
-                                      ))}
-                                    {group.evidence.status === "failed" && (
-                                      <span className="table-subtext">Previous, unverified</span>
-                                    )}
-                                  </td>
-                                  <td>
-                                    <Badge tone={finding.kind === "advisory" ? "error" : "info"}>
-                                      {finding.kind === "advisory"
-                                        ? finding.severity + " advisory"
-                                        : "Update recorded"}
-                                    </Badge>
-                                  </td>
-                                  <td className="muted">{finding.source}</td>
-                                  <td className="muted">{timestamp(finding.lastSeenAt)}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </Table>
+                          <FindingsTable
+                            key={`${filter}:${search}`}
+                            label={group.label + " findings"}
+                            findings={packageFindings}
+                            project={group.project}
+                            retained={findingsRetained(group.evidence.status)}
+                            select={setSelectedId}
+                          />
                         ) : coverageFindings.length === 0 && group.evidence.errors.length === 0 ? (
                           <EmptyState
+                            level={3}
                             title={
                               group.evidence.status === "not-scanned"
                                 ? "No evidence collected for this target"
@@ -646,6 +924,7 @@ export function Attention() {
                         <details className="group-evidence">
                           <summary>Scan evidence & coverage</summary>
                           <Evidence
+                            level={3}
                             evidence={group.evidence}
                             {...(group.project
                               ? { inputFingerprint: group.project.inputFingerprint ?? null }
@@ -653,6 +932,7 @@ export function Attention() {
                           />
                           {group.kind === "pc" && snapshot.inventory.updateEvidence && (
                             <Evidence
+                              level={3}
                               evidence={snapshot.inventory.updateEvidence}
                               title="Global tool upgrade checks"
                             />
@@ -665,15 +945,10 @@ export function Attention() {
               })}
             </div>
           )}
-          <p className="monitoring-footnote">
-            Connection health, scan freshness, and coverage are separate.{" "}
-            <Link to="/service" className="text-link">
-              Review background monitoring →
-            </Link>
-          </p>
         </>
       )}
       {selected && <FindingDetails finding={selected} close={() => setSelectedId(null)} />}
+      {adding && <AddProjectDialog close={() => setAdding(false)} added={() => {}} />}
     </>
   );
 }
@@ -681,18 +956,21 @@ export function ThisPc() {
   const { snapshot, connection } = useMonitoring();
   const updater = useGlobalToolUpdates();
   const [query, setQuery] = useState("");
+  const search = useDeferredValue(query);
   const [source, setSource] = useState("all");
   const [filter, setFilter] = useState<InventoryFilter>("updates");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const installations = snapshot?.inventory.installations ?? [];
   const selected = installations.find((item) => item.id === selectedId);
   const managers = snapshot?.inventory.managers ?? [];
-  const visible = filterInstallations(installations, filter, source, query);
+  const visible = filterInstallations(installations, filter, source, search);
   const unscanned = snapshot?.inventory.evidence.lastAttempt === null && installations.length === 0;
   const updates = installations.filter((item) => item.updateStatus === "available").length;
   const unverified = installations.filter((item) => item.updateStatus === "unknown").length;
   const emptyUpdateState = snapshot ? pcUpdateState(snapshot.inventory) : null;
   const previous = snapshot?.inventory.updateEvidence?.status === "failed";
+  const lastChecked =
+    (snapshot?.inventory.updateEvidence ?? snapshot?.inventory.evidence)?.lastSuccess ?? null;
   return (
     <>
       <PageHeading
@@ -720,7 +998,14 @@ export function ThisPc() {
       )}
       {snapshot && snapshot.inventory.collector !== "npm-bun-global-v1" ? (
         <EmptyState title="Global tool scanner update required">
-          <p>Restart monitoring using the instructions above to detect npm and Bun global tools.</p>
+          <p>
+            Restart monitoring to detect npm and Bun global tools.{" "}
+            {restartAdvice(
+              snapshot.runtime.host,
+              Boolean(window.versionstead),
+              snapshot.runtime.platform,
+            )}
+          </p>
         </EmptyState>
       ) : snapshot && unscanned ? (
         <EmptyState
@@ -746,8 +1031,11 @@ export function ThisPc() {
                   <p className="muted small">{state.description}</p>
                   {manager.status === "detected" && (
                     <p className="small">
-                      {installations.filter((item) => item.manager === manager.manager).length}{" "}
-                      global tools collected
+                      {plural(
+                        installations.filter((item) => item.manager === manager.manager).length,
+                        "global tool",
+                      )}{" "}
+                      collected
                     </p>
                   )}
                   {manager.error && manager.status !== "unavailable" && (
@@ -769,22 +1057,35 @@ export function ThisPc() {
               <strong>
                 {snapshot.inventory.updateEvidence?.status === "complete" ||
                 snapshot.inventory.updateEvidence?.status === "partial"
-                  ? `${updates} global tool updates available`
+                  ? `${plural(updates, "global tool update")} available`
                   : previous
-                    ? `${updates} previously recorded global tool updates`
+                    ? plural(updates, "previously recorded global tool update")
                     : snapshot.inventory.evidence.status === "scanning"
                       ? "Checking global tool updates"
                       : snapshot.inventory.updateEvidence?.status === "not-scanned"
                         ? "Ready to check for updates"
                         : "Update checks unavailable"}
               </strong>{" "}
-              · {installations.length} global installations
+              · {plural(installations.length, "global installation")}
               {unverified > 0 ? ` · ${unverified} unverified` : ""}
+              {lastChecked && (
+                <>
+                  {" "}
+                  · Last successful check {timestamp(lastChecked)}{" "}
+                  <StaleBadge
+                    lastSuccess={lastChecked}
+                    intervalMinutes={snapshot.settings.pcIntervalMinutes}
+                  />
+                </>
+              )}
             </p>
             <p className="muted small">
               Blank update cells mean no verified result. Review source coverage below before
               treating a check as complete.
             </p>
+            {!updater.desktop && updates > 0 && (
+              <p className="muted small">Updates run in the Versionstead desktop app.</p>
+            )}
           </div>
           <div className="table-toolbar">
             <div className="inventory-filters">
@@ -829,22 +1130,24 @@ export function ThisPc() {
           {visible.length === 0 ? (
             <EmptyState
               title={
-                source !== "all" || query.trim() || filter !== "updates"
+                source !== "all" || search.trim() || filter !== "updates"
                   ? "No global tools match this filter"
                   : (emptyUpdateState?.title ?? "Global tool checking unavailable")
               }
               action={<ScanButton target="pc" />}
             >
               <p>
-                {source !== "all" || query.trim() || filter !== "updates"
+                {source !== "all" || search.trim() || filter !== "updates"
                   ? "Change the update filter, package manager, or search to see other collected global tools."
                   : emptyUpdateState?.description}
               </p>
             </EmptyState>
           ) : (
             <>
-              <Table label="Globally installed tools">
-                <thead>
+              <PagedTable
+                key={`${filter}:${source}:${search}`}
+                label="Globally installed tools"
+                head={
                   <tr>
                     <th scope="col">Global tool</th>
                     <th scope="col">Installed</th>
@@ -855,26 +1158,27 @@ export function ThisPc() {
                       <span className="sr-only">Update package</span>
                     </th>
                   </tr>
-                </thead>
-                <tbody>
-                  {visible.map((item) => (
-                    <tr key={item.id}>
-                      <td>
-                        <button className="item-label" onClick={() => setSelectedId(item.id)}>
-                          {item.name}
-                        </button>
-                        <span className="table-subtext">
-                          {item.manager ?? item.source} global installation
-                        </span>
-                      </td>
-                      <td className="mono">{item.version}</td>
-                      <td className="mono">{installationCandidate(item, previous)}</td>
-                      <td>
-                        {item.source}
-                        <span className="table-subtext">{item.channel}</span>
-                      </td>
-                      <td>
-                        {item.updateStatus !== "unknown" && (
+                }
+                rows={visible}
+                renderRow={(item) => (
+                  <tr key={item.id}>
+                    <td>
+                      <button className="item-label" onClick={() => setSelectedId(item.id)}>
+                        {item.name}
+                      </button>
+                      <span className="table-subtext">
+                        {item.manager ?? item.source} global installation
+                      </span>
+                    </td>
+                    <td className="mono">{item.version}</td>
+                    <td className="mono">{installationCandidate(item, previous)}</td>
+                    <td>
+                      {item.source}
+                      <span className="table-subtext">{item.channel}</span>
+                    </td>
+                    <td>
+                      {item.updateStatus !== "unknown" && (
+                        <div className="package-checks">
                           <Badge tone={item.updateStatus === "available" ? "info" : "neutral"}>
                             {previous
                               ? "Previous result"
@@ -882,15 +1186,21 @@ export function ThisPc() {
                                 ? "Update available"
                                 : "Current at source"}
                           </Badge>
-                        )}
-                      </td>
-                      <td>
-                        <GlobalToolUpdateButton item={item} updater={updater} />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </Table>
+                          {item.updateStatus === "available" && !previous && (
+                            <UpdateKindBadge
+                              installed={item.version}
+                              candidate={item.availableVersion}
+                            />
+                          )}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <GlobalToolUpdateButton item={item} updater={updater} />
+                    </td>
+                  </tr>
+                )}
+              />
               <p className="table-note">
                 A tool installed through both npm and Bun appears separately. Installed versions
                 come from each global location; private, linked, and unsupported packages remain
@@ -956,9 +1266,10 @@ export function ThisPc() {
             <dt>Channel</dt>
             <dd>{selected.channel}</dd>
           </dl>
-          {snapshot && <Evidence evidence={snapshot.inventory.evidence} />}
+          {snapshot && <Evidence level={3} evidence={snapshot.inventory.evidence} />}
           {snapshot?.inventory.updateEvidence && (
             <Evidence
+              level={3}
               evidence={snapshot.inventory.updateEvidence}
               title="Global tool upgrade checks"
             />
@@ -1003,7 +1314,7 @@ function DependencyDetails({
         finding,
       ]),
     ).values(),
-  ];
+  ].sort(compareFindings);
   return (
     <Dialog title="Dependency evidence" onClose={close} drawer>
       <h3>{dependency.name}</h3>
@@ -1032,10 +1343,10 @@ function DependencyDetails({
         <dd>{dependency.origin}</dd>
         <dt>Role</dt>
         <dd>{dependency.role}</dd>
-        <dt>Workspace importer</dt>
-        <dd className="mono">{dependency.importer}</dd>
+        <dt>Workspace</dt>
+        <dd className="mono">{workspaceLabel(dependency.importer)}</dd>
         <dt>Advisory lookup</dt>
-        <dd>{dependency.advisoryStatus}</dd>
+        <dd>{lookupLabels[dependency.advisoryStatus]}</dd>
         <dt>Advisory identifiers</dt>
         <dd>
           {dependency.advisoryIds.length
@@ -1049,14 +1360,12 @@ function DependencyDetails({
       </dl>
       {findings.length > 0 && (
         <section className="detail-section">
-          <h3>Recorded package findings</h3>
+          <h3>Package findings</h3>
           {findings.map((finding) => {
             const url = safeExternalUrl(finding.advisoryUrl);
             return (
               <article className="dependency-finding" key={finding.id}>
-                <Badge tone={finding.kind === "advisory" ? "error" : "info"}>
-                  {finding.kind === "advisory" ? finding.severity + " advisory" : "Update recorded"}
-                </Badge>
+                <FindingBadge finding={finding} />
                 <p>{finding.description}</p>
                 <dl className="details-list">
                   <dt>Source</dt>
@@ -1080,7 +1389,11 @@ function DependencyDetails({
           })}
         </section>
       )}
-      <Evidence evidence={project.evidence} inputFingerprint={project.inputFingerprint ?? null} />
+      <Evidence
+        level={3}
+        evidence={project.evidence}
+        inputFingerprint={project.inputFingerprint ?? null}
+      />
       <p className="notice">
         Requested ranges and resolved versions are separate evidence. Git, workspace, local, and
         unsupported sources do not inherit registry update or advisory coverage.
@@ -1089,35 +1402,286 @@ function DependencyDetails({
   );
 }
 
+// Collapsed projects stay mounted so browser find can reach their rows, and scan progress reaches
+// the page every second. Stable props let memo skip re-rendering a table nothing changed in.
+const ProjectDependencies = memo(function ProjectDependencies({
+  project,
+  findings,
+  search,
+  showAll,
+  setShowAll,
+  clearSearch,
+  select,
+}: {
+  project: Project;
+  findings: readonly Finding[];
+  search: string;
+  showAll: boolean;
+  setShowAll: (projectId: string, showAll: boolean) => void;
+  clearSearch: () => void;
+  select: (projectId: string, dependencyId: string) => void;
+}) {
+  const rows = useMemo(() => {
+    const projectMatches = matchesProject(project, search);
+    return project.dependencies.filter(
+      (item) =>
+        (showAll || dependencyNeedsAttention(item, findings)) &&
+        (projectMatches || matchesDependency(item, search)),
+    );
+  }, [project, findings, search, showAll]);
+  // The same package can appear in several workspaces, so each row's menu is named by both.
+  const names = useMemo(
+    () =>
+      uniqueRowLabels(
+        rows,
+        (item) =>
+          `${item.name}${item.resolved ? ` ${item.resolved}` : ""} in ${workspaceLabel(item.importer)}`,
+        (item) => item.id,
+      ),
+    [rows],
+  );
+  return (
+    <>
+      <div className="group-toolbar">
+        <span>
+          {rows.length} of {plural(project.dependencies.length, "dependency record")}
+        </span>
+        <div className="tabs" role="group" aria-label={project.name + " dependency visibility"}>
+          <Button
+            variant={!showAll ? "secondary" : "ghost"}
+            size="compact"
+            aria-pressed={!showAll}
+            onClick={() => setShowAll(project.id, false)}
+          >
+            Needs attention
+          </Button>
+          <Button
+            variant={showAll ? "secondary" : "ghost"}
+            size="compact"
+            aria-pressed={showAll}
+            data-testid="dependency-filter-all"
+            onClick={() => setShowAll(project.id, true)}
+          >
+            All dependencies
+          </Button>
+        </div>
+      </div>
+      {rows.length === 0 ? (
+        <EmptyState
+          level={3}
+          title={
+            search ? "No dependencies match this view" : "No package findings in collected evidence"
+          }
+          action={
+            <Button
+              onClick={() => {
+                setShowAll(project.id, true);
+                clearSearch();
+              }}
+            >
+              Show all dependencies
+            </Button>
+          }
+        >
+          <p>
+            Coverage gaps apply to the project independently of package findings. Review the scan
+            evidence below.
+          </p>
+        </EmptyState>
+      ) : (
+        <PagedTable
+          key={`${showAll}:${search}`}
+          label={project.name + " dependencies"}
+          head={
+            <tr>
+              <th scope="col">Dependency / workspace</th>
+              <th scope="col">Requested</th>
+              <th scope="col">Resolved</th>
+              <th scope="col">Candidate</th>
+              <th scope="col">Origin / role</th>
+              <th scope="col">Checks & findings</th>
+              <th scope="col">
+                <span className="sr-only">Actions</span>
+              </th>
+            </tr>
+          }
+          rows={rows}
+          renderRow={(item) => (
+            <tr key={item.id}>
+              <td>
+                <div className="package-label">
+                  <PackageIcon size={14} aria-hidden="true" />
+                  <button className="item-label" onClick={() => select(project.id, item.id)}>
+                    {item.name}
+                  </button>
+                </div>
+                <span className="table-subtext mono">{workspaceLabel(item.importer)}</span>
+                {item.packageName !== item.name && (
+                  <span className="table-subtext mono">Alias: {item.packageName}</span>
+                )}
+              </td>
+              <td className="mono">{item.requested ?? "Transitive"}</td>
+              <td className="mono">{item.resolved ?? "Unknown"}</td>
+              <td className="mono">{versionCandidate(item)}</td>
+              <td>
+                {item.origin}
+                <span className="table-subtext">{item.role}</span>
+              </td>
+              <td>
+                <div className="package-checks">
+                  {(item.availableVersion || item.latestVersion) && (
+                    <>
+                      <Badge tone="info">
+                        {item.versionStatus === "checked" ? "Update available" : "Previous update"}
+                      </Badge>
+                      {item.versionStatus === "checked" && (
+                        <UpdateKindBadge
+                          installed={item.resolved}
+                          candidate={item.availableVersion ?? item.latestVersion}
+                        />
+                      )}
+                    </>
+                  )}
+                  <Badge
+                    tone={
+                      item.advisoryIds.length
+                        ? advisoryTone(
+                            dependencyFindings(item, findings).filter(
+                              (finding) => finding.kind === "advisory",
+                            ),
+                          )
+                        : item.advisoryStatus === "checked"
+                          ? "neutral"
+                          : "warning"
+                    }
+                  >
+                    {item.advisoryIds.length
+                      ? item.advisoryStatus === "checked"
+                        ? plural(item.advisoryIds.length, "known advisory", "known advisories")
+                        : plural(item.advisoryIds.length, "advisory", "advisories") +
+                          " (previous, unverified)"
+                      : item.advisoryStatus === "checked"
+                        ? "No known matches"
+                        : lookupLabels[item.advisoryStatus]}
+                  </Badge>
+                </div>
+              </td>
+              <td>
+                <RowActions label={`Actions for ${names.get(item.id)}`}>
+                  <DependencyMenuItems dependency={item} project={project} />
+                </RowActions>
+              </td>
+            </tr>
+          )}
+        />
+      )}
+    </>
+  );
+});
+
+/** Confirms removing a project. A failure shows here, and the dialog stays until the request ends. */
+function RemoveProjectDialog({
+  project,
+  close,
+  removed,
+}: {
+  project: Project;
+  close: () => void;
+  removed: () => void;
+}) {
+  const { connection, pending, mutate } = useMonitoring();
+  // The dialog owns its error, so each opening starts clean and a failure never reaches another dialog.
+  const [error, fail, clearError] = useFailure();
+  const key = actionKeys.removeProject(project.id);
+  const removing = pending.has(key);
+  return (
+    <Dialog title={"Remove " + project.name + "?"} onClose={close} dismissible={!removing}>
+      <p>
+        Remove this folder from monitoring. Its source files and installed dependencies will remain
+        untouched.
+      </p>
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="form-actions">
+        <Button disabled={removing} onClick={close}>
+          Cancel
+        </Button>
+        <Button
+          variant="danger"
+          disabled={connection !== "connected" || removing}
+          onClick={() => {
+            clearError();
+            void mutate(
+              "/api/projects/" + encodeURIComponent(project.id),
+              {},
+              decodeAcceptedResponse,
+              "Project removed from monitoring.",
+              "DELETE",
+              { key, onError: fail },
+            ).then((result) => {
+              if (result) removed();
+            });
+          }}
+        >
+          Remove from monitoring
+        </Button>
+      </div>
+    </Dialog>
+  );
+}
+
 export function Projects() {
-  const { snapshot, connection, busy, error, mutate } = useMonitoring();
+  const { snapshot, connection, pending, mutate } = useMonitoring();
   const [filter, setFilter] = useState<"attention" | "all">("attention");
   const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
   const [adding, setAdding] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const canAdd = connection === "connected" && !pending.has(actionKeys.addProject);
   const [selectedDependency, setSelectedDependency] = useState<{
     projectId: string;
     dependencyId: string;
   } | null>(null);
   const [allDependencies, setAllDependencies] = useState<Record<string, boolean>>({});
   const projects = snapshot?.projects ?? [];
-  const findings = snapshot?.findings ?? [];
+  const findings = snapshot?.findings ?? noFindings;
   const attentionProjects = projects.filter((project) =>
     projectNeedsAttention(project, findings, snapshot?.scanProgress),
   );
-  const search = query.trim().toLowerCase();
-  const matchesProject = (project: Project) =>
-    (project.name + " " + project.path + " " + project.packageManager)
-      .toLowerCase()
-      .includes(search);
-  const matchesDependency = (item: Dependency) =>
-    (item.name + " " + item.packageName + " " + item.importer + " " + item.origin)
-      .toLowerCase()
-      .includes(search);
+  const search = deferredQuery.trim().toLowerCase();
   const visibleProjects = (filter === "all" ? projects : attentionProjects).filter(
-    (project) => matchesProject(project) || project.dependencies.some(matchesDependency),
+    (project) =>
+      matchesProject(project, search) ||
+      project.dependencies.some((item) => matchesDependency(item, search)),
+  );
+  // Stable per-project lists let each open table keep its memoized rows across polls.
+  const findingsByProject = useMemo(() => {
+    const groups = new Map<string, Finding[]>();
+    for (const finding of findings) {
+      const group = groups.get(finding.subjectId);
+      if (group) group.push(finding);
+      else groups.set(finding.subjectId, [finding]);
+    }
+    return groups;
+  }, [findings]);
+  const projectGroups = useMemo(
+    () => (snapshot ? attentionGroups(snapshot).filter((group) => group.kind === "project") : []),
+    [snapshot],
   );
   const expansion = useGroupExpansion();
+  const setShowAll = useCallback(
+    (projectId: string, showAll: boolean) =>
+      setAllDependencies((previous) => ({ ...previous, [projectId]: showAll })),
+    [],
+  );
+  const clearSearch = useCallback(() => setQuery(""), []);
+  const selectDependency = useCallback(
+    (projectId: string, dependencyId: string) => setSelectedDependency({ projectId, dependencyId }),
+    [],
+  );
   const removing = projects.find((project) => project.id === removingId);
   const selectedProject = projects.find((project) => project.id === selectedDependency?.projectId);
   const dependency = selectedProject?.dependencies.find(
@@ -1129,11 +1693,7 @@ export function Projects() {
       findings.filter((finding) => projectIds.has(finding.subjectId)),
       snapshot?.device.id ?? "",
     ),
-    incomplete: snapshot
-      ? attentionGroups(snapshot)
-          .filter((group) => group.kind === "project")
-          .reduce((total, group) => total + group.counts.incomplete, 0)
-      : 0,
+    incomplete: projectGroups.reduce((total, group) => total + group.counts.incomplete, 0),
   };
   return (
     <>
@@ -1143,12 +1703,7 @@ export function Projects() {
         actions={
           <div className="action-row">
             <ScanButton target="projects" label="Scan projects" />
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={connection !== "connected" || busy}
-              onClick={() => setAdding(true)}
-            >
+            <Button variant="primary" size="sm" disabled={!canAdd} onClick={() => setAdding(true)}>
               <Plus size={14} aria-hidden="true" />
               Add project
             </Button>
@@ -1164,11 +1719,7 @@ export function Projects() {
         <EmptyState
           title="Select your first project"
           action={
-            <Button
-              variant="primary"
-              disabled={connection !== "connected" || busy}
-              onClick={() => setAdding(true)}
-            >
+            <Button variant="primary" disabled={!canAdd} onClick={() => setAdding(true)}>
               Add project
             </Button>
           }
@@ -1214,11 +1765,10 @@ export function Projects() {
           </div>
           <div className="monitoring-summary">
             <span>
-              {visibleProjects.length} of {projects.length} selected projects shown
-            </span>
-            <span>
+              {visibleProjects.length} of {plural(projects.length, "selected project")} shown ·
               Complete projects with no recorded findings remain available in All projects.
             </span>
+            <ExpandCollapseAll ids={visibleProjects.map((item) => item.id)} expansion={expansion} />
           </div>
           {visibleProjects.length === 0 ? (
             <EmptyState
@@ -1246,19 +1796,14 @@ export function Projects() {
           ) : (
             <div className="target-groups">
               {visibleProjects.map((project) => {
-                const projectFindings = findings.filter(
-                  (finding) => finding.subjectId === project.id,
-                );
+                const projectFindings = findingsByProject.get(project.id) ?? noFindings;
                 const projectCounts = findingCounts(projectFindings, snapshot.device.id);
-                const showAll = allDependencies[project.id] === true;
-                const rows = project.dependencies.filter(
-                  (item) =>
-                    (showAll || dependencyNeedsAttention(item, projectFindings)) &&
-                    (matchesProject(project) || matchesDependency(item)),
-                );
                 const queued = snapshot.scanProgress?.queued.some(
                   (target) => target.targetId === project.id,
                 );
+                const scanning =
+                  project.evidence.status === "scanning" ||
+                  snapshot.scanProgress?.active?.targetId === project.id;
                 return (
                   <Collapsible
                     key={project.id}
@@ -1287,12 +1832,28 @@ export function Projects() {
                           </span>
                           <span className="target-group-badges">
                             {projectCounts.updates > 0 && (
-                              <Badge tone="info">{projectCounts.updates} updates</Badge>
+                              <Badge tone="info">
+                                {plural(
+                                  projectCounts.updates,
+                                  "update available",
+                                  "updates available",
+                                )}
+                              </Badge>
                             )}
                             {projectCounts.advisories > 0 && (
-                              <Badge tone="error">{projectCounts.advisories} advisories</Badge>
+                              <Badge
+                                tone={advisoryTone(
+                                  projectFindings.filter((finding) => finding.kind === "advisory"),
+                                )}
+                              >
+                                {plural(projectCounts.advisories, "advisory", "advisories")}
+                              </Badge>
                             )}
                             <EvidenceBadge status={project.evidence.status} />
+                            <StaleBadge
+                              lastSuccess={project.evidence.lastSuccess}
+                              intervalMinutes={snapshot.settings.projectIntervalMinutes}
+                            />
                             {queued && <Badge tone="info">Queued</Badge>}
                             {!projectNeedsAttention(project, findings, snapshot.scanProgress) && (
                               <Badge>No recorded findings</Badge>
@@ -1313,11 +1874,11 @@ export function Projects() {
                           compact
                           target="projects"
                           projectId={project.id}
-                          ariaLabel={"Scan " + project.name}
+                          subject={project.name}
                         />
                       </div>
                     </div>
-                    <CollapsiblePanel className="target-group-panel">
+                    <CollapsiblePanel className="target-group-panel" hiddenUntilFound>
                       <section
                         className="target-group-body project-detail"
                         aria-label={project.name + " project details"}
@@ -1329,7 +1890,10 @@ export function Projects() {
                               label={"Maintenance intent for " + project.name}
                               value={project.mode}
                               items={maintenanceItems}
-                              disabled={connection !== "connected" || busy}
+                              disabled={
+                                connection !== "connected" ||
+                                pending.has(actionKeys.projectMode(project.id))
+                              }
                               onChange={(mode) => {
                                 void mutate(
                                   "/api/projects/" + encodeURIComponent(project.id),
@@ -1337,13 +1901,17 @@ export function Projects() {
                                   decodeProject,
                                   "Maintenance intent saved.",
                                   "PATCH",
+                                  { key: actionKeys.projectMode(project.id) },
                                 );
                               }}
                             />
                             <Button
                               variant="ghost"
                               size="compact"
-                              disabled={connection !== "connected" || busy}
+                              disabled={
+                                connection !== "connected" ||
+                                pending.has(actionKeys.removeProject(project.id))
+                              }
                               onClick={() => setRemovingId(project.id)}
                             >
                               Remove
@@ -1362,168 +1930,37 @@ export function Projects() {
                           </section>
                         )}
                         {project.dependencies.length === 0 ? (
-                          <EmptyState
-                            title={
-                              project.evidence.status === "not-scanned"
-                                ? "This project has not been scanned"
-                                : "No dependency records collected"
-                            }
-                            action={<ScanButton target="projects" projectId={project.id} />}
-                          >
-                            <p>
-                              {project.evidence.status === "not-scanned"
-                                ? "Run a read-only scan to verify access and inspect supported project inputs."
-                                : "Review coverage and errors. Missing or unsupported inputs leave resolved dependency coverage incomplete."}
+                          scanning ? (
+                            <p className="muted" role="status">
+                              Scanning… dependency records appear when this scan finishes.
                             </p>
-                          </EmptyState>
+                          ) : (
+                            <EmptyState
+                              level={3}
+                              title={
+                                project.evidence.status === "not-scanned"
+                                  ? "This project has not been scanned"
+                                  : "No dependency records collected"
+                              }
+                              action={<ScanButton target="projects" projectId={project.id} />}
+                            >
+                              <p>
+                                {project.evidence.status === "not-scanned"
+                                  ? "Run a read-only scan to verify access and inspect supported project inputs."
+                                  : "Review coverage and errors. Missing or unsupported inputs leave resolved dependency coverage incomplete."}
+                              </p>
+                            </EmptyState>
+                          )
                         ) : (
-                          <>
-                            <div className="group-toolbar">
-                              <span>
-                                {rows.length} of {project.dependencies.length} dependency records ·
-                                importer rows retain their own requested ranges
-                              </span>
-                              <div
-                                className="tabs"
-                                role="group"
-                                aria-label={project.name + " dependency visibility"}
-                              >
-                                <Button
-                                  variant={!showAll ? "secondary" : "ghost"}
-                                  size="compact"
-                                  aria-pressed={!showAll}
-                                  onClick={() =>
-                                    setAllDependencies((previous) => ({
-                                      ...previous,
-                                      [project.id]: false,
-                                    }))
-                                  }
-                                >
-                                  Needs attention
-                                </Button>
-                                <Button
-                                  variant={showAll ? "secondary" : "ghost"}
-                                  size="compact"
-                                  aria-pressed={showAll}
-                                  data-testid="dependency-filter-all"
-                                  onClick={() =>
-                                    setAllDependencies((previous) => ({
-                                      ...previous,
-                                      [project.id]: true,
-                                    }))
-                                  }
-                                >
-                                  All dependencies
-                                </Button>
-                              </div>
-                            </div>
-                            {rows.length === 0 ? (
-                              <EmptyState
-                                title={
-                                  search
-                                    ? "No dependencies match this view"
-                                    : "No package findings in collected evidence"
-                                }
-                                action={
-                                  <Button
-                                    onClick={() => {
-                                      setAllDependencies((previous) => ({
-                                        ...previous,
-                                        [project.id]: true,
-                                      }));
-                                      setQuery("");
-                                    }}
-                                  >
-                                    Show all dependencies
-                                  </Button>
-                                }
-                              >
-                                <p>
-                                  Coverage gaps apply to the project independently of package
-                                  findings. Review the scan evidence below.
-                                </p>
-                              </EmptyState>
-                            ) : (
-                              <Table label={project.name + " dependencies"}>
-                                <thead>
-                                  <tr>
-                                    <th scope="col">Dependency / importer</th>
-                                    <th scope="col">Requested</th>
-                                    <th scope="col">Resolved</th>
-                                    <th scope="col">Candidate</th>
-                                    <th scope="col">Origin / role</th>
-                                    <th scope="col">Checks & findings</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {rows.map((item) => (
-                                    <tr key={item.id}>
-                                      <td>
-                                        <div className="package-label">
-                                          <PackageIcon size={14} aria-hidden="true" />
-                                          <button
-                                            className="item-label"
-                                            onClick={() =>
-                                              setSelectedDependency({
-                                                projectId: project.id,
-                                                dependencyId: item.id,
-                                              })
-                                            }
-                                          >
-                                            {item.name}
-                                          </button>
-                                        </div>
-                                        <span className="table-subtext mono">{item.importer}</span>
-                                        {item.packageName !== item.name && (
-                                          <span className="table-subtext mono">
-                                            Alias: {item.packageName}
-                                          </span>
-                                        )}
-                                      </td>
-                                      <td className="mono">{item.requested ?? "Transitive"}</td>
-                                      <td className="mono">{item.resolved ?? "Unknown"}</td>
-                                      <td className="mono">{versionCandidate(item)}</td>
-                                      <td>
-                                        {item.origin}
-                                        <span className="table-subtext">{item.role}</span>
-                                      </td>
-                                      <td>
-                                        <div className="package-checks">
-                                          {(item.availableVersion || item.latestVersion) && (
-                                            <Badge tone="info">
-                                              {item.versionStatus === "checked"
-                                                ? "Update"
-                                                : "Previous update"}
-                                            </Badge>
-                                          )}
-                                          <Badge
-                                            tone={
-                                              item.advisoryIds.length
-                                                ? "error"
-                                                : item.advisoryStatus === "checked"
-                                                  ? "neutral"
-                                                  : "warning"
-                                            }
-                                          >
-                                            {item.advisoryIds.length
-                                              ? item.advisoryIds.length +
-                                                (item.advisoryStatus === "checked"
-                                                  ? " known advisories"
-                                                  : " previous, unverified")
-                                              : item.advisoryStatus === "checked"
-                                                ? "No known matches"
-                                                : item.advisoryStatus === "not-checked"
-                                                  ? "Not checked"
-                                                  : item.advisoryStatus}
-                                          </Badge>
-                                        </div>
-                                      </td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </Table>
-                            )}
-                          </>
+                          <ProjectDependencies
+                            project={project}
+                            findings={projectFindings}
+                            search={search}
+                            showAll={allDependencies[project.id] === true}
+                            setShowAll={setShowAll}
+                            clearSearch={clearSearch}
+                            select={selectDependency}
+                          />
                         )}
                         <details className="group-evidence">
                           <summary>Project inputs, scan evidence & coverage</summary>
@@ -1561,6 +1998,7 @@ export function Projects() {
                             </span>
                           </div>
                           <Evidence
+                            level={3}
                             evidence={project.evidence}
                             inputFingerprint={project.inputFingerprint ?? null}
                           />
@@ -1572,10 +2010,6 @@ export function Projects() {
               })}
             </div>
           )}
-          <p className="monitoring-footnote">
-            Update and advisory summaries combine duplicate importer observations. Dependency rows
-            preserve requested ranges, origins, and resolved versions.
-          </p>
         </>
       )}
       {adding && (
@@ -1589,40 +2023,14 @@ export function Projects() {
         />
       )}
       {removing && (
-        <Dialog title={"Remove " + removing.name + "?"} onClose={() => setRemovingId(null)}>
-          <p>
-            Remove this folder from monitoring. Its source files and installed dependencies will
-            remain untouched.
-          </p>
-          {error && (
-            <p className="error-text" role="alert">
-              {error}
-            </p>
-          )}
-          <div className="form-actions">
-            <Button onClick={() => setRemovingId(null)}>Cancel</Button>
-            <Button
-              variant="danger"
-              disabled={busy || connection !== "connected"}
-              onClick={() => {
-                void mutate(
-                  "/api/projects/" + encodeURIComponent(removing.id),
-                  {},
-                  decodeAcceptedResponse,
-                  "Project removed from monitoring.",
-                  "DELETE",
-                ).then((result) => {
-                  if (result) {
-                    setRemovingId(null);
-                    if (selectedDependency?.projectId === removing.id) setSelectedDependency(null);
-                  }
-                });
-              }}
-            >
-              Remove from monitoring
-            </Button>
-          </div>
-        </Dialog>
+        <RemoveProjectDialog
+          project={removing}
+          close={() => setRemovingId(null)}
+          removed={() => {
+            setRemovingId(null);
+            if (selectedDependency?.projectId === removing.id) setSelectedDependency(null);
+          }}
+        />
       )}
       {dependency && selectedProject && (
         <DependencyDetails
@@ -1635,7 +2043,7 @@ export function Projects() {
   );
 }
 export function Service() {
-  const { snapshot, connection, busy, refreshing, refresh, mutate } = useMonitoring();
+  const { snapshot, connection, pending, refreshing, refresh, mutate } = useMonitoring();
   if (!snapshot)
     return (
       <>
@@ -1663,12 +2071,18 @@ export function Service() {
     );
   const settings = snapshot.settings;
   const connected = connection === "connected";
-  const boot = snapshot.runtime.host === "boot-task";
-  const pending = snapshot.notifications.filter((item) => !item.deliveredAt);
+  const undelivered = snapshot.notifications.filter((item) => !item.deliveredAt);
   const summary = snapshot.notificationSummary;
-  const changeSettings = (body: unknown, message: string) => {
-    void mutate("/api/settings", body, decodeMonitoringSettings, message, "PATCH");
+  // Each setting waits only for its own save, so changing one never holds back another.
+  const changeSetting = (field: string, value: boolean | number, message: string) => {
+    void mutate("/api/settings", { [field]: value }, decodeMonitoringSettings, message, "PATCH", {
+      key: actionKeys.setting(field),
+    });
   };
+  const unavailable = (field: string) => !connected || pending.has(actionKeys.setting(field));
+  // The host's platform decides what startup and sign-out can mean; only the desktop has a tray.
+  const platform = snapshot.runtime.platform;
+  const setup = backgroundSetup(platform);
   return (
     <>
       <PageHeading
@@ -1677,10 +2091,11 @@ export function Service() {
         actions={
           <>
             <Button
-              disabled={!connected || busy}
+              disabled={unavailable("paused")}
               onClick={() =>
-                changeSettings(
-                  { paused: !settings.paused },
+                changeSetting(
+                  "paused",
+                  !settings.paused,
                   settings.paused
                     ? "Scheduled scans resumed."
                     : "Scheduled scans paused. The coordinator remains running.",
@@ -1707,70 +2122,30 @@ export function Service() {
           </p>
         </div>
         <Badge tone={connected ? "success" : "warning"}>
-          {connected ? "UI connected" : "UI disconnected"}
+          {connected ? "Connected" : "Disconnected"}
         </Badge>
       </section>
       <div className="settings-grid">
         <section className="settings-section">
           <h2>Lifecycle & access</h2>
-          <div className="setting-row">
-            <div>
-              <h3>Windows boot</h3>
-              <p>
-                {boot
-                  ? "Connected to the Windows boot-task host. Verify reboot and sign-out behavior before relying on unattended coverage."
-                  : "Startup registration has not been confirmed. This coordinator currently belongs to the signed-in session."}
-              </p>
-            </div>
-            <Badge tone={boot ? "info" : "warning"}>{boot ? "Boot host" : "Setup required"}</Badge>
-          </div>
-          <div className="setting-row">
-            <div>
-              <h3>When the window closes</h3>
-              <p>
-                Electron remains in the system tray. Reopen the app or pause schedules from its tray
-                menu.
-              </p>
-            </div>
-            <Badge tone="neutral">Tray</Badge>
-          </div>
-          <div className="setting-row">
-            <div>
-              <h3>After Windows sign-out</h3>
-              <p>
-                {boot
-                  ? "The independent boot host is designed to continue collecting accessible sources after sign-out. Folder access and session-dependent sources still need verification."
-                  : "A tray process cannot survive sign-out. Configure the Windows background host to enable monitoring outside your signed-in session."}
-              </p>
-            </div>
-            <Badge tone={boot ? "info" : "warning"}>
-              {boot ? "Verify access" : "Not configured"}
-            </Badge>
-          </div>
-          <div className="setting-row">
-            <div>
-              <h3>Account and folder coverage</h3>
-              <p>
-                The desktop saves the owner's npm and Bun global locations for the boot host.
-                Inaccessible folders and unverified package origins produce explicit coverage
-                errors.
-              </p>
-            </div>
-          </div>
-          <p className="settings-note">
-            Startup registration requires the Windows setup command in the development
-            documentation. Pausing schedules keeps the coordinator running; it does not remove
-            startup registration. A sleeping or powered-off PC cannot scan.
-          </p>
-          {snapshot.runtime.platform === "win32" && (
+          {lifecycleRows(platform, snapshot.runtime.host, Boolean(window.versionstead)).map(
+            (row) => (
+              <div className="setting-row" key={row.title}>
+                <div>
+                  <h3>{row.title}</h3>
+                  <p>{row.text}</p>
+                </div>
+                {row.badge && <Badge tone={row.badge.tone}>{row.badge.label}</Badge>}
+              </div>
+            ),
+          )}
+          <p className="settings-note">{lifecycleNote(platform)}</p>
+          {setup && (
             <details className="startup-help">
-              <summary>Windows startup setup</summary>
-              <p>From the Versionstead project folder, run this in an administrator PowerShell:</p>
-              <code>.\scripts\windows-background.ps1 -Action Install</code>
-              <p>
-                Use the documented ProjectRoots option to grant read access to selected folders.
-                Verify boot, sign-out, and source coverage after setup.
-              </p>
+              <summary>{setup.summary}</summary>
+              <p>{setup.intro}</p>
+              <CommandBlock className="mt-2.5" command={setup.command} label={setup.label} />
+              <p>{setup.note}</p>
             </details>
           )}
         </section>
@@ -1785,10 +2160,10 @@ export function Service() {
               <SelectControl
                 label="PC scan interval"
                 value={String(settings.pcIntervalMinutes)}
-                disabled={!connected || busy}
+                disabled={unavailable("pcIntervalMinutes")}
                 items={intervalOptions([15, 60, 360, 720, 1440, settings.pcIntervalMinutes])}
                 onChange={(value) =>
-                  changeSettings({ pcIntervalMinutes: Number(value) }, "PC scan interval saved.")
+                  changeSetting("pcIntervalMinutes", Number(value), "PC scan interval saved.")
                 }
               />
             </div>
@@ -1800,11 +2175,12 @@ export function Service() {
               <SelectControl
                 label="Project scan interval"
                 value={String(settings.projectIntervalMinutes)}
-                disabled={!connected || busy}
+                disabled={unavailable("projectIntervalMinutes")}
                 items={intervalOptions([15, 60, 360, 1440, settings.projectIntervalMinutes])}
                 onChange={(value) =>
-                  changeSettings(
-                    { projectIntervalMinutes: Number(value) },
+                  changeSetting(
+                    "projectIntervalMinutes",
+                    Number(value),
                     "Project scan interval saved.",
                   )
                 }
@@ -1835,17 +2211,12 @@ export function Service() {
                   during a five-minute cooldown.
                 </p>
               </div>
-              <button
-                className="switch"
-                role="switch"
-                aria-checked={settings.notifyNewFindings}
+              <Switch
                 aria-label="Notify on new findings"
-                disabled={!connected || busy}
-                onClick={() =>
-                  changeSettings(
-                    { notifyNewFindings: !settings.notifyNewFindings },
-                    "Notification preference saved.",
-                  )
+                checked={settings.notifyNewFindings}
+                disabled={unavailable("notifyNewFindings")}
+                onCheckedChange={(value) =>
+                  changeSetting("notifyNewFindings", value, "Notification preference saved.")
                 }
               />
             </div>
@@ -1854,8 +2225,8 @@ export function Service() {
                 <h3>Waiting for delivery</h3>
                 <p>
                   {summary
-                    ? `${summary.updateCount} updates and ${summary.advisoryCount} advisory findings are ready to review.`
-                    : pending.length
+                    ? `${plural(summary.updateCount, "update")} and ${plural(summary.advisoryCount, "advisory finding")} are ready to review.`
+                    : undelivered.length
                       ? "New findings are being combined into the next summary."
                       : "No new findings are waiting."}
                 </p>
@@ -1863,8 +2234,8 @@ export function Service() {
                   <p>Next eligible summary: {timestamp(snapshot.notificationNextAt)}</p>
                 )}
               </div>
-              <Badge tone={pending.length ? "info" : "neutral"}>
-                {pending.length ? "1 summary pending" : "None pending"}
+              <Badge tone={undelivered.length ? "info" : "neutral"}>
+                {undelivered.length ? "1 summary pending" : "None pending"}
               </Badge>
             </div>
             <p className="settings-note">
@@ -1877,7 +2248,7 @@ export function Service() {
       <section className="history">
         <div className="section-head">
           <h2>Scan history</h2>
-          <span className="small muted">{snapshot.history.length} recorded attempts</span>
+          <span className="small muted">{plural(snapshot.history.length, "recorded attempt")}</span>
         </div>
         {snapshot.history.length === 0 ? (
           <p className="muted">No scans have been attempted yet.</p>
@@ -1896,7 +2267,9 @@ export function Service() {
                 <tr key={scan.id}>
                   <td>
                     {scan.targetLabel}
-                    <span className="table-subtext">{scan.kind}</span>
+                    <span className="table-subtext">
+                      {scan.kind === "pc" ? "This PC" : "Project"}
+                    </span>
                   </td>
                   <td>
                     {timestamp(scan.startedAt)}

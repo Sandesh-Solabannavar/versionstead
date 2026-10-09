@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  applicationMenu,
   defaultWindowPreferences,
   initialWindowBounds,
   loadWindowPreferences,
@@ -22,6 +23,50 @@ test("native caption controls follow the theme and leave macOS traffic lights na
   assert.equal(decodeWindowTheme("system"), "system");
   for (const invalid of [null, {}, "Dark", "javascript:alert(1)"])
     assert.throws(() => decodeWindowTheme(invalid));
+});
+
+test("the application menu keeps editing, zoom and close shortcuts without reload or devtools", () => {
+  const shape = (menu) =>
+    menu.map(
+      (item) =>
+        item.role ??
+        `${item.label}: ${item.submenu.map((child) => child.role ?? child.type).join(" ")}`,
+    );
+  // The standard View menu without Reload, Force Reload or Toggle Developer Tools.
+  const view = "View: resetZoom zoomIn zoomOut separator togglefullscreen";
+  // Window (Windows/Linux) and File (macOS) carry Close, the Ctrl/Cmd+W hide-to-tray shortcut.
+  for (const platform of ["win32", "linux"]) {
+    assert.deepEqual(shape(applicationMenu(platform, false)), ["editMenu", view, "windowMenu"]);
+    assert.deepEqual(shape(applicationMenu(platform, true)), [
+      "editMenu",
+      "viewMenu",
+      "windowMenu",
+    ]);
+  }
+  assert.deepEqual(shape(applicationMenu("darwin", false)), [
+    "appMenu",
+    "fileMenu",
+    "editMenu",
+    view,
+    "windowMenu",
+  ]);
+  assert.deepEqual(shape(applicationMenu("darwin", true)), [
+    "appMenu",
+    "fileMenu",
+    "editMenu",
+    "viewMenu",
+    "windowMenu",
+  ]);
+  const previous = process.env.VERSIONSTEAD_DEVTOOLS;
+  try {
+    process.env.VERSIONSTEAD_DEVTOOLS = "1";
+    assert.deepEqual(shape(applicationMenu("win32")), ["editMenu", "viewMenu", "windowMenu"]);
+    process.env.VERSIONSTEAD_DEVTOOLS = "true";
+    assert.deepEqual(shape(applicationMenu("win32")), ["editMenu", view, "windowMenu"]);
+  } finally {
+    if (previous === undefined) delete process.env.VERSIONSTEAD_DEVTOOLS;
+    else process.env.VERSIONSTEAD_DEVTOOLS = previous;
+  }
 });
 
 test("restore saved windows only when the entire normal bounds fit a connected display", () => {

@@ -2,14 +2,18 @@ import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { validateProjectChanges } from "@versionstead/contracts/project-settings";
 import {
+  decodeMonitoringProgress,
+  decodeMonitoringSnapshot,
   type ActiveScan,
   type Finding,
   type GlobalToolSource,
+  type MonitoringProgress,
   type MonitoringSettings,
   type MonitoringSnapshot,
   type NotificationSummary,
   type Project,
   type ScanEvidence,
+  type ScanProgress,
   type ScanRecord,
   type ScanTarget,
 } from "@versionstead/contracts/monitoring";
@@ -25,6 +29,7 @@ import {
 import { inspectInventory, validateGlobalToolSources } from "./adapters/inventory.ts";
 import { checkNativeVersions } from "./adapters/outdated.ts";
 import {
+  createSourceCache,
   lookupDependencies,
   type DependencyLookup,
   type LookupResult,
@@ -37,6 +42,8 @@ type Mutable<T> = T extends readonly (infer U)[]
     ? { -readonly [K in keyof T]: Mutable<T[K]> }
     : T;
 const timestamp = () => new Date().toISOString();
+const features = "settings-repositories-connections-v9" as const;
+const evidenceNotSaved = "Evidence could not be saved; the previous saved evidence is retained.";
 const emptyEvidence = (): Mutable<ScanEvidence> => ({
   status: "not-scanned",
   lastAttempt: null,
@@ -57,8 +64,8 @@ export type MonitoringOptions = {
 };
 
 export class MonitoringCoordinator {
-  private projectInspection = (project: Project, _signal?: AbortSignal) =>
-    inspectProject(project.path);
+  private projectInspection = (project: Project, signal?: AbortSignal) =>
+    inspectProject(project.path, signal);
   private automaticProjectAllowed = (_project: Project) => true;
   private readonly storage: MonitoringStorage;
   private state: Mutable<MonitoringSnapshot>;
@@ -66,6 +73,7 @@ export class MonitoringCoordinator {
   private notified: Set<string>;
   private readonly queue = new Map<string, boolean>();
   private active: string | null = null;
+  private activeScan: AbortController | null = null;
   private worker: Promise<void> | null = null;
   private readonly timer: ReturnType<typeof setInterval>;
   private closed = false;
@@ -73,6 +81,10 @@ export class MonitoringCoordinator {
   private readonly inventoryLookup: typeof inspectInventory;
   private readonly shutdown = new AbortController();
   private progress: Mutable<ActiveScan> | null = null;
+  // A random boot id keeps revisions of different instances on one database distinct.
+  private readonly bootId = randomUUID();
+  private changes = 0;
+  private stable: { revision: string; json: string } | null = null;
   private settledAt = Date.now();
   private readonly summaries: {
     summary: NotificationSummary;
@@ -88,6 +100,8 @@ export class MonitoringCoordinator {
       options.nativeVersionLookup === false
         ? null
         : (options.nativeVersionLookup ?? checkNativeVersions);
+    // Every project and This PC scan of this coordinator shares one cache of public metadata.
+    const sources = createSourceCache();
     this.lookup =
       options.lookup === false
         ? null
@@ -109,8 +123,12 @@ export class MonitoringCoordinator {
                         onProgress?.({ stage: "native-versions", completed, total }),
                     )
                 : undefined,
+              sources,
             )));
-    this.inventoryLookup = options.inventoryLookup ?? inspectInventory;
+    this.inventoryLookup =
+      options.inventoryLookup ??
+      ((scanPlatform, mode, signal, progress, previous) =>
+        inspectInventory(scanPlatform, mode, signal, progress, previous, sources));
     this.state = stored
       ? (structuredClone(stored.snapshot) as Mutable<MonitoringSnapshot>)
       : {
@@ -209,26 +227,44 @@ export class MonitoringCoordinator {
     this.updateNextDue();
     return structuredClone({
       ...this.state,
-      features: "settings-repositories-connections-v6" as const,
-      scanProgress: {
-        active: this.progress,
-        queued: [...this.queue.keys()].flatMap<ScanTarget>((id) => {
-          const project = this.state.projects.find((p) => p.id === id);
-          return id === "pc"
-            ? [
-                {
-                  targetId: this.state.device.id,
-                  targetLabel: this.state.device.label,
-                  kind: "pc" as const,
-                },
-              ]
-            : project
-              ? [{ targetId: project.id, targetLabel: project.name, kind: "project" as const }]
-              : [];
-        }),
-      },
+      features,
+      scanProgress: this.scanProgress(),
       notificationSummary: this.prepareNotificationSummary(),
     });
+  }
+
+  /** Changes with every durable change; live progress and notification summaries are excluded. */
+  get revision() {
+    return `${this.bootId}-${this.changes}`;
+  }
+  get mode() {
+    return this.state.runtime.mode;
+  }
+  get device(): MonitoringSnapshot["device"] {
+    return { ...this.state.device };
+  }
+
+  /** Validated live fields; computed per request because summaries freeze when presented. */
+  progressSnapshot(): MonitoringProgress {
+    return decodeMonitoringProgress({
+      revision: this.revision,
+      settings: this.state.settings,
+      scanProgress: this.scanProgress(),
+      notificationSummary: this.prepareNotificationSummary(),
+      notificationNextAt: this.state.notificationNextAt ?? null,
+    });
+  }
+
+  /** The validated snapshot as JSON; its stable part is validated and serialized once per revision. */
+  snapshotJson(): string {
+    const revision = this.revision;
+    if (this.stable?.revision !== revision)
+      this.stable = {
+        revision,
+        json: JSON.stringify(decodeMonitoringSnapshot({ ...this.state, features })),
+      };
+    const { scanProgress, notificationSummary } = this.progressSnapshot();
+    return `${this.stable.json.slice(0, -1)},"scanProgress":${JSON.stringify(scanProgress)},"notificationSummary":${JSON.stringify(notificationSummary)}}`;
   }
 
   configureProjectInspection(
@@ -237,12 +273,16 @@ export class MonitoringCoordinator {
   ) {
     this.projectInspection = inspect;
     this.automaticProjectAllowed = automatic;
+    this.updateNextDue();
   }
 
   readApplication(): unknown {
     return this.storage.readApplication();
   }
   writeApplication(value: unknown) {
+    // Application preferences decide which repositories scan automatically, so a change to them
+    // can move nextScanAt.
+    this.updateNextDue();
     this.storage.writeApplication(value);
   }
 
@@ -349,6 +389,7 @@ export class MonitoringCoordinator {
     this.state.notifications = this.state.notifications.filter((n) => !removed.has(n.findingId));
     this.queue.delete(id);
     delete this.due[id];
+    if (this.active === id) this.activeScan?.abort();
     this.persist();
   }
 
@@ -468,27 +509,50 @@ export class MonitoringCoordinator {
   private nextDue(evidence: ScanEvidence, interval: number) {
     return evidence.lastAttempt ? Date.parse(evidence.lastAttempt) + interval * 60000 : Date.now();
   }
+  // Due entries of removed projects or projects without automatic scans are stale.
+  private scansAutomatically(id: string) {
+    const project = this.state.projects.find((p) => p.id === id);
+    return id === "pc" || (project !== undefined && this.automaticProjectAllowed(project));
+  }
   private updateNextDue() {
-    const values = Object.values(this.due);
-    this.state.runtime.nextScanAt =
+    const values = Object.entries(this.due)
+      .filter(([id]) => this.scansAutomatically(id))
+      .map(([, due]) => due);
+    const next =
       this.state.settings.paused || !values.length
         ? null
         : new Date(Math.min(...values)).toISOString();
+    // nextScanAt is in the cached snapshot; eligibility can change it outside persist().
+    if (next !== this.state.runtime.nextScanAt) this.changes += 1;
+    this.state.runtime.nextScanAt = next;
   }
   private persist() {
+    // Advance before writing: memory already holds the change even if the write fails.
+    this.changes += 1;
     this.updateNextDue();
     this.storage.write({ snapshot: this.state, due: this.due, notified: [...this.notified] });
   }
+  private scanProgress(): ScanProgress {
+    return {
+      active: this.progress,
+      queued: [...this.queue.keys()].flatMap<ScanTarget>((id) => {
+        const project = this.state.projects.find((p) => p.id === id);
+        return id === "pc"
+          ? [{ targetId: this.state.device.id, targetLabel: this.state.device.label, kind: "pc" }]
+          : project
+            ? [{ targetId: project.id, targetLabel: project.name, kind: "project" }]
+            : [];
+      }),
+    };
+  }
   private enqueue(id: string, manual = false) {
-    if (id !== this.active) this.queue.set(id, manual || this.queue.get(id) === true);
+    // An owner's request for the target now scanning runs again afterwards; scheduled ones do not.
+    if (id !== this.active || manual) this.queue.set(id, manual || this.queue.get(id) === true);
   }
   private schedule() {
     if (this.closed || this.state.settings.paused) return;
-    for (const [id, due] of Object.entries(this.due)) {
-      const project = this.state.projects.find((p) => p.id === id);
-      if (due <= Date.now() && (!project || this.automaticProjectAllowed(project)))
-        this.enqueue(id);
-    }
+    for (const [id, due] of Object.entries(this.due))
+      if (due <= Date.now() && this.scansAutomatically(id)) this.enqueue(id);
     this.runQueue();
   }
   private runQueue() {
@@ -508,18 +572,27 @@ export class MonitoringCoordinator {
         await this.scan(id);
         this.active = null;
       }
-    })().finally(() => {
-      this.worker = null;
-      this.active = null;
-      this.progress = null;
-      this.settledAt = Date.now();
-    });
+    })()
+      // scan() records its own failures on the attempt; nothing may reject the unobserved worker.
+      .catch(() => {})
+      .finally(() => {
+        this.worker = null;
+        this.active = null;
+        this.progress = null;
+        this.settledAt = Date.now();
+        // A request made while this worker was finishing would otherwise stay queued until
+        // something else starts a worker.
+        this.runQueue();
+      });
   }
 
   private async scan(id: string) {
     const project = id === "pc" ? null : this.state.projects.find((p) => p.id === id);
     if (id !== "pc" && !project) return;
     const evidence = project?.evidence ?? this.state.inventory.evidence;
+    // Removing a project aborts its own scan, leaving shutdown and other scans untouched.
+    this.activeScan = new AbortController();
+    const signal = AbortSignal.any([this.shutdown.signal, this.activeScan.signal]);
     const attempt: Mutable<ScanRecord> = {
       id: randomUUID(),
       targetId: project?.id ?? this.state.device.id,
@@ -557,15 +630,24 @@ export class MonitoringCoordinator {
         ? this.state.settings.projectIntervalMinutes
         : this.state.settings.pcIntervalMinutes) *
         60000;
-    this.persist();
+    // A storage failure fails this attempt instead of throwing out of the worker.
+    // ponytail: due is advanced before this write, so a transient failure costs one automatic
+    // cycle; restore the previous due on start failure if that matters.
+    let saved = true;
+    try {
+      this.persist();
+    } catch {
+      saved = false;
+    }
     let findings: Finding[] = [];
     let freshUpdates = false;
     let freshAdvisories = false;
     let retainedFindingIds: Set<string> | null = null;
     let inventoryStatus: "complete" | "partial" | "failed" | null = null;
     try {
+      if (!saved) throw new InputError(evidenceNotSaved);
       if (project) {
-        const inputs = await this.projectInspection(project, this.shutdown.signal);
+        const inputs = await this.projectInspection(project, signal);
         attempt.inputFingerprint = inputs.inputFingerprint;
         let lookedUp: LookupResult = {
           dependencies: inputs.dependencies,
@@ -576,7 +658,7 @@ export class MonitoringCoordinator {
         if (this.lookup)
           lookedUp = await this.lookup(
             inputs.dependencies,
-            this.shutdown.signal,
+            signal,
             (progress) => this.reportProgress(progress),
             !project.repository && this.state.runtime.mode === "interactive"
               ? { root: project.path, packageManager: inputs.packageManager }
@@ -719,7 +801,7 @@ export class MonitoringCoordinator {
         const inventory = await this.inventoryLookup(
           this.state.runtime.platform as NodeJS.Platform,
           this.state.runtime.mode,
-          this.shutdown.signal,
+          signal,
           (progress) => this.reportProgress(progress),
           this.state.inventory.managers,
         );
@@ -828,6 +910,11 @@ export class MonitoringCoordinator {
       }
     } finally {
       this.reportProgress({ stage: "saving", completed: null, total: null });
+      // However the scan ended (early return, adapter abort error), a removal is its outcome.
+      if (project && !this.state.projects.some((p) => p.id === id)) {
+        attempt.status = "failed";
+        attempt.errors = ["The project was removed during this scan."];
+      }
       attempt.finishedAt = timestamp();
       evidence.status = attempt.status;
       evidence.errors = [...attempt.errors];
@@ -861,7 +948,23 @@ export class MonitoringCoordinator {
           );
         this.mergeFindings(subjectId, [...retained, ...findings]);
       }
-      this.persist();
+      try {
+        this.persist();
+      } catch {
+        // Memory stays current, but a restart reloads the last successful write.
+        if (!attempt.errors.includes(evidenceNotSaved))
+          attempt.errors = [...attempt.errors, evidenceNotSaved];
+        if (attempt.status === "complete") attempt.status = "partial";
+        evidence.status = attempt.status;
+        evidence.errors = [...attempt.errors];
+        if (!project) {
+          // PC update checks are unsaved too; a failed check stays failed.
+          const updates = this.state.inventory.updateEvidence!;
+          if (updates.status === "complete") updates.status = "partial";
+          if (!updates.errors.includes(evidenceNotSaved))
+            updates.errors = [...updates.errors, evidenceNotSaved];
+        }
+      }
     }
   }
 
@@ -905,13 +1008,10 @@ export class MonitoringCoordinator {
     ];
     for (const finding of deduped) {
       // Coverage failures are visible in the app; only new actionable package findings produce notifications.
-      if (
-        finding.kind === "coverage" ||
-        this.notified.has(finding.id) ||
-        !this.state.settings.notifyNewFindings
-      )
-        continue;
+      if (finding.kind === "coverage" || this.notified.has(finding.id)) continue;
+      // Recorded even while notifications are off, so enabling them later announces only newer findings.
       this.notified.add(finding.id);
+      if (!this.state.settings.notifyNewFindings) continue;
       this.state.notifications.push({
         id: randomUUID(),
         findingId: finding.id,
@@ -930,6 +1030,8 @@ export class MonitoringCoordinator {
 
   private pruneNotifications() {
     const current = new Set(this.state.findings.map((f) => f.id));
+    // Only current findings need remembering as already announced.
+    this.notified = new Set([...this.notified].filter((id) => current.has(id)));
     // Obsolete pending fingerprints must not produce a toast after a newer result resolves them.
     const pending = this.state.notifications.filter(
       (n) => n.deliveredAt === null && current.has(n.findingId),
@@ -1000,7 +1102,7 @@ export class MonitoringCoordinator {
       pcCount,
       advisoryCount: advisories.length,
       newAdvisoryCount: newAdvisories.length,
-      title: newUpdates.length ? updateTitle : advisoryTitle,
+      title: newAdvisories.length ? advisoryTitle : updateTitle,
       body: [
         newUpdates.length
           ? `${newUpdates.length} newly detected update${newUpdates.length === 1 ? "" : "s"}.`

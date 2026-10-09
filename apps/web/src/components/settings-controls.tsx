@@ -18,7 +18,7 @@ export function SettingRow({
   searchable = true,
 }: {
   label: string;
-  description: string;
+  description: ReactNode;
   children: ReactNode;
   mark?: ReactNode;
   version?: string | null;

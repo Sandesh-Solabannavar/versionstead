@@ -1,16 +1,31 @@
 import { execFile } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { chmod, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as Schema from "effect/Schema";
+import { InputError } from "./adapters/projects.ts";
+import {
+  deleteFromKeychain,
+  isKeychainReference,
+  keychainIssue,
+  readFromKeychain,
+  storeInKeychain,
+  type CredentialOptions,
+} from "./adapters/keychain.ts";
 
+export { CredentialStorageUnavailable } from "./adapters/keychain.ts";
+
+// The only frontend origin a development coordinator accepts besides its own.
+export const DEV_ORIGIN = "http://127.0.0.1:4317";
 const RuntimeFile = Schema.Struct({
   origin: Schema.String,
   pid: Schema.Number,
   mode: Schema.Literals(["interactive", "background"]),
   host: Schema.Literals(["session", "boot-task", "unconfigured"]),
+  // Absent in descriptors written by older coordinators.
+  devOrigin: Schema.optional(Schema.String),
   protection: Schema.Literals(["dpapi-machine", "private-file"]),
   protectedToken: Schema.String,
 });
@@ -21,13 +36,31 @@ export type CoordinatorRuntime = Omit<RuntimeFile, "protection" | "protectedToke
 const decodeRuntime = Schema.decodeUnknownSync(RuntimeFile);
 let cachedRuntime: { dataDir: string; contents: string; runtime: CoordinatorRuntime } | undefined;
 
-export function resolveDataDir(): string {
-  const override = process.env.VERSIONSTEAD_DATA_DIR;
+export const DATABASE_FILE = "monitoring.sqlite";
+
+export function resolveDataDir(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home = homedir(),
+): string {
+  const override = env.VERSIONSTEAD_DATA_DIR;
   if (override) {
     if (!isAbsolute(override)) throw new Error("VERSIONSTEAD_DATA_DIR must be absolute");
     return resolve(override);
   }
-  return join(process.env.LOCALAPPDATA ?? join(homedir(), ".local", "share"), "Versionstead");
+  const share = join(home, ".local", "share");
+  if (platform === "win32") return join(env.LOCALAPPDATA ?? share, "Versionstead");
+  const xdg = env.XDG_DATA_HOME;
+  const current =
+    platform === "darwin"
+      ? join(home, "Library", "Application Support", "Versionstead")
+      : join(xdg && isAbsolute(xdg) ? xdg : share, "Versionstead");
+  // Earlier builds kept their macOS and Linux data in ~/.local/share/Versionstead (Windows used
+  // %LOCALAPPDATA%\Versionstead and still does). Only a database counts as data: Electron creates its own
+  // profile in the macOS folder on every launch, which must not strand it.
+  const legacy = join(share, "Versionstead");
+  const holdsDatabase = (directory: string) => existsSync(join(directory, DATABASE_FILE));
+  return !holdsDatabase(current) && holdsDatabase(legacy) ? legacy : current;
 }
 
 // The database lock is released by the OS on a crash; stale PID files cannot split the writer.
@@ -87,16 +120,56 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
   });
 }
 
-export async function protectSecret(value: string): Promise<string> {
-  if (process.platform !== "win32")
-    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
-  return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+const keychainPlatform = (options: CredentialOptions) => {
+  const platform = options.platform ?? process.platform;
+  return platform === "darwin" || platform === "linux";
+};
+
+/**
+ * Windows protects a secret with machine-scope DPAPI and returns the blob. macOS and Linux keep it in
+ * the OS keychain under a random handle namespaced by the monitoring database and return a
+ * `keychain:v1:` reference; the keychain adapter refuses any other platform. Either result is what
+ * SQLite stores.
+ */
+export async function protectSecret(
+  value: string,
+  options: CredentialOptions & { namespace?: string } = {},
+): Promise<string> {
+  if ((options.platform ?? process.platform) === "win32")
+    return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  return storeInKeychain(value, options.namespace ?? "versionstead", options);
 }
 
-export async function unprotectSecret(value: string): Promise<string> {
-  if (process.platform !== "win32")
-    throw new Error("OS-backed connection credentials are currently supported on Windows only.");
-  return Buffer.from(await dpapi(value, "Unprotect"), "base64").toString("utf8");
+export async function unprotectSecret(
+  reference: string,
+  options: CredentialOptions = {},
+): Promise<string> {
+  if (isKeychainReference(reference)) {
+    if (!keychainPlatform(options))
+      throw new InputError(
+        "This credential is in a macOS or Linux keychain. Reconnect it on this host.",
+      );
+    return readFromKeychain(reference, options);
+  }
+  if ((options.platform ?? process.platform) !== "win32")
+    throw new InputError(
+      "This credential was protected by Windows on another host. Reconnect it here.",
+    );
+  return Buffer.from(await dpapi(reference, "Unprotect"), "base64").toString("utf8");
+}
+
+/**
+ * Deletes a keychain item; a DPAPI blob lives only in SQLite and leaves with its record, and another
+ * host's keychain is out of reach. A locked or missing store throws rather than passing for deleted.
+ */
+export async function discardSecret(reference: string, options: CredentialOptions = {}) {
+  if (isKeychainReference(reference) && keychainPlatform(options))
+    await deleteFromKeychain(reference, options);
+}
+
+/** Null when this host can keep protected credentials; otherwise what is missing and how to get it. */
+export async function credentialStorageIssue(options: CredentialOptions = {}) {
+  return (options.platform ?? process.platform) === "win32" ? null : keychainIssue(options);
 }
 
 function validateDescriptor(runtime: RuntimeFile): void {
@@ -109,6 +182,7 @@ function validateDescriptor(runtime: RuntimeFile): void {
     url.hash ||
     url.username ||
     url.password ||
+    (runtime.devOrigin !== undefined && runtime.devOrigin !== DEV_ORIGIN) ||
     !Number.isSafeInteger(runtime.pid) ||
     runtime.pid < 1 ||
     runtime.protectedToken.length > 8192
@@ -139,6 +213,7 @@ export async function readRuntime(dataDir: string): Promise<CoordinatorRuntime |
       pid: runtime.pid,
       mode: runtime.mode,
       host: runtime.host,
+      ...(runtime.devOrigin ? { devOrigin: runtime.devOrigin } : {}),
       token,
     };
     cachedRuntime = { dataDir, contents, runtime: result };
@@ -155,6 +230,7 @@ export async function writeRuntime(dataDir: string, runtime: CoordinatorRuntime)
     pid: runtime.pid,
     mode: runtime.mode,
     host: runtime.host,
+    ...(runtime.devOrigin ? { devOrigin: runtime.devOrigin } : {}),
     protection: process.platform === "win32" ? "dpapi-machine" : "private-file",
     protectedToken: process.platform === "win32" ? await dpapi(encoded, "Protect") : encoded,
   });

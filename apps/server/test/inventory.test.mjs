@@ -10,6 +10,7 @@ import {
   inspectGlobalSources,
   validateGlobalToolSources,
 } from "../dist/adapters/inventory.js";
+import { createSourceCache } from "../dist/adapters/lookups.js";
 
 const checkedAt = "2026-10-02T10:00:00.000Z";
 test("Bun roots follow explicit config and environment precedence without listing a parent project", () => {
@@ -217,8 +218,13 @@ test("all global names are checked with bounded concurrency despite individual s
         active--;
       }
     },
+    createSourceCache(async () => {}),
   );
-  assert.deepEqual(calls.sort(), names);
+  assert.deepEqual(
+    calls.sort(),
+    [...names, "tool-010"].sort(),
+    "Every name once, and the unavailable one retried once",
+  );
   assert.equal(peak, 4);
   assert.equal(result.inventoryChecks, "complete");
   assert.equal(result.updateChecks, "partial");
@@ -376,33 +382,15 @@ test("owner source boundary validates both managers, local roots, versions and b
 });
 
 test("manager discovery reports independent not-installed results without constrained executables", async () => {
-  const names = [
-    "PATH",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "USERPROFILE",
-    "BUN_INSTALL",
-    "VOLTA_HOME",
-    "PNPM_HOME",
-    "ProgramFiles",
-  ];
-  const original = new Map(names.map((name) => [name, process.env[name]]));
-  try {
-    for (const name of names) delete process.env[name];
-    const sources = await discoverGlobalToolSources();
-    assert.deepEqual(
-      sources.map(({ manager, status, root, version }) => ({ manager, status, root, version })),
-      ["npm", "bun"].map((manager) => ({
-        manager,
-        status: "not-installed",
-        root: null,
-        version: null,
-      })),
-    );
-  } finally {
-    for (const [name, value] of original) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-  }
+  // The platform fallbacks (Homebrew, /usr/local/bin, ...) can hold real tools on this host: search nowhere.
+  const sources = await discoverGlobalToolSources(undefined, [], []);
+  assert.deepEqual(
+    sources.map(({ manager, status, root, version }) => ({ manager, status, root, version })),
+    ["npm", "bun"].map((manager) => ({
+      manager,
+      status: "not-installed",
+      root: null,
+      version: null,
+    })),
+  );
 });

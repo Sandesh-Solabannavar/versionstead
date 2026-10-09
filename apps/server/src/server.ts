@@ -1,7 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
-import { readFile } from "node:fs/promises";
-import { extname, join } from "node:path";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { decodeStatus } from "@versionstead/contracts/status";
@@ -19,6 +17,7 @@ import {
 import { InputError, type MonitoringCoordinator } from "./monitoring.ts";
 import { getStatus } from "./status.ts";
 import { ApplicationService } from "./application.ts";
+import { readWebFile, responseHeaders } from "./web-files.ts";
 import {
   ConnectProvider,
   ChangeProvider,
@@ -31,17 +30,11 @@ import {
   ComputerAction,
   ProviderKind,
   decodeApplicationSnapshot,
+  decodeComputerSnapshot,
   decodeRepositoryList,
   decodeInvitation,
 } from "@versionstead/contracts/application";
 
-const contentTypes: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".svg": "image/svg+xml",
-  ".woff2": "font/woff2",
-};
 class HttpError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -111,13 +104,7 @@ export async function startServer(
     options.application ??
     (options.monitoring ? await ApplicationService.create(options.monitoring) : null);
   const server = createServer({ maxHeaderSize: 16 * 1024 }, async (request, response) => {
-    response.setHeader("X-Content-Type-Options", "nosniff");
-    response.setHeader("Cache-Control", "no-store");
-    response.setHeader("Referrer-Policy", "no-referrer");
-    response.setHeader(
-      "Content-Security-Policy",
-      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
-    );
+    for (const [name, value] of Object.entries(responseHeaders)) response.setHeader(name, value);
     const origin = new URL(`http://127.0.0.1:${request.socket.localPort}`).origin;
     const requestOrigin = request.headers.origin;
     if (
@@ -181,7 +168,7 @@ export async function startServer(
           if (path === "/api/application/preferences" && request.method === "PATCH") {
             json(
               decodeApplicationSnapshot(
-                application.changePreferences(
+                await application.changePreferences(
                   decode(ChangeApplicationPreferences, await readJson(request)),
                 ),
               ),
@@ -206,7 +193,7 @@ export async function startServer(
             const input = decode(ChangeProvider, await readJson(request));
             json(
               decodeApplicationSnapshot(
-                application.changeProvider(input.kind, input.enabled, input.disconnect),
+                await application.changeProvider(input.kind, input.enabled, input.disconnect),
               ),
             );
             return;
@@ -272,6 +259,16 @@ export async function startServer(
             );
             return;
           }
+          // The polled application read leaves out each PC's received evidence; this is where it is read.
+          const evidenceOf = /^\/api\/application\/computers\/([^/]+)\/snapshot$/.exec(path)?.[1];
+          if (evidenceOf && request.method === "GET") {
+            if (!/^[a-f0-9-]{36}$/.test(evidenceOf))
+              throw new HttpError(400, "Invalid computer identity");
+            const evidence = application.computerSnapshot(evidenceOf);
+            if (!evidence) throw new HttpError(404, "This PC is no longer connected.");
+            json(decodeComputerSnapshot(evidence));
+            return;
+          }
           const action = /^\/api\/application\/computers\/(refresh|scan|remove|revoke)$/.exec(
             path,
           )?.[1];
@@ -296,8 +293,23 @@ export async function startServer(
           }
           throw new HttpError(404, "Application route not found");
         }
+        // The coordinator validates both reads; the snapshot's stable part is cached per revision.
         if (path === "/api/monitoring" && (request.method === "GET" || request.method === "HEAD")) {
-          json(decodeMonitoringSnapshot(coordinator.snapshot()));
+          const tag = `"${coordinator.revision}"`;
+          if (request.headers["if-none-match"]?.includes(tag)) {
+            response.writeHead(304, { ETag: tag }).end();
+            return;
+          }
+          const body = coordinator.snapshotJson();
+          response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", ETag: tag });
+          response.end(request.method === "HEAD" ? undefined : body);
+          return;
+        }
+        if (
+          path === "/api/monitoring/progress" &&
+          (request.method === "GET" || request.method === "HEAD")
+        ) {
+          json(coordinator.progressSnapshot());
           return;
         }
         if (path === "/api/projects" && request.method === "POST") {
@@ -380,22 +392,10 @@ export async function startServer(
       }
       if (request.method !== "GET" && request.method !== "HEAD")
         throw new HttpError(405, "Method not allowed");
-      const file =
-        ["/", "/pc", "/projects", "/service", "/coverage", "/about"].includes(path) ||
-        /^\/settings\/(general|project|appearance|keybindings|source-control|connections)$/.test(
-          path,
-        ) ||
-        /^\/computers\/[a-f0-9-]{36}$/.test(path)
-          ? "index.html"
-          : /^\/assets\/[a-zA-Z0-9_.-]+$/.test(path)
-            ? path.slice(1)
-            : undefined;
-      if (!options.webRoot || !file) throw new HttpError(404, "Not found");
-      const content = await readFile(join(options.webRoot, file));
-      response.writeHead(200, {
-        "Content-Type": contentTypes[extname(file)] ?? "application/octet-stream",
-      });
-      response.end(request.method === "HEAD" ? undefined : content);
+      const found = await readWebFile(options.webRoot, path);
+      if (!found) throw new HttpError(404, "Not found");
+      response.writeHead(200, { "Content-Type": found.contentType });
+      response.end(request.method === "HEAD" ? undefined : found.content);
     } catch (error) {
       if (response.headersSent) {
         response.end();
