@@ -1,11 +1,22 @@
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, rmdirSync } from "node:fs";
 import { chmod, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import * as Schema from "effect/Schema";
 import { InputError } from "./adapters/projects.ts";
+import {
+  CredentialStorageUnavailable,
+  deleteFromKeychain,
+  isKeychainReference,
+  keychainIssue,
+  readFromKeychain,
+  storeInKeychain,
+  type CredentialOptions,
+} from "./adapters/keychain.ts";
+
+export { CredentialStorageUnavailable };
 
 // The only frontend origin a development coordinator accepts besides its own.
 export const DEV_ORIGIN = "http://127.0.0.1:4317";
@@ -53,15 +64,27 @@ export function resolveDataDir(
   return !holdsDatabase(current) && holdsDatabase(legacy) ? legacy : current;
 }
 
+// SQLITE_BUSY: another connection holds the lock.
+const SQLITE_BUSY = 5;
+
 // The database lock is released by the OS on a crash; stale PID files cannot split the writer.
 export function acquireCoordinatorLock(dataDir: string): () => void {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  createDataDirectory(dataDir);
   const lock = new DatabaseSync(join(dataDir, "coordinator-lock.sqlite"), { timeout: 100 });
   try {
     lock.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE");
-  } catch {
+  } catch (error) {
     lock.close();
-    throw new Error("A coordinator already owns this data directory");
+    // Only a held lock means another coordinator. A lock file that is not a database, or cannot be used
+    // for another reason, must not read as one: a boot-task host would then exit 0 and stay stopped.
+    // The low byte drops an extended result code. The cause is SQLite's own error, which names no path.
+    const code = (error as { errcode?: unknown }).errcode;
+    if (typeof code === "number" && (code & 0xff) === SQLITE_BUSY)
+      throw new Error("A coordinator already owns this data directory", { cause: error });
+    throw new Error(
+      "The coordinator lock file could not be locked. Check the data directory's permissions, or remove coordinator-lock.sqlite while Versionstead is stopped.",
+      { cause: error },
+    );
   }
   return () => {
     lock.exec("ROLLBACK");
@@ -69,24 +92,28 @@ export function acquireCoordinatorLock(dataDir: string): () => void {
   };
 }
 
-async function dpapi(value: string, operation: "Protect" | "Unprotect"): Promise<string> {
-  const script = `Add-Type -AssemblyName System.Security
-$ErrorActionPreference = 'Stop'
-$value = [Console]::In.ReadToEnd()
-$bytes = [Convert]::FromBase64String($value)
-$entropy = [Text.Encoding]::UTF8.GetBytes('Versionstead coordinator v1')
-$result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, [Security.Cryptography.DataProtectionScope]::LocalMachine)
-[Console]::Out.Write([Convert]::ToBase64String($result))`;
-  const executable = join(
-    process.env.SystemRoot ?? "C:\\Windows",
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe",
-  );
-  return new Promise((resolveResult, reject) => {
+export const windowsPolicyBlocked =
+  "Windows policy blocks the PowerShell features Versionstead needs (Constrained Language Mode).";
+// Checked first: Add-Type and the .NET calls below fail under Constrained Language Mode.
+const languageGuard =
+  "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { Write-Output 'versionstead-constrained-language'; exit 3 }";
+
+export type PowerShellRunner = (
+  script: string,
+  input: string,
+) => Promise<{ code: number | null; stdout: string }>;
+
+/** Windows PowerShell 5.1 with an encoded script, stdin input, a deadline and an output bound. */
+export const runPowerShell: PowerShellRunner = (script, input) =>
+  new Promise((resolveResult) => {
     const child = execFile(
-      executable,
+      join(
+        process.env.SystemRoot ?? "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      ),
       [
         "-NoLogo",
         "-NoProfile",
@@ -94,40 +121,174 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
         "-EncodedCommand",
         Buffer.from(script, "utf16le").toString("base64"),
       ],
-      {
-        timeout: 10_000,
-        maxBuffer: 64 * 1024,
-        windowsHide: true,
-        encoding: "utf8",
-      },
+      { timeout: 10_000, maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
       (error, stdout) => {
-        if (error || !/^[A-Za-z0-9+/=]+$/.test(stdout.trim())) {
-          reject(new Error("Windows could not protect the local coordinator capability"));
-        } else resolveResult(stdout.trim());
+        const code = (error as { code?: unknown } | null)?.code;
+        resolveResult({ code: error ? (typeof code === "number" ? code : null) : 0, stdout });
       },
     );
-    child.stdin?.end(value);
+    // A script that exits before reading its input (the language guard) must not crash this process.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
   });
+
+export const dpapiScript = (operation: "Protect" | "Unprotect") => `${languageGuard}
+Add-Type -AssemblyName System.Security
+$ErrorActionPreference = 'Stop'
+$value = [Console]::In.ReadToEnd()
+$bytes = [Convert]::FromBase64String($value)
+$entropy = [Text.Encoding]::UTF8.GetBytes('Versionstead coordinator v1')
+$result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, [Security.Cryptography.DataProtectionScope]::LocalMachine)
+[Console]::Out.Write([Convert]::ToBase64String($result))`;
+
+/**
+ * Runs one DPAPI operation through PowerShell. Exported with its runner so a test can feed it results;
+ * callers use protectSecret and unprotectSecret.
+ */
+export async function dpapi(
+  value: string,
+  operation: "Protect" | "Unprotect",
+  run: PowerShellRunner = runPowerShell,
+): Promise<string> {
+  const { code, stdout } = await run(dpapiScript(operation), value);
+  // The marker is read before the exit code: the language guard exits 3, which would otherwise read as
+  // a generic failure.
+  if (stdout.includes("versionstead-constrained-language"))
+    throw new InputError(windowsPolicyBlocked);
+  // No exit code at all: the run timed out or PowerShell could not start. That says nothing about the
+  // credential, and a later try can succeed, so it is a storage failure and never an unreadable credential.
+  if (code === null)
+    throw new CredentialStorageUnavailable(
+      operation === "Protect"
+        ? "Windows did not finish protecting the credential. Try again."
+        : "Windows did not finish reading the protected credential. Try again.",
+    );
+  if (code !== 0 || !/^[A-Za-z0-9+/=]+$/.test(stdout.trim()))
+    throw new Error("Windows could not protect the local coordinator capability");
+  return stdout.trim();
 }
 
-// An input error, so the interface receives this reason as a 400 rather than a generic 500.
-const secretsUnsupported =
-  "OS-backed connection credentials are currently supported on Windows only.";
+/**
+ * Null when Windows PowerShell runs in full language mode; otherwise the policy message.
+ *
+ * ponytail: null also covers a PowerShell that was blocked, missing or too slow (no marker came back),
+ * which then surfaces as the generic start-up failure; name those cases if owners report them.
+ */
+export async function windowsPolicyIssue(
+  run: PowerShellRunner = runPowerShell,
+): Promise<string | null> {
+  const { stdout } = await run(`${languageGuard}\nWrite-Output 'versionstead-full-language'`, "");
+  return stdout.includes("versionstead-constrained-language") ? windowsPolicyBlocked : null;
+}
 
+/** Shown when a new data directory cannot be restricted: the cause and the way out, with no path. */
+export const dataDirectoryNotRestricted =
+  "Windows could not restrict the new data folder to your account. Create the folder yourself on an NTFS drive, or choose a folder inside your user profile.";
+
+/**
+ * Creates the data directory owner-only. On Windows a directory created outside the profile would
+ * inherit its parent's access list, so it gets the owner, SYSTEM and Administrators only. An existing
+ * directory is left alone (the Windows boot-task installer sets its own list). If the list cannot be
+ * applied, the new empty directory is removed again and dataDirectoryNotRestricted is thrown.
+ *
+ * ponytail: the new directory has its parent's access list until icacls finishes, parents that
+ * `recursive` created stay after a rollback, and a rollback that fails leaves the directory, which the
+ * next start then uses as it is; create it under a temporary name, restrict it and rename it into place
+ * if two hosts ever race on a new directory or those leftovers matter.
+ * ponytail: "inside the profile" compares path text, so a junction in the profile that leads elsewhere
+ * counts as inside and keeps the inherited list; compare real paths if owners start using such junctions.
+ */
+export function createDataDirectory(
+  dataDir: string,
+  platform: NodeJS.Platform = process.platform,
+  profile = homedir(),
+) {
+  const created = !existsSync(dataDir);
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  if (!created || platform !== "win32") return;
+  const relative = win32.relative(profile.toLowerCase(), dataDir.toLowerCase());
+  if (!relative.startsWith("..") && !win32.isAbsolute(relative)) return;
+  try {
+    const system32 = join(process.env.SystemRoot ?? "C:\\Windows", "System32");
+    const user = execFileSync(join(system32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    const sid = /"(S-1-[0-9-]+)"\s*$/.exec(user.trim())?.[1];
+    if (!sid) throw new Error("No owner SID");
+    execFileSync(
+      join(system32, "icacls.exe"),
+      [
+        dataDir,
+        "/inheritance:r",
+        "/grant:r",
+        `*${sid}:(OI)(CI)F`,
+        "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F",
+      ],
+      { timeout: 10_000, windowsHide: true, stdio: "ignore" },
+    );
+  } catch {
+    try {
+      rmdirSync(dataDir);
+    } catch {
+      // The owner's message below matters more than a leftover directory (see the note above).
+    }
+    throw new Error(dataDirectoryNotRestricted);
+  }
+}
+
+const keychainPlatform = (options: CredentialOptions) => {
+  const platform = options.platform ?? process.platform;
+  return platform === "darwin" || platform === "linux";
+};
+
+/**
+ * Windows protects a secret with machine-scope DPAPI and returns the blob. macOS and Linux keep it in
+ * the OS keychain under a random handle namespaced by the monitoring database and return a
+ * `keychain:v1:` reference; the keychain adapter refuses any other platform. Either result is what
+ * SQLite stores.
+ */
 export async function protectSecret(
   value: string,
-  platform: NodeJS.Platform = process.platform,
+  options: CredentialOptions & { namespace?: string } = {},
 ): Promise<string> {
-  if (platform !== "win32") throw new InputError(secretsUnsupported);
-  return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  if ((options.platform ?? process.platform) === "win32")
+    return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  return storeInKeychain(value, options.namespace ?? "versionstead", options);
 }
 
 export async function unprotectSecret(
-  value: string,
-  platform: NodeJS.Platform = process.platform,
+  reference: string,
+  options: CredentialOptions = {},
 ): Promise<string> {
-  if (platform !== "win32") throw new InputError(secretsUnsupported);
-  return Buffer.from(await dpapi(value, "Unprotect"), "base64").toString("utf8");
+  if (isKeychainReference(reference)) {
+    if (!keychainPlatform(options))
+      throw new InputError(
+        "This credential is in a macOS or Linux keychain. Reconnect it on this host.",
+      );
+    return readFromKeychain(reference, options);
+  }
+  if ((options.platform ?? process.platform) !== "win32")
+    throw new InputError(
+      "This credential was protected by Windows on another host. Reconnect it here.",
+    );
+  return Buffer.from(await dpapi(reference, "Unprotect"), "base64").toString("utf8");
+}
+
+/**
+ * Deletes a keychain item; a DPAPI blob lives only in SQLite and leaves with its record, and another
+ * host's keychain is out of reach. A locked or missing store throws rather than passing for deleted.
+ */
+export async function discardSecret(reference: string, options: CredentialOptions = {}) {
+  if (isKeychainReference(reference) && keychainPlatform(options))
+    await deleteFromKeychain(reference, options);
+}
+
+/** Null when this host can keep protected credentials; otherwise what is missing and how to get it. */
+export async function credentialStorageIssue(options: CredentialOptions = {}) {
+  return (options.platform ?? process.platform) === "win32" ? null : keychainIssue(options);
 }
 
 function validateDescriptor(runtime: RuntimeFile): void {

@@ -75,6 +75,9 @@ export const Sharing = Schema.Struct({
   port: Schema.Number,
   fingerprint: NullableString,
   error: NullableString,
+  // Set when turning sharing on had to create a new certificate, so paired PCs must pair again; absent
+  // from older coordinators and from sharing that has never done so.
+  notice: Schema.optional(NullableString),
   clients: Schema.Array(PairedClient),
 });
 export const AppUpdate = Schema.Struct({
@@ -100,6 +103,8 @@ export const ApplicationSnapshot = Schema.Struct({
   }),
   networkAddresses: Schema.Array(Schema.String),
   credentialStorageAvailable: Schema.Boolean,
+  // What is missing when credentials cannot be stored ("Install libsecret-tools…"); absent from older coordinators.
+  credentialStorageIssue: Schema.optional(NullableString),
   sharing: Sharing,
   computers: Schema.Array(ConnectedComputer),
   update: AppUpdate,

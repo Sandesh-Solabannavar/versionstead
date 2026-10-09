@@ -16,6 +16,7 @@ import {
 } from "electron";
 import { fileURLToPath } from "node:url";
 import { stat, realpath, mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import {
   coordinatorRequest,
@@ -25,6 +26,9 @@ import {
   readyCoordinator,
   recoverCoordinator,
   restartCoordinator,
+  StartupError,
+  startupFailureMessage,
+  stopMonitoringDetail,
   webRoot,
   type CoordinatorPoll,
   type CoordinatorRuntime,
@@ -36,8 +40,9 @@ import {
   decodeActionRequest,
   decodeRunActionRequest,
   decodeActionRun,
+  decodeActionShell,
 } from "@versionstead/contracts/project-settings";
-import { ProjectActionRunner } from "./project-actions.js";
+import { ProjectActionRunner, projectActionShell } from "./project-actions.js";
 import {
   decodeGlobalToolUpdateRequest,
   decodeGlobalToolUpdateRun,
@@ -45,20 +50,35 @@ import {
 } from "@versionstead/contracts/global-tool-updates";
 import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
 import {
+  decodeLoginItemChange,
+  decodeLoginItemState,
   decodeWindowTheme,
   decodeWindowPreferences,
   type WindowPreferences,
 } from "@versionstead/contracts/desktop";
+import { changeLoginItem, readLoginItem, type LoginItemContext } from "./login-item.js";
 import {
   applicationMenu,
   defaultWindowPreferences,
   initialWindowBounds,
   loadWindowPreferences,
+  maximizedToSave,
+  restoreMaximized,
   saveWindowPreferences,
   titleBarOptions,
 } from "./window.js";
 
 const smoke = process.argv.includes("--smoke-test");
+// A login entry starts the tray app without a window; launching it by hand still shows one.
+const startHidden = process.argv.includes("--hidden");
+const loginContext = (): LoginItemContext => ({
+  platform: process.platform,
+  home: homedir(),
+  env: process.env,
+  executable: process.execPath,
+  appPath: app.getAppPath(),
+  app,
+});
 let runtime: CoordinatorRuntime | null = null;
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -101,7 +121,7 @@ function captureWindowPreferences() {
     windowPreferences = decodeWindowPreferences({
       ...windowPreferences,
       bounds: window.getNormalBounds(),
-      maximized: window.isMaximized(),
+      maximized: maximizedToSave(window, windowPreferences.maximized),
     });
   } catch {
     /* Ignore transient/undersized geometry, including the narrow smoke viewport. */
@@ -161,7 +181,7 @@ async function showWindow(path = "/") {
   window.focus();
 }
 
-async function createWindow() {
+async function createWindow(show = !smoke) {
   window = new BrowserWindow({
     ...initialWindowBounds(
       windowPreferences,
@@ -173,7 +193,7 @@ async function createWindow() {
     minHeight: 520,
     title: "Versionstead",
     icon: trayIcon(),
-    show: !smoke,
+    show,
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: false,
@@ -183,7 +203,7 @@ async function createWindow() {
       preload: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
     },
   });
-  if (windowPreferences.maximized) window.maximize();
+  restoreMaximized(window, windowPreferences.maximized, show);
   window.on("move", scheduleWindowPreferences);
   window.on("resize", scheduleWindowPreferences);
   window.on("maximize", scheduleWindowPreferences);
@@ -249,6 +269,18 @@ function reopenFailed() {
   void showWindow().catch(() => console.error("The Versionstead window could not be shown."));
 }
 
+/** The tray's Start and Restart monitoring failure: a StartupError's own message, else the generic advice. */
+function showStartupFailure(verb: "start" | "restart") {
+  return (error: unknown) => {
+    dialog.showErrorBox(
+      "Versionstead",
+      error instanceof StartupError
+        ? error.message
+        : `Monitoring could not ${verb}. Check Node.js 24 and the background host status, then retry. Saved evidence is retained.`,
+    );
+  };
+}
+
 async function updateTray() {
   // Only a running project command needs the project actions, which take a snapshot read.
   const reconcile = projectActionRunner.active;
@@ -295,12 +327,7 @@ async function updateTray() {
           monitoringStopped = false;
           void ensureCoordinator()
             .then(() => updateTray())
-            .catch(() => {
-              dialog.showErrorBox(
-                "Versionstead",
-                "Monitoring could not start. Check Node.js 24 and the background host status, then retry. Saved evidence is retained.",
-              );
-            });
+            .catch(showStartupFailure("start"));
         },
       },
       {
@@ -310,12 +337,7 @@ async function updateTray() {
           monitoringStopped = false;
           void restartCoordinator()
             .then(() => updateTray())
-            .catch(() => {
-              dialog.showErrorBox(
-                "Versionstead",
-                "Monitoring could not restart. Check Node.js 24 and the background host status, then retry. Saved evidence is retained.",
-              );
-            });
+            .catch(showStartupFailure("restart"));
         },
       },
       {
@@ -362,10 +384,7 @@ async function stopMonitoring() {
     title: "Stop background monitoring?",
     message:
       "This stops the coordinator. Closing or quitting the interface normally keeps monitoring running.",
-    detail:
-      runtime.host === "boot-task"
-        ? "Windows startup registration stays installed; the task can start again at the next boot."
-        : "Use Start monitoring to resume.",
+    detail: stopMonitoringDetail(runtime.host),
   });
   if (result.response === 1) {
     monitoringStopped = true;
@@ -1418,7 +1437,10 @@ async function runSmoke() {
     await clickButton("Add action");
     await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Add Action'");
     await fillProjectField('dialog[open] input[placeholder="Test"]', "Native action");
-    await fillProjectField("dialog[open] textarea", "Write-Output 'native-action-ok'");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Write-Output 'native-action-ok'" : "printf native-action-ok",
+    );
     // The keybinding field never traps focus, and Tab is not recorded as a shortcut.
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Action keybinding\"]').focus()",
@@ -1465,7 +1487,10 @@ async function runSmoke() {
     await clickButton("Close dialog");
     await waitSettings("!document.querySelector('dialog[open]')");
     await clickButton("Edit Native action");
-    await fillProjectField("dialog[open] textarea", "Start-Sleep -Seconds 30");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30",
+    );
     await clickButton("Save changes");
     await waitSettings(
       "!document.querySelector('dialog[open]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
@@ -1732,6 +1757,23 @@ async function runSmoke() {
   );
   if ((await readyCoordinator())?.snapshot.settings.paused === scheduled)
     throw new Error("Native monitoring switch did not persist");
+  // Login items belong to the owner's account, so the smoke only reads this one and never toggles it.
+  const loginItem = await readLoginItem(loginContext());
+  // The switch reads Off and is disabled until the renderer's read of the OS state resolves, so a
+  // matching state alone would pass while it is still loading.
+  await waitSettings(
+    `(() => { const toggle = document.querySelector('[aria-label="Open Versionstead at login"]'); return toggle?.getAttribute('aria-checked') === ${JSON.stringify(String(loginItem.openAtLogin))} && toggle.getAttribute('aria-disabled') !== 'true'; })()`,
+  );
+  // The command dialog names the shell that runs commands; the renderer asks the desktop for it through IPC.
+  const commandShell: unknown = await window.webContents.executeJavaScript(
+    "window.versionstead.projectActionShell()",
+  );
+  if (
+    process.platform === "win32"
+      ? commandShell !== "Windows PowerShell"
+      : typeof commandShell !== "string" || !isAbsolute(commandShell)
+  )
+    throw new Error("The command shell must reach the renderer through the desktop bridge");
   await window.webContents.executeJavaScript(
     `document.querySelector('[aria-label="Scheduled scans"]').click();document.querySelector('[aria-label="Versionstead updates"]').click()`,
   );
@@ -2020,8 +2062,7 @@ async function runSmoke() {
 
 function fail(error: unknown) {
   // Routine logs must not print private discovery tokens or selected filesystem paths.
-  const message =
-    "Versionstead desktop initialization failed. Check Node.js 24, data-directory access, and background host status.";
+  const message = startupFailureMessage(error);
   console.error(message);
   // A launch from Explorer, Finder or the Dock has no visible console, so startup failures are shown.
   if (smoke)
@@ -2035,8 +2076,8 @@ function fail(error: unknown) {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    void showWindow().catch(reopenFailed);
+  app.on("second-instance", (_event, argv) => {
+    if (!argv.includes("--hidden")) void showWindow().catch(reopenFailed);
   });
   app.on("activate", () => {
     void showWindow().catch(reopenFailed);
@@ -2111,6 +2152,16 @@ if (!app.requestSingleInstanceLock()) {
         syncWindowAppearance();
         await persistWindowPreferences();
       });
+      ipcMain.handle("versionstead:login-item", async (event) => {
+        assertActionSender(event);
+        return decodeLoginItemState(await readLoginItem(loginContext()));
+      });
+      ipcMain.handle("versionstead:login-item-set", async (event, input: unknown) => {
+        assertActionSender(event);
+        return decodeLoginItemState(
+          await changeLoginItem(loginContext(), decodeLoginItemChange(input)),
+        );
+      });
       for (const operation of ["start", "command"] as const)
         ipcMain.handle(
           `versionstead:global-tool-update-${operation}`,
@@ -2165,6 +2216,10 @@ if (!app.requestSingleInstanceLock()) {
         if (project.actions?.find((a) => a.id === actionId)?.command !== expectedCommand)
           throw new Error("This command changed. Refresh and review it before running.");
         return decodeActionRun(await projectActionRunner.start(project, actionId));
+      });
+      ipcMain.handle("versionstead:project-action-shell", async (event) => {
+        assertActionSender(event);
+        return decodeActionShell(await projectActionShell());
       });
       for (const operation of ["status", "stop"] as const)
         ipcMain.handle(`versionstead:project-action-${operation}`, async (event, id: unknown) => {
@@ -2261,7 +2316,7 @@ if (!app.requestSingleInstanceLock()) {
         void showWindow().catch(reopenFailed);
       });
       await updateTray();
-      await createWindow();
+      await createWindow(!smoke && !startHidden);
       started = true;
       if (smoke) console.log("Desktop smoke: renderer loaded");
       if (smoke) await runSmoke();

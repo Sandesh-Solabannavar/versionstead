@@ -15,7 +15,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -27,3 +27,21 @@ jobs:
       - uses: pnpm/action-setup@v6
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      # Credential tests that need an unlocked Secret Service skip inside pnpm check; run them under a
+      # throwaway GNOME Keyring. macOS needs no step: its tests create and delete their own keychain.
+      - name: Linux keyring credential tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+          dbus-run-session -- sh -c 'printf versionstead | gnome-keyring-daemon --unlock >/dev/null && VERSIONSTEAD_KEYRING_TESTS=1 pnpm --filter @versionstead/server test'
+      - name: Linux systemd user-service smoke
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for attempt in $(seq 1 50); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; sleep 0.2; done
+          VERSIONSTEAD_SYSTEMD_SMOKE=1 node --test apps/server/test/background-host.test.mjs
+      - name: systemd journal after a failed smoke
+        if: failure() && runner.os == 'Linux'
+        run: XDG_RUNTIME_DIR="/run/user/$(id -u)" journalctl --user -u versionstead.service --no-pager -n 100 || true

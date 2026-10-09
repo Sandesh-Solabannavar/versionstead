@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +9,8 @@ import {
   defaultWindowPreferences,
   initialWindowBounds,
   loadWindowPreferences,
+  maximizedToSave,
+  restoreMaximized,
   saveWindowPreferences,
   titleBarOptions,
 } from "../dist/window.js";
@@ -82,6 +85,42 @@ test("restore saved windows only when the entire normal bounds fit a connected d
     width: 1280,
     height: 860,
   });
+});
+
+test("a window that starts hidden is maximized by its first show, never at creation", () => {
+  const maximized = [];
+  const fake = (name) =>
+    Object.assign(new EventEmitter(), { maximize: () => maximized.push(name) });
+  // BrowserWindow.maximize() also shows a hidden window, so a hidden login start must wait.
+  const hidden = fake("hidden");
+  restoreMaximized(hidden, true, false);
+  assert.deepEqual(maximized, []);
+  // A window shown at once is maximized at once; a later window must not take over the pending one.
+  const shown = fake("shown");
+  restoreMaximized(shown, true, true);
+  assert.deepEqual(maximized, ["shown"]);
+  hidden.emit("show");
+  hidden.emit("show");
+  assert.deepEqual(maximized, ["shown", "hidden"], "Only the waiting window, only once");
+  // Nothing to restore: no maximize now or later, and no listener left behind.
+  const plain = fake("plain");
+  restoreMaximized(plain, false, true);
+  restoreMaximized(plain, false, false);
+  plain.emit("show");
+  assert.equal(plain.listenerCount("show"), 0);
+  assert.deepEqual(maximized, ["shown", "hidden"]);
+});
+
+test("a hidden start that is never shown keeps the saved maximized choice", () => {
+  const window = (isMaximized, isVisible) => ({
+    isMaximized: () => isMaximized,
+    isVisible: () => isVisible,
+  });
+  assert.equal(maximizedToSave(window(true, true), false), true, "Maximized while shown");
+  assert.equal(maximizedToSave(window(false, true), true), false, "Restored by the owner");
+  assert.equal(maximizedToSave(window(true, false), false), true, "Closed to the tray maximized");
+  assert.equal(maximizedToSave(window(false, false), true), true, "Hidden start, not yet shown");
+  assert.equal(maximizedToSave(window(false, false), false), false);
 });
 
 test("native device settings survive restart and safely ignore malformed or oversized files", async () => {

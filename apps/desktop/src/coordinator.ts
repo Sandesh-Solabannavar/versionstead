@@ -4,7 +4,14 @@ import { constants, existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { acquireCoordinatorLock, readRuntime, resolveDataDir } from "@versionstead/server/runtime";
+import {
+  acquireCoordinatorLock,
+  createDataDirectory,
+  dataDirectoryNotRestricted,
+  readRuntime,
+  resolveDataDir,
+  windowsPolicyIssue,
+} from "@versionstead/server/runtime";
 import {
   decodeAcceptedResponse,
   decodeMonitoringProgress,
@@ -74,6 +81,65 @@ export function shouldRecoverCoordinator(
     descriptor.mode === "interactive" &&
     now - lastAttempt >= 60_000
   );
+}
+
+/**
+ * How the owner restarts a boot/background host, which the desktop never replaces. Each tool is named
+ * only on the platform that has it.
+ */
+export function backgroundRestartMessage(platform: NodeJS.Platform = process.platform) {
+  if (platform === "win32") return "Restart this coordinator through its Windows background host.";
+  if (platform === "darwin" || platform === "linux")
+    return "Restart this coordinator with node scripts/background-host.mjs restart.";
+  return "Restart this coordinator through its background host.";
+}
+
+/** The Stop monitoring dialog's detail: what happens to startup registration afterwards. */
+export function stopMonitoringDetail(
+  host: CoordinatorRuntime["host"],
+  platform: NodeJS.Platform = process.platform,
+) {
+  if (host !== "boot-task") return "Use Start monitoring to resume.";
+  if (platform === "win32")
+    return "Windows startup registration stays installed; the task can start again at the next boot.";
+  if (platform === "darwin")
+    return "The LaunchAgent stays installed and starts again at your next login.";
+  if (platform === "linux")
+    return "The systemd user service stays enabled and starts again at your next login, or at boot with lingering.";
+  return "The background host's startup registration stays installed.";
+}
+
+/** A start-up failure whose message was written for the owner and holds no paths. */
+export class StartupError extends Error {}
+
+/** What a failed launch shows: an owner-facing StartupError message, otherwise a generic one. */
+export function startupFailureMessage(error: unknown) {
+  return error instanceof StartupError
+    ? error.message
+    : "Versionstead desktop initialization failed. Check Node.js 24, data-directory access, and background host status.";
+}
+
+/**
+ * What must hold before a coordinator is started on Windows: PowerShell runs in full language mode, and
+ * a data folder that does not exist yet can be restricted to its owner. The coordinator starts with its
+ * output discarded, so either failure there would only show as a timeout; here each becomes a
+ * StartupError that the tray dialogs and the launch failure show.
+ */
+export async function checkWindowsStartup(
+  folder: string,
+  policy: () => Promise<string | null> = windowsPolicyIssue,
+  prepare: (folder: string) => void = createDataDirectory,
+) {
+  const blocked = await policy();
+  if (blocked) throw new StartupError(blocked);
+  try {
+    prepare(folder);
+  } catch (error) {
+    // Only this message was written for the owner; any other file-system error holds a path.
+    throw error instanceof Error && error.message === dataDirectoryNotRestricted
+      ? new StartupError(error.message)
+      : error;
+  }
 }
 
 export async function readyCoordinator() {
@@ -266,17 +332,18 @@ async function connectCoordinator(restart: boolean) {
   if (!existing) {
     const descriptor = await readRuntime(dataDir);
     if (descriptor && (descriptor.host !== "session" || descriptor.mode !== "interactive"))
-      throw new Error("Restart this coordinator through its Windows background host.");
+      throw new Error(backgroundRestartMessage());
   }
   if (existing) {
     const session = existing.runtime.host === "session" && existing.runtime.mode === "interactive";
     const current =
       existing.snapshot.scanProgress &&
-      existing.snapshot.features === "settings-repositories-connections-v8" &&
+      existing.snapshot.features === "settings-repositories-connections-v9" &&
       existing.snapshot.inventory.collector === "npm-bun-global-v1";
     if (!restart && (current || !session)) return existing;
-    if (!session) throw new Error("Restart this coordinator through its Windows background host.");
+    if (!session) throw new Error(backgroundRestartMessage());
   }
+  if (process.platform === "win32") await checkWindowsStartup(dataDir);
   const executable = await nodeExecutable();
   const entry = fileURLToPath(new URL("../../server/dist/bin.js", import.meta.url));
   await Promise.all([

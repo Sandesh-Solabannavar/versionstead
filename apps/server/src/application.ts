@@ -29,6 +29,8 @@ import { providerAccount, listRepositories, inspectRepository } from "./adapters
 import {
   createPeerCertificate,
   networkAddresses,
+  peerCertificate,
+  peerCertificateExpired,
   peerOrigin,
   peerRequest,
   privateAddress,
@@ -37,7 +39,14 @@ import {
 } from "./adapters/paired-computers.ts";
 import { discoverSshHosts, startSshTunnel, validateSshTarget } from "./adapters/ssh-connections.ts";
 import { readSource } from "./adapters/source-http.ts";
-import { protectSecret, unprotectSecret } from "./runtime.ts";
+import type { CredentialOptions } from "./adapters/keychain.ts";
+import {
+  CredentialStorageUnavailable,
+  credentialStorageIssue,
+  discardSecret,
+  protectSecret,
+  unprotectSecret,
+} from "./runtime.ts";
 
 // A saved paired PC is its connection record with the evidence it last sent. The polled application
 // read leaves the evidence out, so the contract's record has the evidence's digest instead.
@@ -65,6 +74,27 @@ const evidenceDigest = (snapshot: MonitoringSnapshot) => hash(JSON.stringify(sna
 const equal = (a: string, b: string) =>
   a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const now = () => new Date().toISOString();
+const restartFailure =
+  "The paired-PC host could not restart. Check its address, certificate, and network access.";
+const unreadableCredential = "The saved credential could not be unlocked on this monitoring host.";
+// What the owner reads when the saved HTTPS certificate cannot be served and sharing stays off, and
+// what they are told once turning Network access on has created a new one.
+const certificateProblems = {
+  unreadable: {
+    error:
+      "The saved HTTPS certificate of this PC could not be read. Turn Network access off and on to create a new one; paired PCs must then pair again.",
+    notice:
+      "This PC created a new HTTPS certificate because the saved one could not be read. Paired PCs must pair again.",
+  },
+  expired: {
+    error:
+      "The HTTPS certificate of this PC has expired. Turn Network access off and on to create a new one; paired PCs must then pair again.",
+    notice:
+      "This PC created a new HTTPS certificate because the saved one had expired. Paired PCs must pair again.",
+  },
+} as const;
+/** The saved HTTPS certificate cannot be served; only the owner turning Network access on replaces it. */
+class CertificateNeedsRenewal extends InputError {}
 
 export class ApplicationService {
   private state: State;
@@ -96,6 +126,16 @@ export class ApplicationService {
   // Discoveries started, and the latest one whose result is applied; see discover().
   private discoveries = 0;
   private discovered = 0;
+  private readonly credentials: CredentialOptions;
+  // The last credential-storage check. Success holds for this process; a failure is checked again
+  // after a minute or on an explicit refresh, so a keyring unlocked after start-up is picked up.
+  private storage: { issue: string | null; at: number } | null = null;
+  private storageCheck: Promise<string | null> | null = null;
+  private sharingWork: Promise<unknown> = Promise.resolve();
+  // When each saved credential last failed to be read, for a reason other than its store (which the
+  // check above remembers). Polls, scans and the sharing retry leave it alone for a minute, as they
+  // would otherwise run the keychain tool, a Linux probe or DPAPI for it every 30 seconds.
+  private readonly unreadable = new Map<string, number>();
 
   private constructor(
     coordinator: MonitoringCoordinator,
@@ -103,7 +143,12 @@ export class ApplicationService {
     peer: typeof peerRequest,
     tools: typeof discoverTools,
     version: string,
+    credentials: CredentialOptions,
   ) {
+    this.credentials = credentials;
+    // DPAPI needs no probe, so Windows hosts behave as before.
+    if ((credentials.platform ?? process.platform) === "win32")
+      this.storage = { issue: null, at: Date.now() };
     this.coordinator = coordinator;
     this.fetcher = fetcher;
     this.peer = peer;
@@ -190,25 +235,33 @@ export class ApplicationService {
     fetcher: typeof fetch = fetch,
     peer: typeof peerRequest = peerRequest,
     tools: typeof discoverTools = discoverTools,
+    credentials: CredentialOptions = {},
   ) {
     const metadata = object(
       JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")),
     );
     if (typeof metadata.version !== "string" || !semver.valid(metadata.version))
       throw new Error("Invalid application version.");
-    const app = new ApplicationService(coordinator, fetcher, peer, tools, metadata.version);
-    if (app.state.sharing.enabled) {
-      try {
-        await app.enableSharing(app.state.sharing.address, app.state.sharing.port);
-      } catch {
-        app.state.sharing = {
-          ...app.state.sharing,
-          error:
-            "The paired-PC host could not restart. Check its address, certificate, and network access.",
-        };
-        app.save();
-      }
-    }
+    const app = new ApplicationService(
+      coordinator,
+      fetcher,
+      peer,
+      tools,
+      metadata.version,
+      credentials,
+    );
+    if (app.state.sharing.enabled)
+      await app.serializeSharing(async () => {
+        try {
+          await app.enableSharing(app.state.sharing.address, app.state.sharing.port);
+        } catch (error) {
+          app.state.sharing = {
+            ...app.state.sharing,
+            error: app.sharingFailure(error, restartFailure),
+          };
+          app.save();
+        }
+      });
     return app;
   }
   // The single write path. Received evidence counts by its digest and a computer's checkedAt not at
@@ -243,26 +296,108 @@ export class ApplicationService {
       p.kind === kind ? { ...p, ...patch } : p,
     );
   }
+  /** Null when protected credentials can be stored here; otherwise what is missing and how to get it. */
+  async checkCredentialStorage(force = false): Promise<string | null> {
+    const known = this.storage;
+    if (known && (known.issue === null || (!force && Date.now() - known.at < 60_000)))
+      return known.issue;
+    return this.probeCredentialStorage();
+  }
+  // One probe at a time; its answer is the latest check.
+  private probeCredentialStorage() {
+    this.storageCheck ??= credentialStorageIssue(this.credentials)
+      .catch(() => "Protected credential storage could not be checked on this monitoring host.")
+      .then((issue) => {
+        this.storage = { issue, at: Date.now() };
+        return issue;
+      })
+      .finally(() => {
+        this.storageCheck = null;
+      });
+    return this.storageCheck;
+  }
+  private async requireCredentialStorage() {
+    const issue = await this.checkCredentialStorage();
+    if (issue) throw new CredentialStorageUnavailable(issue);
+  }
+  /**
+   * Proves the store works now, before a step that cannot be taken back (pairing uses up the other
+   * PC's one-time invitation): DPAPI protects a throwaway value, and a keychain is probed afresh
+   * instead of trusting the last check, which a keyring locked since then would still pass.
+   */
+  private async verifyCredentialStorage() {
+    if ((this.credentials.platform ?? process.platform) === "win32") {
+      await protectSecret("pairing-storage-check", this.credentials);
+      return;
+    }
+    const issue = await this.probeCredentialStorage();
+    if (issue) throw new CredentialStorageUnavailable(issue);
+  }
+  // The held success above is not checked again, so a store that the credential layer finds missing
+  // or locked later (a keyring locked at logout) is recorded here as the latest check.
+  private storageFailed(error: unknown) {
+    if (error instanceof CredentialStorageUnavailable)
+      this.storage = { issue: error.message, at: Date.now() };
+    return error;
+  }
+  private sharingFailure(error: unknown, fallback: string) {
+    return error instanceof CredentialStorageUnavailable || error instanceof CertificateNeedsRenewal
+      ? error.message
+      : fallback;
+  }
+  /** Sharing changes and listener retries run one at a time, so a retry never undoes a switch-off. */
+  private serializeSharing<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.sharingWork.then(work, work);
+    this.sharingWork = next.catch(() => {});
+    return next;
+  }
   private async secret(key: string) {
     if (this.plainSecrets.has(key)) return this.plainSecrets.get(key)!;
     const entry = this.state.secrets.find((s) => s.key === key);
     if (!entry) throw new InputError("Reconnect this source to restore its protected credentials.");
+    await this.requireCredentialStorage();
+    const failed = this.unreadable.get(key);
+    if (failed !== undefined && Date.now() - failed < 60_000)
+      throw new InputError(unreadableCredential);
     try {
-      const value = await unprotectSecret(entry.encrypted);
+      const value = await unprotectSecret(entry.encrypted, this.credentials);
+      this.unreadable.delete(key);
       this.plainSecrets.set(key, value);
       return value;
-    } catch {
-      throw new InputError("The saved credential could not be unlocked on this monitoring host.");
+    } catch (error) {
+      if (error instanceof CredentialStorageUnavailable) throw this.storageFailed(error);
+      this.unreadable.set(key, Date.now());
+      throw new InputError(unreadableCredential);
     }
   }
   private async storeSecret(key: string, value: string) {
-    const encrypted = await protectSecret(value);
+    await this.requireCredentialStorage();
+    const encrypted = await protectSecret(value, {
+      ...this.credentials,
+      namespace: this.coordinator.device.id,
+    }).catch((error: unknown) => {
+      throw this.storageFailed(error);
+    });
+    const previous = this.state.secrets.find((s) => s.key === key)?.encrypted;
     this.state.secrets = [...this.state.secrets.filter((s) => s.key !== key), { key, encrypted }];
     this.plainSecrets.set(key, value);
+    // Saved first: a crash in between leaves an unused keychain item, never a record without one.
+    this.save();
+    if (previous)
+      await discardSecret(previous, this.credentials).catch((error: unknown) =>
+        this.storageFailed(error),
+      );
   }
-  private forgetSecret(key: string) {
+  private async forgetSecret(key: string) {
+    const entry = this.state.secrets.find((s) => s.key === key);
     this.state.secrets = this.state.secrets.filter((s) => s.key !== key);
     this.plainSecrets.delete(key);
+    // ponytail: an item that cannot be deleted now (a locked keychain) stays behind and the docs say to
+    // revoke the token at the provider; retry the deletion if leftover items ever matter.
+    if (entry)
+      await discardSecret(entry.encrypted, this.credentials).catch((error: unknown) =>
+        this.storageFailed(error),
+      );
   }
   snapshot(): ApplicationSnapshot {
     return structuredClone({
@@ -271,7 +406,10 @@ export class ApplicationService {
       providers: this.state.providers,
       tools: this.tools,
       networkAddresses: networkAddresses(),
-      credentialStorageAvailable: process.platform === "win32",
+      credentialStorageAvailable: this.storage?.issue === null,
+      credentialStorageIssue: this.storage
+        ? this.storage.issue
+        : "Checking protected credential storage on this monitoring host.",
       sharing: {
         ...this.state.sharing,
         error:
@@ -300,6 +438,7 @@ export class ApplicationService {
     this.localOrigin = origin;
   }
   async discover(refreshAuthentication = false) {
+    if (refreshAuthentication) await this.checkCredentialStorage(true);
     // Overlapping discoveries (startup, Refresh, a Git switch) finish in any order; a result never
     // replaces one from a discovery that started later.
     const discovery = ++this.discoveries;
@@ -323,9 +462,11 @@ export class ApplicationService {
               this.fetcher,
               this.shutdown.signal,
             );
-          } catch {
+          } catch (cause) {
             error =
-              "Provider authentication could not be verified. Check the connection, token permissions, and provider availability, or reconnect.";
+              cause instanceof CredentialStorageUnavailable
+                ? cause.message
+                : "Provider authentication could not be verified. Check the connection, token permissions, and provider availability, or reconnect.";
           }
           if (
             this.shutdown.signal.aborted ||
@@ -341,6 +482,9 @@ export class ApplicationService {
     return this.snapshot();
   }
   async readSnapshot() {
+    // The first read waits for the check; later reads refresh a failing one in the background.
+    if (!this.storage) await this.checkCredentialStorage();
+    else void this.checkCredentialStorage();
     await this.startup;
     return this.snapshot();
   }
@@ -379,18 +523,20 @@ export class ApplicationService {
     this.save();
     return this.snapshot();
   }
-  changeProvider(kind: ProviderKind, enabled: boolean, disconnect = false) {
+  async changeProvider(kind: ProviderKind, enabled: boolean, disconnect = false) {
     const provider = this.provider(kind);
     if (disconnect) {
-      this.forgetSecret(`provider:${kind}`);
+      const forgetting = this.forgetSecret(`provider:${kind}`);
       this.repositoryLists.delete(kind);
       this.updateProvider(kind, { account: null, enabled: false, error: null });
+      this.save();
+      await forgetting;
     } else {
       if (enabled && !provider.account)
         throw new InputError("Connect the provider before enabling repository scans.");
       this.updateProvider(kind, { enabled });
+      this.save();
     }
-    this.save();
     return this.snapshot();
   }
   async repositories(kind: ProviderKind) {
@@ -407,10 +553,12 @@ export class ApplicationService {
       this.updateProvider(kind, { checkedAt: now(), error: null });
       this.save();
       return repositories;
-    } catch {
+    } catch (cause) {
       this.updateProvider(kind, {
         error:
-          "Repository discovery failed. Check read permissions, authentication, and the provider rate limit.",
+          cause instanceof CredentialStorageUnavailable
+            ? cause.message
+            : "Repository discovery failed. Check read permissions, authentication, and the provider rate limit.",
       });
       this.save();
       throw new InputError(this.provider(kind).error!);
@@ -531,34 +679,40 @@ export class ApplicationService {
     return this.snapshot();
   }
   async changeSharing(enabled: boolean, address?: string, port?: number) {
-    if (this.peerServer) {
-      await this.peerServer.close();
-      this.peerServer = null;
-    }
-    this.invitation = null;
-    if (!enabled) {
-      this.state.sharing = { ...this.state.sharing, enabled: false, error: null };
-      this.save();
+    return this.serializeSharing(async () => {
+      if (this.peerServer) {
+        await this.peerServer.close();
+        this.peerServer = null;
+      }
+      this.invitation = null;
+      if (!enabled) {
+        this.state.sharing = { ...this.state.sharing, enabled: false, error: null, notice: null };
+        this.save();
+        return this.snapshot();
+      }
+      try {
+        // The owner's own switch: the one place a saved certificate that cannot be used is replaced.
+        await this.enableSharing(
+          address ?? this.state.sharing.address,
+          port ?? this.state.sharing.port,
+          true,
+        );
+      } catch (error) {
+        this.state.sharing = {
+          ...this.state.sharing,
+          enabled: false,
+          error: this.sharingFailure(
+            error,
+            "Could not start HTTPS sharing. Choose an address assigned to this PC and an unused port.",
+          ),
+        };
+        this.save();
+        throw new InputError(this.state.sharing.error!);
+      }
       return this.snapshot();
-    }
-    try {
-      await this.enableSharing(
-        address ?? this.state.sharing.address,
-        port ?? this.state.sharing.port,
-      );
-    } catch {
-      this.state.sharing = {
-        ...this.state.sharing,
-        enabled: false,
-        error:
-          "Could not start HTTPS sharing. Choose an address assigned to this PC and an unused port.",
-      };
-      this.save();
-      throw new InputError(this.state.sharing.error!);
-    }
-    return this.snapshot();
+    });
   }
-  private async enableSharing(address: string, port: number) {
+  private async enableSharing(address: string, port: number, renew = false) {
     if (
       !privateAddress(address) ||
       !Number.isInteger(port) ||
@@ -569,13 +723,9 @@ export class ApplicationService {
       throw new InputError(
         "Choose this PC's LAN or Tailscale address and a port between 1024 and 65535.",
       );
-    let certificate: PeerCertificate;
-    if (this.state.secrets.some((s) => s.key === "certificate"))
-      certificate = JSON.parse(await this.secret("certificate")) as PeerCertificate;
-    else {
-      certificate = await createPeerCertificate();
-      await this.storeSecret("certificate", JSON.stringify(certificate));
-    }
+    const { certificate, notice } = await this.sharingCertificate(address, renew);
+    // Before the listener starts: a failure to start after a new certificate still unpairs the other PCs.
+    if (notice) this.state.sharing = { ...this.state.sharing, notice };
     this.peerServer = await startPeerServer({
       address,
       port,
@@ -593,8 +743,45 @@ export class ApplicationService {
       port: this.peerServer.port,
       fingerprint: certificate.fingerprint,
       error: null,
+      notice,
     };
     this.save();
+  }
+  /**
+   * The certificate the listener serves. A saved one that cannot be read, or has expired, is replaced
+   * only when `renew` is set (the owner turning Network access on) and is otherwise reported, so a
+   * restart never unpairs the other PCs unasked. A store that is locked or unavailable says nothing
+   * about the certificate and never causes a new one. The notice is the one for a certificate made now,
+   * or kept for one made earlier that has not been served yet (its switch could not start the listener).
+   */
+  private async sharingCertificate(
+    address: string,
+    renew: boolean,
+  ): Promise<{ certificate: PeerCertificate; notice: string | null }> {
+    let problem: keyof typeof certificateProblems | null = null;
+    if (this.state.secrets.some((s) => s.key === "certificate")) {
+      try {
+        const saved = peerCertificate(JSON.parse(await this.secret("certificate")));
+        if (!peerCertificateExpired(saved))
+          return {
+            certificate: saved,
+            // The stored pin only changes when the listener starts, so a different one means this
+            // certificate is about to go live for the first time.
+            notice:
+              saved.fingerprint === this.state.sharing.fingerprint
+                ? null
+                : (this.state.sharing.notice ?? null),
+          };
+        problem = "expired";
+      } catch (error) {
+        if (error instanceof CredentialStorageUnavailable) throw error;
+        problem = "unreadable";
+      }
+      if (!renew) throw new CertificateNeedsRenewal(certificateProblems[problem].error);
+    }
+    const certificate = createPeerCertificate(address);
+    await this.storeSecret("certificate", JSON.stringify(certificate));
+    return { certificate, notice: problem && certificateProblems[problem].notice };
   }
   createInvitation() {
     if (!this.peerServer || !this.state.sharing.fingerprint)
@@ -719,7 +906,7 @@ export class ApplicationService {
     const local = this.coordinator.device;
     const id = randomUUID();
     // Verify OS-backed storage before consuming the remote one-time invitation.
-    await protectSecret("pairing-storage-check");
+    await this.verifyCredentialStorage();
     let response;
     try {
       response = object(
@@ -791,15 +978,13 @@ export class ApplicationService {
             }
           : c,
       );
-    } catch {
+    } catch (error) {
+      const message =
+        error instanceof CredentialStorageUnavailable
+          ? `${error.message} Last received evidence is retained.`
+          : "This PC is unreachable, its certificate changed, or pairing was revoked. Last received evidence is retained.";
       this.state.computers = this.state.computers.map((c) =>
-        c.id === id && c.enabled !== false
-          ? {
-              ...c,
-              error:
-                "This PC is unreachable, its certificate changed, or pairing was revoked. Last received evidence is retained.",
-            }
-          : c,
+        c.id === id && c.enabled !== false ? { ...c, error: message } : c,
       );
     }
     if (!this.shutdown.signal.aborted) this.save();
@@ -833,9 +1018,10 @@ export class ApplicationService {
       /* Revoke the client on the host PC if it is currently unreachable. */
     }
     await this.closeTunnel(id);
-    this.forgetSecret(`computer:${id}`);
+    const forgetting = this.forgetSecret(`computer:${id}`);
     this.state.computers = this.state.computers.filter((computer) => computer.id !== id);
     this.save();
+    await forgetting;
     return this.snapshot();
   }
   // Never rejects: the timer chain has no handler, and one PC must not stop the others.
@@ -851,12 +1037,26 @@ export class ApplicationService {
     }
     if (this.state.preferences.automaticAppUpdateChecks && Date.now() > this.nextUpdate)
       await this.checkUpdate().catch(() => {});
+    // A listener that could not start (for example, a keyring still locked at boot) is retried here.
+    await this.serializeSharing(async () => {
+      if (!this.state.sharing.enabled || this.peerServer || this.shutdown.signal.aborted) return;
+      try {
+        await this.enableSharing(this.state.sharing.address, this.state.sharing.port);
+      } catch (error) {
+        const message = this.sharingFailure(error, restartFailure);
+        if (message !== this.state.sharing.error) {
+          this.state.sharing = { ...this.state.sharing, error: message };
+          this.save();
+        }
+      }
+    }).catch(() => {});
   }
   async close() {
     if (this.shutdown.signal.aborted) return;
     this.shutdown.abort();
     clearInterval(this.timer);
     await this.polling;
+    await this.sharingWork;
     await Promise.all([...this.tunnels.keys()].map((id) => this.closeTunnel(id)));
     if (this.peerServer) await this.peerServer.close();
   }

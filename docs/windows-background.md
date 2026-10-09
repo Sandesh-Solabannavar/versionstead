@@ -1,6 +1,6 @@
 # Windows background monitoring
 
-Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out.
+Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out. For macOS and Linux, see [macOS and Linux background host](background-host.md).
 
 Paired-PC access over Tailscale after sign-out also requires **Preferences → Run unattended** in each Windows PC's Tailscale tray menu. Tailscale normally disconnects after Windows sign-out; see its [unattended-mode guide](https://tailscale.com/docs/how-to/run-unattended). Installing Versionstead's boot host does not change Tailscale configuration or Windows Firewall. Verify both separately using the [connection setup](settings-and-connections.md).
 
@@ -34,7 +34,7 @@ If elevating as another account, first launch the updated desktop and scan **Thi
 .\scripts\windows-background.ps1 -Action Uninstall
 ```
 
-Status does not need elevation; configuration actions do. Start and Restart use the persisted owner sources and repeat the fresh global-tool access probe. They never rediscover sources under the service identity. Uninstall removes startup registration and preserves evidence and explicit folder grants. It does not delete project files. The tray notifier starts when Electron is opened; automatic tray startup at login is not configured. Pending findings are delivered when the UI next runs.
+Status does not need elevation; configuration actions do. Start and Restart use the persisted owner sources and repeat the fresh global-tool access probe. They never rediscover sources under the service identity. Uninstall removes startup registration and preserves evidence and explicit folder grants. It does not delete project files. The tray notifier starts when Electron opens; Settings › General › Open Versionstead at login starts it hidden at sign-in. Pending findings are delivered when the UI next runs.
 
 ## Required lifecycle verification
 

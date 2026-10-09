@@ -193,7 +193,7 @@ export async function startServer(
             const input = decode(ChangeProvider, await readJson(request));
             json(
               decodeApplicationSnapshot(
-                application.changeProvider(input.kind, input.enabled, input.disconnect),
+                await application.changeProvider(input.kind, input.enabled, input.disconnect),
               ),
             );
             return;

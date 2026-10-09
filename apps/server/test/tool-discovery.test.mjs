@@ -8,6 +8,7 @@ import {
   link,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rm,
   stat,
@@ -221,6 +222,43 @@ test("a real Bun answers the probe with the version and path that it reports its
   assert.ok(reported, "Bun must accept the probe");
   assert.equal(reported.version, execFileSync(bun, ["--version"], { encoding: "utf8" }).trim());
   assert.ok((await stat(reported.execPath)).isFile());
+});
+
+test("the bun -e probe never loads the owner's global bunfig preload (Bun reads it only for package-manager commands)", async (t) => {
+  const bun = await toolExecutable(windows ? "bun.exe" : "bun");
+  if (!bun) return t.skip("Bun is unavailable on this host.");
+  const base = await temporary(t);
+  const marker = join(base, "preloaded");
+  const preload = join(base, "preload.js");
+  await writeFile(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+  const config = join(base, "config");
+  const local = join(base, "local");
+  await mkdir(config);
+  await mkdir(local);
+  const bunfig = `preload = [${JSON.stringify(preload)}]\n`;
+  await writeFile(join(config, ".bunfig.toml"), bunfig);
+  await writeFile(join(local, "bunfig.toml"), bunfig);
+  // Control: the same preload in a working-directory bunfig.toml does run for `bun -e`.
+  execFileSync(bun, ["-e", "0"], {
+    cwd: local,
+    env: { ...process.env, BUN_OPTIONS: "" },
+    stdio: "ignore",
+  });
+  assert.equal(await readFile(marker, "utf8"), "ran");
+  await rm(marker);
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = config;
+  try {
+    assert.ok(await inspectBun(bun), "Bun must still answer the probe");
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previous;
+  }
+  await assert.rejects(
+    access(marker),
+    { code: "ENOENT" },
+    "The global bunfig preload must not run",
+  );
 });
 
 test("a rejected candidate does not end the search", async (t) => {

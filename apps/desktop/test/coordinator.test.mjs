@@ -189,6 +189,7 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
       "settings-repositories-connections-v5",
       "settings-repositories-connections-v6",
       "settings-repositories-connections-v7",
+      "settings-repositories-connections-v8",
     ]) {
       fixture = await legacy("interactive", "session", true, true, features);
       assert.equal((await desktop.readyCoordinator()).snapshot.features, features);
@@ -198,7 +199,7 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
         fixture.runtime.pid,
         "Previous settings builds must load the current connections flow",
       );
-      assert.equal(refreshedBuild.snapshot.features, "settings-repositories-connections-v8");
+      assert.equal(refreshedBuild.snapshot.features, "settings-repositories-connections-v9");
       assert.deepEqual(refreshedBuild.snapshot.projects, before.projects);
       assert.deepEqual(refreshedBuild.snapshot.settings, before.settings);
       assert.equal(fixture.shutdowns(), 1);
@@ -207,6 +208,10 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
       await stopDetached();
     }
 
+    // Both refusals name the platform's own restart tool: a reachable background host that restart
+    // would replace, and a boot descriptor whose host is unreachable.
+    const restartTool =
+      process.platform === "win32" ? /Windows background host/ : /background-host\.mjs restart/;
     for (const [mode, host] of [
       ["background", "boot-task"],
       ["background", "session"],
@@ -218,15 +223,15 @@ test("desktop upgrades a legacy session without losing evidence and preserves ba
       assert.equal(retained.runtime.host, host);
       assert.equal(retained.runtime.mode, mode);
       assert.equal(retained.snapshot.scanProgress, undefined);
-      await assert.rejects(desktop.restartCoordinator(), /restart|session|background|boot/i);
+      await assert.rejects(desktop.restartCoordinator(), restartTool);
       assert.equal(fixture.shutdowns(), 0, "A non-session host must never be stopped or replaced");
       assert(await desktop.readyCoordinator(), "The background host must remain responsive");
       await fixture.close();
       fixture = undefined;
       if (host === "boot-task") {
         await writeRuntime(dataDir, retained.runtime);
-        await assert.rejects(desktop.ensureCoordinator(), /background|host|restart/i);
-        await assert.rejects(desktop.restartCoordinator(), /background|host|restart/i);
+        await assert.rejects(desktop.ensureCoordinator(), restartTool);
+        await assert.rejects(desktop.restartCoordinator(), restartTool);
         assert.equal(
           (await readRuntime(dataDir)).host,
           host,

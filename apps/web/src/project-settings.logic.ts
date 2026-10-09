@@ -62,3 +62,20 @@ export function actionForChord(
       !actionShortcutConflict(actions, a.id, chord, bindings),
   );
 }
+/** Shown where nothing can run a command, such as a browser. */
+export const commandsNote = "Custom commands run in the Versionstead desktop app.";
+/** The dialog's sentence naming what runs a command; empty where nothing can run one. */
+export function commandRunnerNote(platform: string | undefined, shell: string | null) {
+  if (!platform) return "";
+  if (platform === "win32") return " PowerShell runs as your signed-in Windows user.";
+  return shell
+    ? ` ${shell} runs it as a login shell as your user.`
+    : " Your login shell runs it as your user.";
+}
+/** The command editor's syntax hint for the platform that will run the command. */
+export function commandSyntaxNote(platform: string | undefined) {
+  if (platform === "win32") return "Windows PowerShell syntax. Saving does not run this command.";
+  if (platform)
+    return "Syntax for your login shell, such as sh, bash or zsh. Saving does not run this command.";
+  return "PowerShell syntax on Windows, your login shell's syntax on macOS and Linux. Saving does not run this command.";
+}

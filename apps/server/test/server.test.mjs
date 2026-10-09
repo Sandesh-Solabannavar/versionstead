@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -14,15 +16,26 @@ import { MonitoringCoordinator } from "../dist/monitoring.js";
 import { InputError } from "../dist/adapters/projects.js";
 import {
   acquireCoordinatorLock,
+  createDataDirectory,
+  CredentialStorageUnavailable,
+  credentialStorageIssue,
   DATABASE_FILE,
+  dataDirectoryNotRestricted,
+  discardSecret,
+  dpapi,
+  dpapiScript,
   protectSecret,
   readRuntime,
   removeRuntime,
   resolveDataDir,
+  runPowerShell,
   unprotectSecret,
+  windowsPolicyBlocked,
+  windowsPolicyIssue,
   writeRuntime,
 } from "../dist/runtime.js";
 import { randomBytes } from "node:crypto";
+import { fakeKeyring } from "./credentials.mjs";
 
 test("live coordinator reports its environment without claiming scanner coverage", async () => {
   const server = await startServer({ port: 0 });
@@ -372,7 +385,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     const tag = initial.headers.get("etag");
     assert.match(tag, /^"[^"]+"$/, "The revision is one quoted entity tag");
     const body = await initial.json();
-    assert.equal(body.features, "settings-repositories-connections-v8");
+    assert.equal(body.features, "settings-repositories-connections-v9");
     assert.deepEqual(body, first.coordinator.snapshot(), "Cached and live parts form the snapshot");
     for (const [method, headers, status] of [
       ["GET", { "If-None-Match": tag }, 304],
@@ -482,6 +495,58 @@ test("runtime descriptor protects the token and an OS database lock prevents dup
     reacquired();
     assert.ok(dataDir.startsWith(join(tmpdir(), "versionstead-runtime-")));
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a boot-task host that finds its data directory in use exits 0, so launchd and systemd keep it stopped", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-lock-"));
+  const release = acquireCoordinatorLock(dataDir);
+  try {
+    const bin = fileURLToPath(new URL("../dist/bin.js", import.meta.url));
+    const run = (host, mode) =>
+      spawnSync(
+        process.execPath,
+        [bin, "--data-dir", dataDir, "--port", "0", "--mode", mode, "--host", host],
+        { encoding: "utf8", timeout: 30_000 },
+      );
+    const boot = run("boot-task", "background");
+    assert.equal(boot.status, 0);
+    assert.match(
+      boot.stderr,
+      /Another Versionstead coordinator already serves this data directory/,
+    );
+    const session = run("session", "interactive");
+    assert.equal(session.status, 1, "A session host still reports the conflict as a failure");
+    assert.match(session.stderr, /A coordinator already owns this data directory/);
+  } finally {
+    release();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a lock file that is not a database fails every host with exit 1, never as another coordinator", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-lock-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  await writeFile(join(dataDir, "coordinator-lock.sqlite"), "not a database, whatever wrote it");
+  assert.throws(
+    () => acquireCoordinatorLock(dataDir),
+    (error) => /^The coordinator lock file could not be locked/.test(error.message),
+  );
+  const bin = fileURLToPath(new URL("../dist/bin.js", import.meta.url));
+  for (const [host, mode] of [
+    ["boot-task", "background"],
+    ["session", "interactive"],
+  ]) {
+    const run = spawnSync(
+      process.execPath,
+      [bin, "--data-dir", dataDir, "--port", "0", "--mode", mode, "--host", host],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    // A boot-task host that exited 0 here would stay stopped under launchd and systemd.
+    assert.equal(run.status, 1, `${host}: ${run.stderr}`);
+    assert.match(run.stderr, /^The coordinator lock file could not be locked/m);
+    assert(!/already/.test(run.stderr), "A broken lock file is not another coordinator");
+    assert(!run.stderr.includes(dataDir), "The data directory's path stays out of the output");
   }
 });
 
@@ -637,17 +702,282 @@ test("data of an earlier build stays in use until the new folder holds a databas
   );
 });
 
-test("hosts without OS-backed credential storage answer with an input error that says why", async () => {
-  for (const operation of [protectSecret, unprotectSecret])
-    for (const platform of ["linux", "darwin"])
-      await assert.rejects(
-        operation("value", platform),
-        (error) =>
-          error instanceof InputError &&
-          error.message ===
-            "OS-backed connection credentials are currently supported on Windows only.",
-      );
+test("credential storage names what is missing and never reads a reference with the wrong backend", async () => {
+  await assert.rejects(
+    protectSecret("value", { platform: "freebsd" }),
+    (error) => error instanceof InputError && /not supported on this platform/.test(error.message),
+  );
+  assert.match(
+    await credentialStorageIssue({ platform: "freebsd" }),
+    /not supported on this platform/,
+  );
+  assert.equal(await credentialStorageIssue({ platform: "win32" }), null);
+  await assert.rejects(
+    unprotectSecret("AQAAANCMnd8BFdERjHoAwE/Cl+s=", { platform: "linux" }),
+    /protected by Windows on another host/,
+  );
+  await assert.rejects(
+    unprotectSecret(`keychain:v1:device.${"A".repeat(22)}`, { platform: "win32" }),
+    /macOS or Linux keychain/,
+  );
+  await discardSecret("AQAAANCMnd8BFdERjHoAwE/Cl+s=", {
+    platform: "linux",
+    run: () => assert.fail("A DPAPI blob is never sent to a keychain"),
+  });
+  await discardSecret(`keychain:v1:device.${"A".repeat(22)}`, {
+    platform: "win32",
+    run: () => assert.fail("Another host's keychain item cannot be reached from Windows"),
+  });
 });
+
+test("a locked Linux keyring never reads as a missing credential or a completed deletion", async () => {
+  const keyring = fakeKeyring();
+  const reference = `keychain:v1:device.${"A".repeat(22)}`;
+  const locked = (error) =>
+    error instanceof CredentialStorageUnavailable &&
+    /^Unlock your login keyring/.test(error.message);
+  await assert.rejects(unprotectSecret(reference, keyring.options), /missing from the OS keychain/);
+  await discardSecret(reference, keyring.options); // Already gone counts as deleted.
+  const stored = await protectSecret("value", { ...keyring.options, namespace: "device" });
+  keyring.lock();
+  // secret-tool answers a locked keyring's lookup and clear exactly as it answers a missing item.
+  await assert.rejects(unprotectSecret(stored, keyring.options), locked);
+  await assert.rejects(discardSecret(stored, keyring.options), locked);
+  await assert.rejects(protectSecret("value", { ...keyring.options, namespace: "device" }), locked);
+  assert.equal(keyring.items.size, 1, "Nothing was deleted while the keyring was locked");
+  keyring.unlock();
+  assert.equal(await unprotectSecret(stored, keyring.options), "value");
+  await discardSecret(stored, keyring.options);
+  assert.equal(keyring.items.size, 0);
+});
+
+test("Windows Constrained Language Mode is named instead of a startup timeout", async () => {
+  assert.equal(
+    windowsPolicyBlocked,
+    "Windows policy blocks the PowerShell features Versionstead needs (Constrained Language Mode).",
+  );
+  assert.equal(
+    await windowsPolicyIssue(async () => ({ code: 0, stdout: "versionstead-full-language\r\n" })),
+    null,
+  );
+  assert.equal(
+    await windowsPolicyIssue(async () => ({
+      code: 3,
+      stdout: "versionstead-constrained-language\r\n",
+    })),
+    windowsPolicyBlocked,
+  );
+  assert.match(dpapiScript("Protect").split("\n")[0], /LanguageMode -ne 'FullLanguage'/);
+});
+
+test("DPAPI names the constrained marker before it reads the exit code, and fails generically otherwise", async () => {
+  const generic = (error) =>
+    !(error instanceof InputError) &&
+    error.message === "Windows could not protect the local coordinator capability";
+  // The language guard exits 3 after printing its marker: the policy is named, not the exit code.
+  await assert.rejects(
+    dpapi("AA==", "Protect", async () => ({
+      code: 3,
+      stdout: "versionstead-constrained-language\r\n",
+    })),
+    (error) => error instanceof InputError && error.message === windowsPolicyBlocked,
+  );
+  for (const result of [
+    { code: 1, stdout: "" }, // A blob this PC cannot decrypt: an unreadable credential.
+    { code: 3, stdout: "QUJD" }, // Base64 text does not excuse a failed exit code.
+    { code: 0, stdout: "not base64!" },
+  ])
+    await assert.rejects(
+      dpapi("AA==", "Protect", async () => result),
+      generic,
+    );
+  // What runs is the guarded script for that operation, with the value on standard input.
+  const calls = [];
+  const text = await dpapi("AA==", "Unprotect", async (script, input) => {
+    calls.push([script, input]);
+    return { code: 0, stdout: "QUJD\r\n" };
+  });
+  assert.equal(text, "QUJD");
+  assert.deepEqual(calls, [[dpapiScript("Unprotect"), "AA=="]]);
+});
+
+test("a DPAPI run that never finished is a storage failure to try again, not a credential that cannot be read", async () => {
+  // No exit code at all: PowerShell timed out or could not start.
+  for (const [operation, message] of [
+    ["Unprotect", "Windows did not finish reading the protected credential. Try again."],
+    ["Protect", "Windows did not finish protecting the credential. Try again."],
+  ])
+    await assert.rejects(
+      dpapi("AA==", operation, async () => ({ code: null, stdout: "" })),
+      (error) => error instanceof CredentialStorageUnavailable && error.message === message,
+      operation,
+    );
+  // The policy marker still wins over a missing exit code, and a failed exit stays generic.
+  await assert.rejects(
+    dpapi("AA==", "Unprotect", async () => ({
+      code: null,
+      stdout: "versionstead-constrained-language\r\n",
+    })),
+    (error) =>
+      error instanceof InputError &&
+      !(error instanceof CredentialStorageUnavailable) &&
+      error.message === windowsPolicyBlocked,
+  );
+  await assert.rejects(
+    dpapi("AA==", "Unprotect", async () => ({ code: 1, stdout: "" })),
+    (error) => !(error instanceof InputError),
+  );
+});
+
+test(
+  "a real PowerShell session switched to Constrained Language Mode is named, and DPAPI never runs",
+  { skip: process.platform !== "win32" },
+  async () => {
+    assert.equal(await windowsPolicyIssue(), null);
+    // The language mode is switched inside the child session only; no machine policy is touched.
+    const constrained = (script, input) =>
+      runPowerShell(
+        `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n${script}`,
+        input,
+      );
+    assert.equal(await windowsPolicyIssue(constrained), windowsPolicyBlocked);
+    const { code, stdout } = await constrained(dpapiScript("Protect"), "AA==");
+    assert.equal(code, 3);
+    assert.match(stdout, /versionstead-constrained-language/);
+  },
+);
+
+test(
+  "a new data directory outside the profile gets an owner, SYSTEM and Administrators ACL on Windows",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    // Only directories this test creates under its own temporary root are ever given an ACL.
+    const base = await mkdtemp(join(tmpdir(), "versionstead-acl-"));
+    t.after(() => rm(base, { recursive: true, force: true }));
+    const profile = join(base, "profile");
+    const outside = join(base, "data");
+    createDataDirectory(outside, "win32", profile);
+    const system32 = join(process.env.SystemRoot, "System32");
+    const owner = /"(S-1-[0-9-]+)"\s*$/.exec(
+      execFileSync(join(system32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
+        encoding: "utf8",
+      }).trim(),
+    )[1];
+    const entries = (path) =>
+      execFileSync(
+        join(system32, "WindowsPowerShell", "v1.0", "powershell.exe"),
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          // sid:inherited:rights:inheritance flags:propagation flags:allow or deny
+          "(Get-Acl -LiteralPath $env:VERSIONSTEAD_ACL_PATH).Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value + ':' + $_.IsInherited + ':' + $_.FileSystemRights + ':' + $_.InheritanceFlags + ':' + $_.PropagationFlags + ':' + $_.AccessControlType }",
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, VERSIONSTEAD_ACL_PATH: path },
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      )
+        .trim()
+        .split(/\r?\n/)
+        .sort();
+    // Exactly three explicit entries, each a full-control allow for this folder, its subfolders and its files.
+    assert.deepEqual(
+      entries(outside),
+      [owner, "S-1-5-18", "S-1-5-32-544"]
+        .map((sid) => `${sid}:False:FullControl:ContainerInherit, ObjectInherit:None:Allow`)
+        .sort(),
+    );
+    const inside = join(profile, "data");
+    createDataDirectory(inside, "win32", profile);
+    assert(
+      entries(inside).every((entry) => entry.split(":")[1] === "True"),
+      "Inside the profile: inherited",
+    );
+    createDataDirectory(outside, "win32", profile); // An existing directory is left alone.
+  },
+);
+
+test("a data directory that cannot be restricted is removed, and the owner's message survives a failed rollback", async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "versionstead-acl-"));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const profile = join(base, "profile");
+  // whoami.exe and icacls.exe are replaced for one synchronous call, so no access list can change. The
+  // replacement fails with a message that holds the path, as a real tool's error would.
+  const restrictFails = (name, beforeFailing) => {
+    const dataDir = join(base, name);
+    const tools = t.mock.method(childProcess, "execFileSync", () => {
+      beforeFailing(dataDir);
+      throw new Error(`The tools failed for ${dataDir}`);
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () => createDataDirectory(dataDir, "win32", profile),
+        (error) => error.message === dataDirectoryNotRestricted,
+      );
+    } finally {
+      tools.mock.restore();
+      syncBuiltinESMExports();
+    }
+    return dataDir;
+  };
+  assert(
+    !existsSync(restrictFails("tools-fail", () => {})),
+    "No unrestricted folder is left behind",
+  );
+  // A rollback that fails as well (here a file arrived in the new folder) must not replace the message
+  // with a raw file-system error that holds the path.
+  const kept = restrictFails("rollback-fails", (dataDir) =>
+    writeFileSync(join(dataDir, "arrived"), ""),
+  );
+  assert(existsSync(join(kept, "arrived")));
+});
+
+test(
+  "the coordinator program shows the data-folder message, with no path, when a new folder cannot be restricted",
+  { skip: process.platform !== "win32" },
+  async (t) => {
+    const base = await mkdtemp(join(tmpdir(), "versionstead-acl-"));
+    t.after(() => rm(base, { recursive: true, force: true }));
+    const dataDir = join(base, "data");
+    // Node cannot start without a real SystemRoot, so a preload moves it (and the profile) once Node has
+    // started: the folder then lies outside the profile and no Windows tool can run.
+    const preload = `data:text/javascript,${encodeURIComponent(
+      `process.env.SystemRoot = ${JSON.stringify(join(base, "no-windows"))}; process.env.USERPROFILE = ${JSON.stringify(join(base, "profile"))};`,
+    )}`;
+    const started = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        preload,
+        fileURLToPath(new URL("../dist/bin.js", import.meta.url)),
+        "--data-dir",
+        dataDir,
+        "--port",
+        "0",
+      ],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    assert.equal(started.status, 1, started.stderr);
+    assert.equal(started.stderr.trim(), dataDirectoryNotRestricted);
+    assert(!started.stderr.includes(base), "The path stays out of the output");
+    assert(!existsSync(dataDir), "The folder that could not be restricted is not left behind");
+  },
+);
+
+test(
+  "a new data directory is owner-only on macOS and Linux",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const base = await mkdtemp(join(tmpdir(), "versionstead-mode-"));
+    t.after(() => rm(base, { recursive: true, force: true }));
+    const dataDir = join(base, "data");
+    createDataDirectory(dataDir);
+    assert.equal(statSync(dataDir).mode & 0o777, 0o700);
+  },
+);
 
 test("static serving exposes built routes/assets, never arbitrary workspace paths", async () => {
   const webRoot = await mkdtemp(join(tmpdir(), "versionstead-test-"));

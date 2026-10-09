@@ -47,6 +47,7 @@ import { Input } from "./components/ui/input";
 import {
   attentionGroups,
   attentionSearch,
+  bootHostBadge,
   platformLabel,
   plural,
   restartAdvice,
@@ -170,7 +171,7 @@ function ConnectionNotice() {
     snapshot &&
     (!snapshot.scanProgress ||
       snapshot.inventory.collector !== "npm-bun-global-v1" ||
-      snapshot.features !== "settings-repositories-connections-v8") &&
+      snapshot.features !== "settings-repositories-connections-v9") &&
     snapshot.runtime.startedAt !== dismissedBuild
   )
     // Nothing is held back by this banner (the PC scan controls say so themselves), so it can be
@@ -250,7 +251,7 @@ function ShellContent() {
       : snapshot?.settings.paused
         ? "Coordinator running · scans paused"
         : snapshot?.runtime.host === "boot-task"
-          ? "Boot host connected"
+          ? `${bootHostBadge(snapshot.runtime.platform)} connected`
           : "Session coordinator running";
   return (
     <div className="app-shell" data-sidebar-collapsed={collapsed}>

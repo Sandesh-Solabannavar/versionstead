@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { Project } from "@versionstead/contracts/monitoring";
 import {
+  commandRunnerNote,
+  commandSyntaxNote,
+  commandsNote,
   groupSettingsProjects,
   actionForChord,
   actionShortcutConflict,
@@ -114,4 +117,21 @@ test("a saved action shortcut runs on the chord it is now typed as, unless somet
   // Nothing pressed, or nothing saved for it.
   assert.equal(actionForChord(actions, null, defaultBindings), undefined);
   assert.equal(actionForChord(actions, "mod+alt+x", defaultBindings), undefined);
+});
+
+test("command notes name the shell that runs a command and the syntax to write", () => {
+  assert.equal(commandRunnerNote(undefined, null), "");
+  assert.equal(
+    commandRunnerNote("win32", null),
+    " PowerShell runs as your signed-in Windows user.",
+  );
+  assert.equal(
+    commandRunnerNote("darwin", "/bin/zsh"),
+    " /bin/zsh runs it as a login shell as your user.",
+  );
+  assert.equal(commandRunnerNote("linux", null), " Your login shell runs it as your user.");
+  assert.match(commandSyntaxNote("win32"), /PowerShell/);
+  assert.doesNotMatch(commandSyntaxNote("linux"), /PowerShell/);
+  assert.match(commandSyntaxNote(undefined), /login shell/);
+  assert.doesNotMatch(commandsNote, /Windows/);
 });

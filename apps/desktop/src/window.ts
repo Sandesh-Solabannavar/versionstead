@@ -1,6 +1,10 @@
 import { readFile, writeFile, rename, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { BrowserWindowConstructorOptions, MenuItemConstructorOptions } from "electron";
+import type {
+  BrowserWindow,
+  BrowserWindowConstructorOptions,
+  MenuItemConstructorOptions,
+} from "electron";
 import {
   decodeWindowPreferences,
   type WindowBounds,
@@ -73,6 +77,23 @@ export function initialWindowBounds(
     ? b
     : { width: 1280, height: 860 };
 }
+/** BrowserWindow.maximize() also shows a hidden window, so a window that starts hidden (a login start)
+ * is maximized by its own first show instead. */
+export function restoreMaximized(
+  window: Pick<BrowserWindow, "maximize" | "once">,
+  maximized: boolean,
+  show: boolean,
+) {
+  if (!maximized) return;
+  if (show) window.maximize();
+  else window.once("show", () => window.maximize());
+}
+/** The maximized choice to save. A hidden start that was never shown is not maximized yet, so it keeps
+ * the saved choice instead of overwriting it with false. */
+export const maximizedToSave = (
+  window: Pick<BrowserWindow, "isMaximized" | "isVisible">,
+  saved: boolean,
+) => window.isMaximized() || (!window.isVisible() && saved);
 export async function loadWindowPreferences(directory: string): Promise<WindowPreferences> {
   try {
     const file = join(directory, "window-settings.json");

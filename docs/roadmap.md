@@ -53,7 +53,7 @@ Acceptance:
 
 Project display names/icons, confirmed removal, and manually launched owner commands for local checkouts are implemented; see [Project settings](project-settings.md). Background scanning remains read-only. Remote project administration/command execution, worktree workflows, and automatic project scripts remain outside the current scope.
 
-Status: selected GitHub.com/GitLab.com repository scans, Windows-protected credentials, routed settings, release checks, and pinned HTTPS pairing/evidence/scan/revocation are implemented. Connections follows T3 Code's grouped settings and Remote link/SSH dialog, with pairing-link autofill, saved-environment switches, and action menus. Optional owner-session OpenSSH forwarding targets an already-running monitor. Each paired PC's evidence is read on demand and saved only when it changes (Wave 3). Regression checks exercise two isolated HTTPS coordinators and pinned TLS through a controlled TCP forward. Physical second-PC networking, actual SSH authentication, firewall configuration, sign-out operation, central cross-device notifications, certificate rotation, and managed Tailscale MagicDNS/Serve remain open.
+Status: selected GitHub.com/GitLab.com repository scans, credentials protected by Windows DPAPI, the macOS login keychain, or the Linux Secret Service, routed settings, release checks, and pinned HTTPS pairing/evidence/scan/revocation are implemented. Connections follows T3 Code's grouped settings and Remote link/SSH dialog, with pairing-link autofill, saved-environment switches, and action menus. Optional owner-session OpenSSH forwarding targets an already-running monitor. Each paired PC's evidence is read on demand and saved only when it changes (Wave 3). Regression checks exercise two isolated HTTPS coordinators and pinned TLS through a controlled TCP forward. Physical second-PC networking, actual SSH authentication, firewall configuration, sign-out operation, central cross-device notifications, certificate rotation, and managed Tailscale MagicDNS/Serve remain open.
 
 Scope: independently running coordinators with explicit LAN/Tailscale pairing, and selected GitHub/GitLab repositories.
 
@@ -67,6 +67,8 @@ Acceptance:
 - One advisory can show every affected device/project, while preserving each source’s evidence and freshness.
 
 ## 4 — Cross-platform daily use
+
+Status: macOS/Linux connection credentials (OS keychain), paired-PC hosting, custom commands, a background host (LaunchAgent, systemd user service) and open-at-login are implemented with the automated checks listed in the [README platform table](../README.md#platform-support); Homebrew and Linux package-manager adapters, packaging, digests and hardware acceptance remain open.
 
 Scope: macOS/Homebrew and Linux package-manager adapters, tested desktop packaging, digests, snoozes, and lifecycle signals.
 

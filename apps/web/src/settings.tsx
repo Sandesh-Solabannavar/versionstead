@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation } from "@tanstack/react-router";
 import { type ProviderKind } from "@versionstead/contracts/application";
+import { decodeLoginItemState } from "@versionstead/contracts/desktop";
 import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { useMonitoring } from "./monitoring";
@@ -9,12 +10,7 @@ import { useAppearance } from "./theme";
 import { ConnectionsSettings } from "./connections-settings";
 import { ProjectSettings } from "./project-settings";
 import { AppearanceSettings } from "./appearance-settings";
-import {
-  SettingRow,
-  SettingGroup,
-  Choice,
-  credentialStorageNote,
-} from "./components/settings-controls";
+import { SettingRow, SettingGroup, Choice } from "./components/settings-controls";
 import { SourceControlRow } from "./components/source-control-row";
 import {
   GitIcon,
@@ -25,7 +21,11 @@ import {
   BitbucketIcon,
   ForgejoIcon,
 } from "./components/source-control-icons";
-import { providerPresentation } from "./source-control-status";
+import {
+  credentialStorageLocation,
+  credentialStorageMessage,
+  providerPresentation,
+} from "./source-control-status";
 import { AddProjectDialog } from "./add-project";
 import { RedactedSensitiveText } from "./components/redacted-sensitive-text";
 import { RefreshIcon } from "./components/ui/refresh-icon";
@@ -53,9 +53,16 @@ import {
   EvidenceBadge,
   FindingBadge,
   ScanProgress,
+  reportError,
   timestamp,
 } from "./ui";
-import { attentionGroups, installationCandidate, plural, workspaceLabel } from "./monitoring-view";
+import {
+  attentionGroups,
+  hostLabel,
+  installationCandidate,
+  plural,
+  workspaceLabel,
+} from "./monitoring-view";
 import { latestEvidence } from "./computer-evidence";
 import { settingsSections } from "./settings-navigation";
 import { SettingsSearchTargets } from "./components/settings-controls";
@@ -71,6 +78,58 @@ function scanIntervals(current: number) {
       value: String(value),
       label: value < 60 ? `${value} minutes` : `${value / 60} ${value === 60 ? "hour" : "hours"}`,
     }));
+}
+
+/** Desktop only: the OS entry that opens the tray app hidden at login, read back from the OS. */
+function LoginItemRow() {
+  const api = window.versionstead;
+  const [openAtLogin, setOpenAtLogin] = useState<boolean | null>(null);
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    if (!api?.loginItem) return;
+    let active = true;
+    void api
+      .loginItem()
+      .then((value) => {
+        if (active) setOpenAtLogin(decodeLoginItemState(value).openAtLogin);
+      })
+      .catch(() => {
+        if (active) reportError("The login setting could not be read from the operating system.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [api]);
+  const setLoginItem = api?.setLoginItem;
+  if (!api?.loginItem || !setLoginItem) return null;
+  return (
+    <SettingGroup title="Desktop app">
+      <SettingRow
+        label="Open Versionstead at login"
+        description="Start the tray app hidden when you sign in. The switch shows what the operating system has registered for this app and checkout."
+        searchable={false}
+      >
+        <Switch
+          aria-label="Open Versionstead at login"
+          checked={openAtLogin ?? false}
+          disabled={openAtLogin === null || pending}
+          onCheckedChange={(value) => {
+            setPending(true);
+            void setLoginItem(value)
+              .then((result) => setOpenAtLogin(decodeLoginItemState(result).openAtLogin))
+              .catch((failure: unknown) =>
+                reportError(
+                  failure instanceof Error
+                    ? failure.message
+                    : "The login setting could not be changed.",
+                ),
+              )
+              .finally(() => setPending(false));
+          }}
+        />
+      </SettingRow>
+    </SettingGroup>
+  );
 }
 
 function GeneralSettings() {
@@ -173,8 +232,9 @@ function GeneralSettings() {
           />
         </SettingRow>
       </SettingGroup>
+      <LoginItemRow />
       <p className="muted">
-        Host: {snapshot.runtime.host === "boot-task" ? "Windows boot task" : "Signed-in session"}.{" "}
+        Host: {hostLabel(snapshot.runtime.host, snapshot.runtime.platform)}.{" "}
         <Link to="/service" className="text-link">
           View background setup, scan history, and service health
         </Link>
@@ -299,6 +359,7 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
   const name = kind === "github" ? "GitHub" : "GitLab";
   const key = actionKeys.provider(kind);
   const connecting = pending.has(key);
+  const storageNote = snapshot ? credentialStorageMessage(snapshot) : null;
   return (
     // Closing mid-request would lose the message, so the dialog stays until the request settles.
     <Dialog title={`Connect ${name}`} onClose={onClose} dismissible={!connecting}>
@@ -339,8 +400,8 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
           />
         </label>
         <p className="muted small">
-          Stored with Windows DPAPI on this monitoring host. Tokens never appear in saved browser
-          preferences.
+          {credentialStorageLocation(monitoring?.runtime.platform ?? "")} Tokens never appear in
+          saved browser preferences.
         </p>
         <div className="dialog-actions">
           <Button
@@ -374,7 +435,7 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
             Use signed-in {kind === "github" ? "gh" : "glab"} CLI
           </Button>
         </div>
-        {!snapshot?.credentialStorageAvailable && <p role="alert">{credentialStorageNote}</p>}
+        {storageNote && <p role="alert">{storageNote}</p>}
         {error && (
           <p className="error-text" role="alert">
             {error}
@@ -394,6 +455,7 @@ function SourceControlSettings() {
     disconnecting !== null,
   );
   if (!app || !snapshot) return null;
+  const storageNote = credentialStorageMessage(app);
   const disabled = connection !== "connected";
   // Each control waits only for its own save, so changing one never holds back another.
   const unavailable = (key: string) => disabled || pending.has(key);
@@ -605,7 +667,7 @@ function SourceControlSettings() {
                   ))}
                 </ul>
               )}
-              {!app.credentialStorageAvailable && <p role="status">{credentialStorageNote}</p>}
+              {storageNote && <p role="status">{storageNote}</p>}
               <div className="provider-actions">
                 <Button
                   size="sm"

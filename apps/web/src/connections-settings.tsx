@@ -22,13 +22,9 @@ import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { request, useMonitoring } from "./monitoring";
 import { actionKeys } from "./monitoring-actions";
-import { backgroundSummary } from "./monitoring-view";
-import {
-  SettingGroup,
-  SettingRow,
-  Choice,
-  credentialStorageNote,
-} from "./components/settings-controls";
+import { backgroundSummary, bootHostBadge, firewallName } from "./monitoring-view";
+import { SettingGroup, SettingRow, Choice } from "./components/settings-controls";
+import { credentialStorageMessage } from "./source-control-status";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./components/ui/menu";
 import { Switch } from "./components/ui/switch";
 import { RefreshIcon } from "./components/ui/refresh-icon";
@@ -517,6 +513,7 @@ export function ConnectionsSettings() {
     return () => window.clearInterval(timer);
   }, [invite]);
   if (!app || !snapshot) return null;
+  const storageNote = credentialStorageMessage(app);
   const connected = connection === "connected";
   // Each control waits only for its own action, so a slow one never holds back the rest.
   const waiting = (key: string) => !connected || pending.has(key);
@@ -578,10 +575,9 @@ export function ConnectionsSettings() {
               : "Check for updates";
   return (
     <div className="connections-settings">
-      {!protectedCredentials && (
+      {storageNote && (
         <p id={credentialNoteId} role="status" className="source-control-note">
-          {credentialStorageNote} Network access, Tailscale setup, and Add environment stay off
-          here.
+          {storageNote} Network access, Tailscale setup, and Add environment stay off here.
         </p>
       )}
       <SettingGroup
@@ -671,8 +667,16 @@ export function ConnectionsSettings() {
         <SettingRow
           label="Network access"
           description={
-            app.sharing.error ??
-            (origin ? `${origin} · Paired devices only.` : "Limited to this machine.")
+            <>
+              {app.sharing.error ??
+                (origin ? `${origin} · Paired devices only.` : "Limited to this machine.")}
+              {app.sharing.notice && (
+                <>
+                  {" "}
+                  <span role="status">{app.sharing.notice}</span>
+                </>
+              )}
+            </>
           }
         >
           <div className="row-actions">
@@ -732,7 +736,7 @@ export function ConnectionsSettings() {
         <SettingRow label="Background monitoring" description={backgroundSummary(snapshot.runtime)}>
           <span className="muted small">
             {snapshot.runtime.host === "boot-task"
-              ? "Boot host"
+              ? bootHostBadge(snapshot.runtime.platform)
               : snapshot.runtime.mode === "background"
                 ? "Background host"
                 : "Owner session"}
@@ -895,8 +899,8 @@ export function ConnectionsSettings() {
               </label>
             </div>
             <p className="muted small">
-              Allow the chosen port for trusted LAN or tailnet peers in Windows Firewall. A pairing
-              link is still required.
+              Allow the chosen port for trusted LAN or tailnet peers in{" "}
+              {firewallName(snapshot.runtime.platform)}. A pairing link is still required.
             </p>
             {!chosen && (
               <p className="connection-form-error">
