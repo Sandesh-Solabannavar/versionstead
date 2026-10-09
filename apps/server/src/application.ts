@@ -75,6 +75,7 @@ const equal = (a: string, b: string) =>
 const now = () => new Date().toISOString();
 const restartFailure =
   "The paired-PC host could not restart. Check its address, certificate, and network access.";
+const unreadableCredential = "The saved credential could not be unlocked on this monitoring host.";
 
 export class ApplicationService {
   private state: State;
@@ -112,6 +113,10 @@ export class ApplicationService {
   private storage: { issue: string | null; at: number } | null = null;
   private storageCheck: Promise<string | null> | null = null;
   private sharingWork: Promise<unknown> = Promise.resolve();
+  // When each saved credential last failed to be read, for a reason other than its store (which the
+  // check above remembers). Polls, scans and the sharing retry leave it alone for a minute, as they
+  // would otherwise run the keychain tool, a Linux probe or DPAPI for it every 30 seconds.
+  private readonly unreadable = new Map<string, number>();
 
   private constructor(
     coordinator: MonitoringCoordinator,
@@ -277,6 +282,10 @@ export class ApplicationService {
     const known = this.storage;
     if (known && (known.issue === null || (!force && Date.now() - known.at < 60_000)))
       return known.issue;
+    return this.probeCredentialStorage();
+  }
+  // One probe at a time; its answer is the latest check.
+  private probeCredentialStorage() {
     this.storageCheck ??= credentialStorageIssue(this.credentials)
       .catch(() => "Protected credential storage could not be checked on this monitoring host.")
       .then((issue) => {
@@ -290,6 +299,19 @@ export class ApplicationService {
   }
   private async requireCredentialStorage() {
     const issue = await this.checkCredentialStorage();
+    if (issue) throw new CredentialStorageUnavailable(issue);
+  }
+  /**
+   * Proves the store works now, before a step that cannot be taken back (pairing uses up the other
+   * PC's one-time invitation): DPAPI protects a throwaway value, and a keychain is probed afresh
+   * instead of trusting the last check, which a keyring locked since then would still pass.
+   */
+  private async verifyCredentialStorage() {
+    if ((this.credentials.platform ?? process.platform) === "win32") {
+      await protectSecret("pairing-storage-check", this.credentials);
+      return;
+    }
+    const issue = await this.probeCredentialStorage();
     if (issue) throw new CredentialStorageUnavailable(issue);
   }
   // The held success above is not checked again, so a store that the credential layer finds missing
@@ -313,13 +335,18 @@ export class ApplicationService {
     const entry = this.state.secrets.find((s) => s.key === key);
     if (!entry) throw new InputError("Reconnect this source to restore its protected credentials.");
     await this.requireCredentialStorage();
+    const failed = this.unreadable.get(key);
+    if (failed !== undefined && Date.now() - failed < 60_000)
+      throw new InputError(unreadableCredential);
     try {
       const value = await unprotectSecret(entry.encrypted, this.credentials);
+      this.unreadable.delete(key);
       this.plainSecrets.set(key, value);
       return value;
     } catch (error) {
       if (error instanceof CredentialStorageUnavailable) throw this.storageFailed(error);
-      throw new InputError("The saved credential could not be unlocked on this monitoring host.");
+      this.unreadable.set(key, Date.now());
+      throw new InputError(unreadableCredential);
     }
   }
   private async storeSecret(key: string, value: string) {
@@ -414,9 +441,11 @@ export class ApplicationService {
               this.fetcher,
               this.shutdown.signal,
             );
-          } catch {
+          } catch (cause) {
             error =
-              "Provider authentication could not be verified. Check the connection, token permissions, and provider availability, or reconnect.";
+              cause instanceof CredentialStorageUnavailable
+                ? cause.message
+                : "Provider authentication could not be verified. Check the connection, token permissions, and provider availability, or reconnect.";
           }
           if (
             this.shutdown.signal.aborted ||
@@ -503,10 +532,12 @@ export class ApplicationService {
       this.updateProvider(kind, { checkedAt: now(), error: null });
       this.save();
       return repositories;
-    } catch {
+    } catch (cause) {
       this.updateProvider(kind, {
         error:
-          "Repository discovery failed. Check read permissions, authentication, and the provider rate limit.",
+          cause instanceof CredentialStorageUnavailable
+            ? cause.message
+            : "Repository discovery failed. Check read permissions, authentication, and the provider rate limit.",
       });
       this.save();
       throw new InputError(this.provider(kind).error!);
@@ -819,7 +850,7 @@ export class ApplicationService {
     const local = this.coordinator.device;
     const id = randomUUID();
     // Verify OS-backed storage before consuming the remote one-time invitation.
-    await this.requireCredentialStorage();
+    await this.verifyCredentialStorage();
     let response;
     try {
       response = object(

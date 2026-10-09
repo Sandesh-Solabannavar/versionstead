@@ -12,9 +12,10 @@ import {
   keychainIssue,
   readFromKeychain,
   storeInKeychain,
-  unsupportedCredentialStorage,
   type CredentialOptions,
 } from "./adapters/keychain.ts";
+
+export { CredentialStorageUnavailable } from "./adapters/keychain.ts";
 
 // The only frontend origin a development coordinator accepts besides its own.
 export const DEV_ORIGIN = "http://127.0.0.1:4317";
@@ -119,49 +120,24 @@ $result = [Security.Cryptography.ProtectedData]::${operation}($bytes, $entropy, 
   });
 }
 
-/** A credential store that is missing, locked or unsupported; the message says what to do about it. */
-export class CredentialStorageUnavailable extends InputError {}
-
 const keychainPlatform = (options: CredentialOptions) => {
   const platform = options.platform ?? process.platform;
   return platform === "darwin" || platform === "linux";
 };
 
 /**
- * Asked after a keychain call failed or found nothing. secret-tool answers a locked keyring's lookup
- * and clear exactly as it answers a missing item, so only a fresh probe tells the two apart.
- */
-async function unavailable(options: CredentialOptions) {
-  const issue = await keychainIssue(options).catch(() => null);
-  return issue === null ? null : new CredentialStorageUnavailable(issue);
-}
-
-/** A failed keychain call reports a missing or locked store as that, before its own error. */
-async function keychainCall<T>(call: Promise<T>, options: CredentialOptions): Promise<T> {
-  try {
-    return await call;
-  } catch (error) {
-    throw (await unavailable(options)) ?? error;
-  }
-}
-
-/**
  * Windows protects a secret with machine-scope DPAPI and returns the blob. macOS and Linux keep it in
  * the OS keychain under a random handle namespaced by the monitoring database and return a
- * `keychain:v1:` reference. Either result is what SQLite stores.
+ * `keychain:v1:` reference; the keychain adapter refuses any other platform. Either result is what
+ * SQLite stores.
  */
 export async function protectSecret(
   value: string,
   options: CredentialOptions & { namespace?: string } = {},
 ): Promise<string> {
-  const platform = options.platform ?? process.platform;
-  if (platform === "win32") return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
-  if (!keychainPlatform(options))
-    throw new CredentialStorageUnavailable(unsupportedCredentialStorage);
-  return keychainCall(
-    storeInKeychain(value, options.namespace ?? "versionstead", options),
-    options,
-  );
+  if ((options.platform ?? process.platform) === "win32")
+    return dpapi(Buffer.from(value, "utf8").toString("base64"), "Protect");
+  return storeInKeychain(value, options.namespace ?? "versionstead", options);
 }
 
 export async function unprotectSecret(
@@ -173,7 +149,7 @@ export async function unprotectSecret(
       throw new InputError(
         "This credential is in a macOS or Linux keychain. Reconnect it on this host.",
       );
-    return keychainCall(readFromKeychain(reference, options), options);
+    return readFromKeychain(reference, options);
   }
   if ((options.platform ?? process.platform) !== "win32")
     throw new InputError(
@@ -184,15 +160,11 @@ export async function unprotectSecret(
 
 /**
  * Deletes a keychain item; a DPAPI blob lives only in SQLite and leaves with its record, and another
- * host's keychain is out of reach. A delete that a locked keyring could not run is an error, never a
- * silent success.
+ * host's keychain is out of reach. A locked or missing store throws rather than passing for deleted.
  */
 export async function discardSecret(reference: string, options: CredentialOptions = {}) {
-  if (!isKeychainReference(reference) || !keychainPlatform(options)) return;
-  if (await keychainCall(deleteFromKeychain(reference, options), options)) return;
-  // Nothing was deleted: the item was gone already, or a locked Linux keyring says the same.
-  const issue = await unavailable(options);
-  if (issue) throw issue;
+  if (isKeychainReference(reference) && keychainPlatform(options))
+    await deleteFromKeychain(reference, options);
 }
 
 /** Null when this host can keep protected credentials; otherwise what is missing and how to get it. */

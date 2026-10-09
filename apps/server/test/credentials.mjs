@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -74,5 +75,41 @@ export function fakeKeyring({ locked = false } = {}) {
       unlocked = true;
     },
     options: { platform: "linux", tool: "/usr/bin/secret-tool", run },
+  };
+}
+
+/**
+ * An in-memory stand-in for /usr/bin/security that parses the `-i` line like the real tool. Missing
+ * items exit 44. A locked keychain refuses every command, though `security -i` itself still exits 0.
+ */
+export function fakeSecurity() {
+  const items = new Map();
+  const calls = [];
+  let unlocked = true;
+  const run = async (file, args, input = "") => {
+    calls.push({ file, args, input });
+    if (args[0] === "-i") {
+      const words = input.trim().split(" ");
+      assert.equal(words[0], "add-generic-password");
+      if (unlocked) items.set(words[words.indexOf("-a") + 1], words[words.indexOf("-w") + 1]);
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (!unlocked) return { code: 36, stdout: "", stderr: "User interaction is not allowed.\n" };
+    const account = args[args.indexOf("-a") + 1];
+    if (args[0] === "find-generic-password")
+      return items.has(account)
+        ? { code: 0, stdout: `${items.get(account)}\n`, stderr: "" }
+        : { code: 44, stdout: "", stderr: "The specified item could not be found.\n" };
+    if (args[0] === "delete-generic-password")
+      return { code: items.delete(account) ? 0 : 44, stdout: "", stderr: "" };
+    return { code: 1, stdout: "", stderr: "unknown command" };
+  };
+  return {
+    items,
+    calls,
+    lock: () => {
+      unlocked = false;
+    },
+    options: { platform: "darwin", tool: "/usr/bin/security", run },
   };
 }

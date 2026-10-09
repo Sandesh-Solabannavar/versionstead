@@ -669,7 +669,7 @@ test("credential storage names what is missing and never reads a reference with 
   });
 });
 
-test("a keychain call that fails or finds nothing checks the store again, so a locked Linux keyring never reads as a missing item", async () => {
+test("a locked Linux keyring never reads as a missing credential or a completed deletion", async () => {
   const keyring = fakeKeyring();
   const reference = `keychain:v1:device.${"A".repeat(22)}`;
   const locked = (error) =>

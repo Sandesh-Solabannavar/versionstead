@@ -29,7 +29,7 @@ import {
   decodeComputerSnapshot,
 } from "@versionstead/contracts/application";
 import { runTool, toolExecutable, inspectGit } from "../dist/adapters/development-tools.js";
-import { fakeKeyring, keyringSkip, testCredentials } from "./credentials.mjs";
+import { fakeKeyring, fakeSecurity, keyringSkip, testCredentials } from "./credentials.mjs";
 
 const sha = "a".repeat(40);
 const files = {
@@ -341,17 +341,7 @@ test("a host without supported credential storage says why in its snapshot and r
   await assert.rejects(app.changeSharing(true, "127.0.0.1", await freePort()), {
     message: unsupported,
   });
-  const invitation = Buffer.from(
-    JSON.stringify({
-      version: 1,
-      origin: "https://100.64.1.2:4389",
-      fingerprint: "a".repeat(64),
-      deviceId: randomUUID(),
-      label: "Studio",
-      code: randomBytes(32).toString("base64url"),
-    }),
-  ).toString("base64url");
-  await assert.rejects(app.pairComputer(invitation), { message: unsupported });
+  await assert.rejects(app.pairComputer(pairingInvitation()), { message: unsupported });
 });
 
 test("reconnecting deletes the previous keychain item and disconnecting deletes the current one", async (t) => {
@@ -702,7 +692,13 @@ test("shared evidence leaves out the feature marker, so a PC on the previous bui
 
 function seedApplication(
   core,
-  { computers = [], automaticAppUpdateChecks = false, secrets = [], sharing = {} } = {},
+  {
+    computers = [],
+    automaticAppUpdateChecks = false,
+    secrets = [],
+    sharing = {},
+    providers = {},
+  } = {},
 ) {
   core.readApplication(); // Creates the table the first write needs.
   core.writeApplication({
@@ -713,6 +709,7 @@ function seedApplication(
       account: null,
       checkedAt: null,
       error: null,
+      ...providers[kind],
     })),
     computers,
     sharing: {
@@ -739,6 +736,19 @@ const pairedComputer = (label) => ({
   snapshot: null,
   enabled: true,
 });
+// A pairing code as another PC's Create pairing link encodes it.
+function pairingInvitation() {
+  return Buffer.from(
+    JSON.stringify({
+      version: 1,
+      origin: "https://100.64.1.2:4389",
+      fingerprint: "a".repeat(64),
+      deviceId: randomUUID(),
+      label: "Studio",
+      code: randomBytes(32).toString("base64url"),
+    }),
+  ).toString("base64url");
+}
 
 test("a PC removed or disabled while a poll awaits another never rejects the poll", async (t) => {
   const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
@@ -966,6 +976,134 @@ test("a keyring that locks after a successful check is reported locked, never ta
     [read.id],
   );
   assert.equal(keyring.items.size, 2, "The removed PC's item stays in the locked keyring");
+});
+
+test("pairing proves the credential store works before it uses up the other PC's invitation", async (t) => {
+  const presented = [];
+  const peer = async (_origin, _fingerprint, path) => {
+    presented.push(path);
+    throw new Error("The test never reaches the other PC.");
+  };
+  const opened = [];
+  t.after(async () => {
+    for (const { app, core } of opened) {
+      await app.close();
+      await core.close();
+    }
+    await cleanupTemporary(t);
+  });
+  const open = async (credentials) => {
+    const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    core.changeSettings({ paused: true });
+    const app = await ApplicationService.create(core, undefined, peer, undefined, credentials);
+    opened.push({ app, core });
+    return app;
+  };
+  // Windows: DPAPI that cannot run (this SystemRoot has no PowerShell) fails a throwaway protect first.
+  const windows = await open({ platform: "win32" });
+  await windows.readSnapshot(); // Its tool discovery finishes under the real SystemRoot.
+  const systemRoot = process.env.SystemRoot;
+  process.env.SystemRoot = await temporary(t);
+  try {
+    await assert.rejects(windows.pairComputer(pairingInvitation()), /Windows could not protect/);
+  } finally {
+    if (systemRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = systemRoot;
+  }
+  // macOS and Linux: a keyring locked since the last successful check is probed again, not trusted.
+  const keyring = fakeKeyring();
+  const linux = await open(keyring.options);
+  assert.equal((await linux.readSnapshot()).credentialStorageAvailable, true);
+  keyring.lock();
+  await assert.rejects(linux.pairComputer(pairingInvitation()), {
+    message: /^Unlock your login keyring/,
+  });
+  assert.deepEqual(presented, [], "Neither invitation reached its PC");
+});
+
+test("a credential missing from the keychain is read again at most once a minute, and only Linux probes after it", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+  const opened = [];
+  t.after(async () => {
+    for (const { app, core } of opened) {
+      await app.close();
+      await core.close();
+    }
+    await cleanupTemporary(t);
+  });
+  for (const store of [fakeKeyring(), fakeSecurity()]) {
+    const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+    core.changeSettings({ paused: true });
+    const computer = pairedComputer("studio");
+    const handle = `${core.device.id}.${"F".repeat(22)}`; // Never stored.
+    seedApplication(core, {
+      computers: [computer],
+      secrets: [{ key: `computer:${computer.id}`, encrypted: `keychain:v1:${handle}` }],
+    });
+    const app = await ApplicationService.create(
+      core,
+      undefined,
+      undefined,
+      undefined,
+      store.options,
+    );
+    opened.push({ app, core });
+    await app.readSnapshot(); // The storage check.
+    const checked = store.calls.length;
+    for (let poll = 0; poll < 6; poll++) {
+      t.mock.timers.tick(30_000);
+      await app.polling;
+    }
+    const calls = store.calls.slice(checked);
+    const linux = store.options.platform === "linux";
+    assert.equal(
+      calls.filter((call) => call.args.includes(handle)).length,
+      3,
+      "Three minutes of polls read the item three times",
+    );
+    assert.equal(
+      calls.filter((call) => call.args[0] === (linux ? "store" : "-i")).length,
+      linux ? 3 : 0,
+      "Only Linux, where a locked lookup looks like a missing item, probes after one",
+    );
+    // A store locked since then is still reported as locked once the minute is up.
+    store.lock();
+    t.mock.timers.tick(30_000);
+    await app.polling;
+    assert.match(
+      app.snapshot().computers[0].error,
+      linux ? /^Unlock your login keyring/ : /^Unlock your macOS login keychain/,
+    );
+    await app.close(); // Its interval must not poll during the next store's minutes.
+  }
+});
+
+test("provider refresh and repository lists on a locked keyring say to unlock it, not to reconnect", async (t) => {
+  const keyring = fakeKeyring({ locked: true });
+  const core = new MonitoringCoordinator({ dataDir: await temporary(t), lookup: false });
+  core.changeSettings({ paused: true });
+  const handle = `${core.device.id}.${"E".repeat(22)}`;
+  keyring.items.set(handle, Buffer.from("fixture-token").toString("base64"));
+  seedApplication(core, {
+    providers: { github: { enabled: true, account: "fixture-owner" } },
+    secrets: [{ key: "provider:github", encrypted: `keychain:v1:${handle}` }],
+  });
+  const app = await ApplicationService.create(
+    core,
+    providerFixture().fetcher,
+    undefined,
+    undefined,
+    keyring.options,
+  );
+  t.after(async () => {
+    await app.close();
+    await core.close();
+    await cleanupTemporary(t);
+  });
+  const unlock = /^Unlock your login keyring/;
+  assert.match((await app.discover(true)).providers[0].error, unlock);
+  await assert.rejects(app.repositories("github"), { message: unlock });
+  assert.match(core.readApplication().providers[0].error, unlock);
 });
 
 // A paired PC whose evidence comes from a second coordinator through an injected peer, so a refresh

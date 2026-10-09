@@ -27,6 +27,9 @@ const linuxMissing =
 const linuxLocked =
   "Unlock your login keyring (GNOME Keyring or KWallet's Secret Service) in a desktop session, then refresh. A background host cannot use it before you log in.";
 
+/** A credential store that is missing, locked or unsupported; the message says what to do about it. */
+export class CredentialStorageUnavailable extends InputError {}
+
 export type KeychainResult = { code: number; stdout: string; stderr: string };
 /**
  * Runs a keychain tool with an argument array and optional stdin; a non-zero exit is a result. The
@@ -84,7 +87,7 @@ async function keychainTool(options: CredentialOptions): Promise<string | null> 
 /** The tool and the runner for one keychain command; a missing tool says what to install. */
 async function keychainCommand(options: CredentialOptions) {
   const file = await keychainTool(options);
-  if (!file) throw new InputError(missingMessage(options));
+  if (!file) throw new CredentialStorageUnavailable(missingMessage(options));
   return { file, run: options.run ?? runKeychain };
 }
 
@@ -123,7 +126,7 @@ async function readHandle(handle: string, options: CredentialOptions): Promise<s
       : await run(file, ["lookup", "service", KEYCHAIN_SERVICE, "account", handle]);
   if (result.code === 0) return decode(result.stdout);
   if (notFound(options, result)) return null;
-  throw new InputError(lockedMessage(options));
+  throw new CredentialStorageUnavailable(lockedMessage(options));
 }
 
 async function deleteHandle(handle: string, options: CredentialOptions) {
@@ -139,14 +142,15 @@ async function deleteHandle(handle: string, options: CredentialOptions) {
           ...keychainArgument(options),
         ])
       : await run(file, ["clear", "service", KEYCHAIN_SERVICE, "account", handle]);
-  if (result.code !== 0 && !notFound(options, result)) throw new InputError(lockedMessage(options));
+  if (result.code !== 0 && !notFound(options, result))
+    throw new CredentialStorageUnavailable(lockedMessage(options));
   return result.code === 0;
 }
 
 async function storeHandle(handle: string, value: string, options: CredentialOptions) {
   const platform = platformOf(options);
   if (platform !== "darwin" && platform !== "linux")
-    throw new InputError(unsupportedCredentialStorage);
+    throw new CredentialStorageUnavailable(unsupportedCredentialStorage);
   const { file, run } = await keychainCommand(options);
   // Base64 keeps quotes, spaces and backslashes away from the `security -i` line parser.
   const encoded = Buffer.from(value, "utf8").toString("base64");
@@ -174,10 +178,11 @@ async function storeHandle(handle: string, value: string, options: CredentialOpt
       ["store", "--label=Versionstead credential", "service", KEYCHAIN_SERVICE, "account", handle],
       encoded,
     );
-    if (result.code !== 0) throw new InputError(lockedMessage(options));
+    if (result.code !== 0) throw new CredentialStorageUnavailable(lockedMessage(options));
   }
   // `security -i` carries on after a failed command, so a store counts only once it reads back.
-  if ((await readHandle(handle, options)) !== value) throw new InputError(lockedMessage(options));
+  if ((await readHandle(handle, options)) !== value)
+    throw new CredentialStorageUnavailable(lockedMessage(options));
 }
 
 export const isKeychainReference = (value: string) => value.startsWith("keychain:v1:");
@@ -202,21 +207,28 @@ export async function storeInKeychain(
   return `keychain:v1:${handle}`;
 }
 
-export async function readFromKeychain(reference: string, options: CredentialOptions = {}) {
-  const value = await readHandle(handleOf(reference), options);
-  if (value === null)
-    throw new InputError(
-      "The saved credential is missing from the OS keychain. Reconnect this source.",
-    );
-  return value;
+/**
+ * After finding nothing: secret-tool answers a locked keyring's lookup and clear exactly as it answers
+ * a missing item, so on Linux only a probe tells them apart. On macOS exit 44 means "not found".
+ */
+async function lockedRatherThanMissing(options: CredentialOptions) {
+  if (platformOf(options) !== "linux") return;
+  const issue = await keychainIssue(options);
+  if (issue) throw new CredentialStorageUnavailable(issue);
 }
 
-/**
- * Deletes the item: true when one was deleted, false when there was none to delete. On Linux a
- * locked keyring also answers false, so a caller that must know checks the store again.
- */
+export async function readFromKeychain(reference: string, options: CredentialOptions = {}) {
+  const value = await readHandle(handleOf(reference), options);
+  if (value !== null) return value;
+  await lockedRatherThanMissing(options);
+  throw new InputError(
+    "The saved credential is missing from the OS keychain. Reconnect this source.",
+  );
+}
+
+/** Deletes the item; one already gone counts as deleted, but a locked or missing store throws. */
 export async function deleteFromKeychain(reference: string, options: CredentialOptions = {}) {
-  return deleteHandle(handleOf(reference), options);
+  if (!(await deleteHandle(handleOf(reference), options))) await lockedRatherThanMissing(options);
 }
 
 /** Null when a probe item round-trips; otherwise what is missing and how to get it. */

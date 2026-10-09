@@ -5,39 +5,16 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { InputError } from "../dist/adapters/projects.js";
 import {
+  CredentialStorageUnavailable,
   KEYCHAIN_SERVICE,
   deleteFromKeychain,
   keychainIssue,
   readFromKeychain,
   storeInKeychain,
 } from "../dist/adapters/keychain.js";
-import { fakeKeyring, testCredentials } from "./credentials.mjs";
+import { fakeKeyring, fakeSecurity, testCredentials } from "./credentials.mjs";
 
 const exec = promisify(execFile);
-
-/** An in-memory stand-in for /usr/bin/security that parses the `-i` line like the real tool. */
-function fakeSecurity() {
-  const items = new Map();
-  const calls = [];
-  const run = async (file, args, input = "") => {
-    calls.push({ file, args, input });
-    if (args[0] === "-i") {
-      const words = input.trim().split(" ");
-      assert.equal(words[0], "add-generic-password");
-      items.set(words[words.indexOf("-a") + 1], words[words.indexOf("-w") + 1]);
-      return { code: 0, stdout: "", stderr: "" };
-    }
-    const account = args[args.indexOf("-a") + 1];
-    if (args[0] === "find-generic-password")
-      return items.has(account)
-        ? { code: 0, stdout: `${items.get(account)}\n`, stderr: "" }
-        : { code: 44, stdout: "", stderr: "The specified item could not be found.\n" };
-    if (args[0] === "delete-generic-password")
-      return { code: items.delete(account) ? 0 : 44, stdout: "", stderr: "" };
-    return { code: 1, stdout: "", stderr: "unknown command" };
-  };
-  return { items, calls, options: { platform: "darwin", tool: "/usr/bin/security", run } };
-}
 
 /** Wraps a runner to note each command and the time limit the module gave it. */
 function watched(options) {
@@ -213,6 +190,47 @@ test("a probe caps each command at five seconds and stops after a store that fai
   );
   for (const call of [...mac.seen, ...closed.seen, ...open.seen])
     assert(call.timeout > 0 && call.timeout <= 5_000, `${call.command} is capped at five seconds`);
+});
+
+test("only Linux probes after finding nothing; a locked store is reported as unavailable without one", async () => {
+  const missing = `keychain:v1:device-1.${"A".repeat(22)}`;
+  const unavailable = (pattern) => (error) =>
+    error instanceof CredentialStorageUnavailable && pattern.test(error.message);
+  // macOS: exit 44 is "not found", and any other failure is the locked keychain.
+  const mac = fakeSecurity();
+  await assert.rejects(readFromKeychain(missing, mac.options), /missing from the OS keychain/);
+  await deleteFromKeychain(missing, mac.options);
+  assert.deepEqual(
+    mac.calls.map((call) => call.args[0]),
+    ["find-generic-password", "delete-generic-password"],
+    "No probe",
+  );
+  mac.lock();
+  for (const operation of [readFromKeychain, deleteFromKeychain])
+    await assert.rejects(
+      operation(missing, mac.options),
+      unavailable(/^Unlock your macOS login keychain/),
+    );
+  await assert.rejects(
+    storeInKeychain("secret", "device-1", mac.options),
+    unavailable(/^Unlock your macOS login keychain/),
+  );
+  // Linux: lookup and clear exit 1 silently whether the item is gone or the keyring is locked.
+  const keyring = fakeKeyring();
+  await assert.rejects(readFromKeychain(missing, keyring.options), /missing from the OS keychain/);
+  await deleteFromKeychain(missing, keyring.options);
+  const probes = () => keyring.calls.filter((call) => call.args[0] === "store").length;
+  assert.equal(probes(), 2, "One probe after each");
+  keyring.lock();
+  for (const operation of [readFromKeychain, deleteFromKeychain])
+    await assert.rejects(
+      operation(missing, keyring.options),
+      unavailable(/^Unlock your login keyring/),
+    );
+  await assert.rejects(
+    storeInKeychain("secret", "device-1", keyring.options),
+    unavailable(/^Unlock your login keyring/),
+  );
 });
 
 test("every operation names the missing tool before running anything", async () => {
