@@ -962,7 +962,14 @@ test(
         ],
         {
           encoding: "utf8",
-          env: { ...process.env, VERSIONSTEAD_ACL_PATH: path },
+          // A PowerShell 7 parent (the CI shell, a pwsh terminal) leaves its own module path, from
+          // which Windows PowerShell 5.1 cannot load Get-Acl; 5.1 rebuilds its default without it.
+          env: {
+            ...Object.fromEntries(
+              Object.entries(process.env).filter(([name]) => name.toLowerCase() !== "psmodulepath"),
+            ),
+            VERSIONSTEAD_ACL_PATH: path,
+          },
           stdio: ["ignore", "pipe", "ignore"],
         },
       )
