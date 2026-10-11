@@ -31,6 +31,8 @@ import {
   inspectBun,
   inspectNode,
   localPath,
+  miseInstalls,
+  miseShim,
   ownNode,
   runBounded,
   toolDirectories,
@@ -701,4 +703,98 @@ test("Git discovery is skipped, not failed, while Git context is off, so the swi
   assert.equal(disabled.git.version, null);
   // Located, not executed: the interface keeps its enable switch whenever Git is installed.
   assert.equal(disabled.git.available, (await developmentTool("git")) !== null);
+});
+
+test("a mise shim is never run to inspect a runtime: mise installs a lazy tool on first use", async (t) => {
+  const root = await temporary(t);
+  const runs = [];
+  const run = async (file) => {
+    runs.push(file);
+    return JSON.stringify({ version: "24.5.0", execPath: process.execPath });
+  };
+  const node = windows ? "node.exe" : "node";
+  assert.equal(
+    await inspectNode(join(root, ".local", "share", "mise", "shims", node), { run }),
+    null,
+  );
+  assert.equal(
+    await inspectBun(join(root, "mise", "shims", windows ? "bun.exe" : "bun"), { run }),
+    null,
+  );
+  const saved = process.env.MISE_DATA_DIR;
+  process.env.MISE_DATA_DIR = join(root, "custom");
+  t.after(() => {
+    if (saved === undefined) delete process.env.MISE_DATA_DIR;
+    else process.env.MISE_DATA_DIR = saved;
+  });
+  assert.equal(await inspectNode(join(root, "custom", "shims", node), { run }), null);
+  assert.deepEqual(runs, [], "no shim was run");
+  assert.ok(
+    await inspectNode(join(root, "bin", node), { run }),
+    "any other candidate is still asked",
+  );
+  assert.equal(runs.length, 1);
+});
+
+test("a link to the mise binary is a shim wherever it sits", { skip: windows }, async (t) => {
+  const root = await temporary(t);
+  const marker = join(root, "ran");
+  await mkdir(join(root, "mise-bin"));
+  await writeFile(join(root, "mise-bin", "mise"), `#!/bin/sh\ntouch '${marker}'\n`);
+  await chmod(join(root, "mise-bin", "mise"), 0o755);
+  await mkdir(join(root, "elsewhere"));
+  await symlink(join(root, "mise-bin", "mise"), join(root, "elsewhere", "node"));
+  assert.equal(await miseShim(join(root, "elsewhere", "node")), true);
+  assert.equal(await inspectNode(join(root, "elsewhere", "node")), null);
+  await assert.rejects(access(marker), "the shim never ran");
+});
+
+test("a Node that only mise provides is found among its installs, newest first", async (t) => {
+  const root = await temporary(t);
+  const data = join(root, "mise");
+  const file = windows ? "node.exe" : "node";
+  for (const version of ["22.11.0", "24.2.0", "24.10.1"])
+    await mkdir(join(data, "installs", "node", version), { recursive: true });
+  assert.deepEqual(
+    await miseInstalls("node", file, { MISE_DATA_DIR: data }),
+    ["24.10.1", "24.2.0", "22.11.0"].map((version) =>
+      windows
+        ? join(data, "installs", "node", version, file)
+        : join(data, "installs", "node", version, "bin", file),
+    ),
+  );
+  assert.deepEqual(await miseInstalls("bun", "bun", { MISE_DATA_DIR: data }), []);
+  assert.deepEqual(await miseInstalls("node", file, { MISE_DATA_DIR: "relative" }), []);
+});
+
+test("development tools come from real files, never from a mise shim", async (t) => {
+  const root = await temporary(t);
+  const name = windows ? "gh.exe" : "gh";
+  const shims = join(root, "mise", "shims");
+  const real = join(root, "real");
+  for (const directory of [shims, real]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, name), "");
+    await chmod(join(directory, name), 0o755);
+  }
+  assert.equal(
+    await developmentTool("gh", { directories: [shims, real], env: {} }),
+    join(real, name),
+  );
+});
+
+test("a Bun that only a mise shim provides is reported as such and never run", async (t) => {
+  const root = await temporary(t);
+  const marker = join(root, "ran");
+  const shims = join(root, "mise", "shims");
+  const name = windows ? "bun.exe" : "bun";
+  await mkdir(shims, { recursive: true });
+  await writeFile(join(shims, name), windows ? "" : `#!/bin/sh\ntouch '${marker}'\n`);
+  await chmod(join(shims, name), 0o755);
+  const bun = (await discoverGlobalToolSources(undefined, [], [shims])).find(
+    (source) => source.manager === "bun",
+  );
+  assert.equal(bun.status, "unavailable");
+  assert.match(bun.error, /mise shim/);
+  await assert.rejects(access(marker), "the shim never ran");
 });

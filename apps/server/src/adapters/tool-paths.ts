@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { access, mkdtemp, readdir, realpath, rm, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
@@ -100,6 +100,55 @@ export function toolDirectories(
     });
 }
 
+/**
+ * A mise shim: a link to the mise binary, or a file in mise's shims directory. mise installs a tool its
+ * owner declared `lazy = true` the first time one of its shims runs, whatever noAutoInstall says
+ * (https://mise.jdx.dev/dev-tools/), so Versionstead never runs one; see miseInstalls for the real binaries.
+ */
+export async function miseShim(
+  path: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+) {
+  const paths = platform === "win32" ? win32 : posix;
+  const directory = paths.dirname(path);
+  const custom = env.MISE_DATA_DIR && paths.join(env.MISE_DATA_DIR, "shims");
+  if (
+    /[\\/]mise[\\/]shims$/i.test(directory) ||
+    (custom && paths.relative(custom, directory) === "")
+  )
+    return true;
+  // ponytail: a shim outside these places that is not a link to mise (a copy, a wrapper script) is run.
+  const real = await realpath(path).catch(() => path);
+  return /^mise(\.exe)?$/i.test(paths.basename(real));
+}
+
+/** The binaries mise has installed for a tool, newest version first; they run without a shim. */
+export async function miseInstalls(
+  tool: string,
+  file: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home = homedir(),
+) {
+  const paths = platform === "win32" ? win32 : posix;
+  const data =
+    env.MISE_DATA_DIR ||
+    (platform === "win32"
+      ? env.LOCALAPPDATA && paths.join(env.LOCALAPPDATA, "mise")
+      : paths.join(env.XDG_DATA_HOME || paths.join(home, ".local", "share"), "mise"));
+  if (!data || !localPath(data, platform)) return [];
+  const root = paths.join(data, "installs", tool);
+  const versions = await readdir(root).catch(() => []);
+  return versions
+    .sort((a, b) => b.localeCompare(a, "en", { numeric: true }))
+    .map((version) =>
+      platform === "win32"
+        ? paths.join(root, version, file)
+        : paths.join(root, version, "bin", file),
+    );
+}
+
 /** The first executable file among absolute local candidates that `accept` allows. */
 export async function firstExecutable(
   candidates: readonly string[],
@@ -137,7 +186,7 @@ async function inspect(
   before: string,
   run: ToolRunner,
 ) {
-  if (!localPath(candidate)) return null;
+  if (!localPath(candidate) || (await miseShim(candidate))) return null;
   try {
     const script = `${before}process.stdout.write(JSON.stringify({version:process.versions.${runtime},execPath:process.execPath}))`;
     const report: { version?: unknown; execPath?: unknown } = JSON.parse(
@@ -161,12 +210,9 @@ export const inspectNode = (
 ) => inspect(candidate, "node", sqlite ? "require('node:sqlite');" : "", run);
 
 /**
- * mise and asdf shims pick a Bun from the directory they run in, so it is asked once, from an empty one
+ * Version-manager shims pick a Bun from the directory they run in, so it is asked once, from an empty one
  * where no project pins apply, with mise's auto-install switched off (runBounded passes noAutoInstall).
- * inspectNode runs the same way.
+ * A mise shim is never run (see miseShim). inspectNode runs the same way.
  */
-// ponytail: mise still installs a tool that its owner declared `lazy = true` the first time the tool runs,
-// whatever noAutoInstall says, and other version managers get no switch; resolve the real binary without
-// running the shim if those matter.
 export const inspectBun = (candidate: string, { run = runBounded }: { run?: ToolRunner } = {}) =>
   inspect(candidate, "bun", "", run);

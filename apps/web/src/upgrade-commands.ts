@@ -65,6 +65,7 @@ function upgradeSpec(
 function addCommand(
   project: {
     packageManager: Project["packageManager"];
+    pnpmWorkspace?: boolean | undefined;
     dependencies: readonly Pick<Dependency, "role" | "importer">[];
   },
   importer: string,
@@ -87,7 +88,9 @@ function addCommand(
               "pnpm add",
               ...specs,
               flag,
-              // pnpm refuses to add to a workspace root without -w.
+              // pnpm refuses to add to a workspace root without -w. Evidence from a coordinator before
+              // pnpmWorkspace knows a workspace only from its packages' dependency records.
+              project.pnpmWorkspace === true ||
               project.dependencies.some((d) => d.role !== "transitive" && d.importer !== ".")
                 ? "-w"
                 : "",
@@ -104,6 +107,7 @@ function addCommand(
 export function dependencyUpgradeCommand(
   project: {
     packageManager: Project["packageManager"];
+    pnpmWorkspace?: boolean | undefined;
     dependencies: readonly Pick<Dependency, "role" | "importer">[];
   },
   dependency: Pick<
@@ -157,7 +161,7 @@ const roleLabels: Record<Role, string> = {
  * lookup did not finish are counted instead.
  */
 export function projectUpgradeCommands(
-  project: Pick<Project, "packageManager" | "dependencies">,
+  project: Pick<Project, "packageManager" | "pnpmWorkspace" | "dependencies">,
   scope: UpgradeScope,
   held: ReadonlySet<string> = new Set(),
   young: ReadonlyMap<string, string> = new Map(),

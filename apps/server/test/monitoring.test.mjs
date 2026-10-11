@@ -169,6 +169,38 @@ snapshots:
   assert.ok(inputs.coverage.some((e) => e.includes("internal workspace/local")));
 });
 
+test("a pnpm workspace is marked even when its packages declare no dependencies", async (t) => {
+  const root = await temporary(t);
+  await mkdir(join(root, "packages", "empty"), { recursive: true });
+  await writeFile(
+    join(root, "package.json"),
+    JSON.stringify({ devDependencies: { typescript: "^5.0.0" } }),
+  );
+  await writeFile(
+    join(root, "packages", "empty", "package.json"),
+    JSON.stringify({ name: "empty" }),
+  );
+  const lockfile = (others) => `lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      typescript: {specifier: '^5.0.0', version: '5.0.4'}
+${others}packages:
+  typescript@5.0.4: {resolution: {integrity: sha512-example}}
+snapshots:
+  typescript@5.0.4: {}
+`;
+  await writeFile(join(root, "pnpm-lock.yaml"), lockfile("  packages/empty: {}\n"));
+  const workspace = await inspectProject(root);
+  assert.equal(workspace.pnpmWorkspace, true);
+  assert.ok(
+    workspace.dependencies.every((d) => d.importer === "."),
+    "no dependency record names another workspace package",
+  );
+  await writeFile(join(root, "pnpm-lock.yaml"), lockfile(""));
+  assert.equal((await inspectProject(root)).pnpmWorkspace, false);
+});
+
 // Records each worker thread started during a test: its messages and whether it has exited. A worker
 // that is not terminated always delivers its result before it exits.
 function watchWorkers(t, onStart = () => {}) {

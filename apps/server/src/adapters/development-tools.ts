@@ -6,6 +6,7 @@ import { InputError } from "./projects.ts";
 import {
   firstExecutable,
   localPath,
+  miseShim,
   noAutoInstall,
   runBounded,
   toolDirectories,
@@ -75,8 +76,12 @@ export function toolCandidates(name: Tool, options: ToolOptions = {}) {
 
 export function toolExecutable(name: Tool, options: ToolOptions = {}) {
   const platform = options.platform ?? process.platform;
-  return firstExecutable(toolCandidates(name, options), (path) =>
-    usableTool(name, path, platform, options.run),
+  // A mise shim may install the tool when it runs (miseShim), so these tools come from real files only.
+  return firstExecutable(
+    toolCandidates(name, options),
+    async (path) =>
+      !(await miseShim(path, options.env, platform)) &&
+      (await usableTool(name, path, platform, options.run)),
   );
 }
 

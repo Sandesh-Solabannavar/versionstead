@@ -82,6 +82,8 @@ export const Project = Schema.Struct({
   path: Schema.String,
   mode: Schema.Literals(["maintained", "watch"]),
   packageManager: Schema.Literals(["npm", "pnpm", "bun", "unknown"]),
+  /** pnpm only: the lockfile lists workspace packages besides the root, so a command at the root needs -w. */
+  pnpmWorkspace: Schema.optional(Schema.Boolean),
   manifestPath: NullableString,
   lockfilePath: NullableString,
   inputFingerprint: Schema.optional(NullableString),

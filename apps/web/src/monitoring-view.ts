@@ -556,7 +556,7 @@ export type UpgradeOption = { where: string; command: string; version: string };
 
 /** The command for a dependency's checked candidate: the compatible release, else the latest. */
 export function dependencyUpgradeOption(
-  project: Pick<Project, "packageManager" | "dependencies">,
+  project: Pick<Project, "packageManager" | "pnpmWorkspace" | "dependencies">,
   dependency: Dependency,
 ): UpgradeOption | null {
   const version =

@@ -934,6 +934,8 @@ export class MonitoringCoordinator {
           );
         this.commit(signal);
         project.packageManager = inputs.packageManager;
+        if (inputs.pnpmWorkspace) project.pnpmWorkspace = true;
+        else delete project.pnpmWorkspace;
         project.manifestPath = inputs.manifestPath;
         project.lockfilePath = inputs.lockfilePath;
         project.inputFingerprint = inputs.inputFingerprint;

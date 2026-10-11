@@ -62,6 +62,26 @@ test("npm commands install the exact version, with dependency role and workspace
   );
 });
 
+test("a pnpm workspace root gets -w even when its packages declare no dependencies", () => {
+  const project = {
+    packageManager: "pnpm" as const,
+    dependencies: [{ role: "development" as const, importer: "." }],
+  };
+  const typescript = dependency({
+    name: "typescript",
+    packageName: "typescript",
+    role: "development",
+  });
+  assert.equal(
+    dependencyUpgradeCommand({ ...project, pnpmWorkspace: true }, typescript, "5.1.0"),
+    "pnpm add typescript@5.1.0 -D -w",
+  );
+  assert.equal(
+    dependencyUpgradeCommand(project, typescript, "5.1.0"),
+    "pnpm add typescript@5.1.0 -D",
+  );
+});
+
 test("pnpm commands add -w at a workspace root and filter other workspaces by path", () => {
   assert.equal(command("pnpm"), "pnpm add lodash@4.17.21");
   assert.equal(command("pnpm", {}, "4.17.21", ["packages/app"]), "pnpm add lodash@4.17.21 -w");

@@ -23,6 +23,7 @@ import { decodeBunConfiguration } from "./bun-config.ts";
 import {
   inspectBun,
   inspectNode,
+  miseShim,
   noAutoInstall,
   ownNode,
   toolExecutable as executable,
@@ -328,6 +329,11 @@ async function bunSource(directories?: readonly string[]): Promise<GlobalToolSou
     return source;
   }
   source.status = "unavailable";
+  if (await miseShim(binary)) {
+    source.error =
+      "Bun is a mise shim, which Versionstead does not run: mise can install a tool the first time its shim runs.";
+    return source;
+  }
   try {
     // A shim reads the directory it runs in, so Bun is asked as a project check asks it: from an empty
     // private folder, never the shared tmpdir().

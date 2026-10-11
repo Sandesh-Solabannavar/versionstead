@@ -8,7 +8,7 @@ import { projectUpgradeCommands, type ProjectUpgradePlan } from "./upgrade-comma
  * included, without what the owner snoozed or ignored and without releases inside the cooldown.
  */
 export function projectUpgradePlan(
-  project: Pick<Project, "packageManager" | "dependencies">,
+  project: Pick<Project, "packageManager" | "pnpmWorkspace" | "dependencies">,
   findings: readonly Finding[],
   major: boolean,
   cooldownDays: number,

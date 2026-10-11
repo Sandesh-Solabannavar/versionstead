@@ -211,6 +211,7 @@ export type ProjectInputs = {
   repositoryCommit?: string;
   git?: Project["git"];
   packageManager: Project["packageManager"];
+  pnpmWorkspace?: boolean;
   manifestPath: string;
   lockfilePath: string;
   dependencies: Dependency[];
@@ -554,6 +555,9 @@ async function pnpmInputs(
   }
   return {
     packageManager: "pnpm",
+    // Every workspace package is an importer, even one that declares no dependencies.
+    // ponytail: a pnpm-workspace.yaml whose patterns match no package yet still reads as no workspace.
+    pnpmWorkspace: Object.keys(importers).length > 1,
     manifestPath: "package.json",
     lockfilePath: "pnpm-lock.yaml",
     dependencies,

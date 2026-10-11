@@ -23,7 +23,11 @@ import {
 } from "@versionstead/contracts/monitoring";
 import { decodeStatus } from "@versionstead/contracts/status";
 import { discoverGlobalToolSources } from "../../server/dist/adapters/inventory.js";
-import { inspectNode, toolDirectories } from "../../server/dist/adapters/tool-paths.js";
+import {
+  inspectNode,
+  miseInstalls,
+  toolDirectories,
+} from "../../server/dist/adapters/tool-paths.js";
 
 export const dataDir = resolveDataDir();
 /** The built web app, which a session coordinator serves and the desktop window loads. */
@@ -260,11 +264,14 @@ export async function nodeExecutable() {
   const configured = process.env.VERSIONSTEAD_NODE_EXECUTABLE;
   if (configured && !isAbsolute(configured))
     throw new Error("VERSIONSTEAD_NODE_EXECUTABLE must be absolute");
+  const file = process.platform === "win32" ? "node.exe" : "node";
+  // mise shims are never run (miseShim), so a Node that only mise provides is found among its installs.
   const candidates = configured
     ? [configured]
-    : toolDirectories().map((directory) =>
-        join(directory, process.platform === "win32" ? "node.exe" : "node"),
-      );
+    : [
+        ...toolDirectories().map((directory) => join(directory, file)),
+        ...(await miseInstalls("node", file)),
+      ];
   for (const candidate of candidates) {
     // Never a shell. A candidate may be a Volta, mise or snap shim, so start the Node that it reports.
     const node = await inspectNode(candidate, { sqlite: true });
