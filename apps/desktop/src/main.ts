@@ -1759,10 +1759,10 @@ async function runSmoke() {
   );
   await window.webContents.executeJavaScript(`
     document.querySelector('[aria-label="Use Grove light mode"]').click();
-    document.querySelector('[aria-label="Use T3 Chat dark mode"]').click();
+    document.querySelector('[aria-label="Use Orchid dark mode"]').click();
   `);
   await waitSettings(
-    `JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='grove' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='t3-chat'`,
+    `JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='grove' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='orchid'`,
   );
   await window.webContents.executeJavaScript(`(() => {
     for (const [label, value] of [['Contrast',150],['Glass opacity',50],['Panel animation duration',250]]) {

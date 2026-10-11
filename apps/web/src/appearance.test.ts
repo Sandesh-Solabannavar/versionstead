@@ -72,6 +72,13 @@ test("appearance validates saved/imported settings and keeps independently selec
   );
   assert.equal(resolvePalette(halves, themes, "dark"), imported.dark);
   assert.deepEqual(readThemeHalves(halves, builtInThemes), { light: "grove", dark: "default" });
+  // A palette saved under its former built-in ID keeps its colors unless a custom theme now owns that ID.
+  assert.deepEqual(readThemeHalves({ light: "t3-chat", dark: "t3-chat" }, builtInThemes), {
+    light: "orchid",
+    dark: "orchid",
+  });
+  const reused = importTheme(JSON.stringify({ ...fixture, id: "t3-chat" }));
+  assert.equal(readThemeHalves({ dark: "t3-chat" }, [...builtInThemes, reused]).dark, "t3-chat");
   assert.deepEqual(readCustomThemes([{}, fixture, fixture]), [imported]);
   assert.throws(() => importTheme(JSON.stringify({ ...fixture, id: "default" })));
   assert.throws(() =>
