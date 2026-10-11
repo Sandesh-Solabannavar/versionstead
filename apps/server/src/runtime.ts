@@ -103,7 +103,12 @@ export type PowerShellRunner = (
   input: string,
 ) => Promise<{ code: number | null; stdout: string }>;
 
-/** Windows PowerShell 5.1 with an encoded script, stdin input, a deadline and an output bound. */
+/**
+ * Windows PowerShell 5.1 with an encoded script, stdin input, a deadline and an output bound.
+ *
+ * The deadline is roomy: a cold 5.1 start takes under a second on an idle PC, but a busy one (logon,
+ * a loaded CI runner) has stalled it past ten seconds, which failed a real credential write.
+ */
 export const runPowerShell: PowerShellRunner = (script, input) =>
   new Promise((resolveResult) => {
     const child = execFile(
@@ -121,7 +126,7 @@ export const runPowerShell: PowerShellRunner = (script, input) =>
         "-EncodedCommand",
         Buffer.from(script, "utf16le").toString("base64"),
       ],
-      { timeout: 10_000, maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
+      { timeout: 30_000, maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
       (error, stdout) => {
         const code = (error as { code?: unknown } | null)?.code;
         resolveResult({ code: error ? (typeof code === "number" ? code : null) : 0, stdout });
