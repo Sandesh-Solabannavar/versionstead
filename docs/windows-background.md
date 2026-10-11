@@ -1,6 +1,6 @@
 # Windows background monitoring
 
-Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out.
+Electron is a tray client. Closing its window hides it; **Quit Versionstead UI** leaves the independent coordinator running. **Stop monitoring** stops the coordinator explicitly. Session hosting ends at Windows sign-out. A boot task is required to monitor after sign-out. For macOS and Linux, see [macOS and Linux background host](background-host.md).
 
 Paired-PC access over Tailscale after sign-out also requires **Preferences → Run unattended** in each Windows PC's Tailscale tray menu. Tailscale normally disconnects after Windows sign-out; see its [unattended-mode guide](https://tailscale.com/docs/how-to/run-unattended). Installing Versionstead's boot host does not change Tailscale configuration or Windows Firewall. Verify both separately using the [connection setup](settings-and-connections.md).
 
@@ -16,7 +16,7 @@ Set-Location D:\production_code\versionstead
 
 Install detects the original owner's npm and Bun independently before stopping the running coordinator. It saves their actual global `node_modules` locations, package-manager detection results, and public-registry eligibility in the monitoring database. Managers that are not installed remain explicitly recorded; an empty global package directory is valid. The service reads these saved locations rather than discover tools from LocalService's `PATH` or home directory. It never installs packages, runs package scripts, or upgrades tools.
 
-List only project folders you deliberately want the background identity to read and monitor. Install registers new `ProjectRoots` as watch-only projects and preserves existing maintenance modes. It validates authenticated background readiness, a fresh global-tool scan, and fresh selected-project scans under LocalService within a bounded three-minute probe. Repeat Install when a global location changes or when adding a folder that LocalService cannot read. The script preserves evidence and stops the old coordinator gracefully before registering the new host. Failed probes keep the task registered for diagnostics and do not certify lifecycle behavior.
+List only project folders you deliberately want the background identity to read and monitor. Install registers new `ProjectRoots` as watch-only projects and preserves existing maintenance modes. Watch-only projects stay in Needs attention but send no notification unless Notify about watch-only projects is turned on in Settings › General (it is off by default), so change a project to Maintained by me, or turn that setting on, to be notified about it. It validates authenticated background readiness, a fresh global-tool scan, and fresh selected-project scans under LocalService within a bounded three-minute probe. Repeat Install when a global location changes or when adding a folder that LocalService cannot read. The script preserves evidence and stops the old coordinator gracefully before registering the new host. Failed probes keep the task registered for diagnostics and do not certify lifecycle behavior.
 
 The task runs at boot under credentialless **LocalService**, independently of the signed-in desktop, with a single-instance policy, no execution-time limit, and bounded failure restarts. It uses the pinned checkout’s built server/web files and an installed Node 24 executable. Keep that checkout and Node location available; moving either requires reinstalling the task. This is a native Scheduled Task, not a Windows SCM service.
 
@@ -34,7 +34,7 @@ If elevating as another account, first launch the updated desktop and scan **Thi
 .\scripts\windows-background.ps1 -Action Uninstall
 ```
 
-Status does not need elevation; configuration actions do. Start and Restart use the persisted owner sources and repeat the fresh global-tool access probe. They never rediscover sources under the service identity. Uninstall removes startup registration and preserves evidence and explicit folder grants. It does not delete project files. The tray notifier starts when Electron is opened; automatic tray startup at login is not configured. Pending findings are delivered when the UI next runs.
+Status does not need elevation; configuration actions do. Start and Restart use the persisted owner sources and repeat the fresh global-tool access probe. They never rediscover sources under the service identity. Uninstall removes startup registration and preserves evidence and explicit folder grants. It does not delete project files. The tray notifier starts when Electron opens; Settings › General › Open Versionstead at login starts it hidden at sign-in. Pending findings are delivered when the UI next runs.
 
 ## Required lifecycle verification
 

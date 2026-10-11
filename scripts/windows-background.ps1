@@ -95,9 +95,9 @@ try {
     if (!snapshot) {
       const database = new DatabaseSync(join(process.argv[4], 'monitoring.sqlite'), { readOnly: true, timeout: 3000 });
       try {
-        const row = database.prepare('SELECT snapshot FROM monitoring_state WHERE id=1').get();
-        if (!row || typeof row.snapshot !== 'string' || Buffer.byteLength(row.snapshot) > 32 * 1024 * 1024) throw new Error('No saved owner sources');
-        snapshot = decodeMonitoringSnapshot(JSON.parse(row.snapshot));
+        const row = database.prepare('SELECT value FROM monitoring_meta WHERE id=1').get();
+        if (!row || typeof row.value !== 'string' || Buffer.byteLength(row.value) > 32 * 1024 * 1024) throw new Error('No saved owner sources');
+        snapshot = decodeMonitoringSnapshot({ ...JSON.parse(row.value).snapshot, projects: [], findings: [] });
       } finally { database.close(); }
     }
     sources = snapshot.inventory.managers;
@@ -330,7 +330,7 @@ switch ($Action) {
     Register-ScheduledTask -TaskName $taskName -Action $scheduledAction -Trigger $trigger -Principal $principal -Settings $settings -Description "Versionstead read-only monitoring for $OwnerSid" -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
     Verify-Coordinator $roots $sourcesJson
-    Write-Output 'Boot host registered under LocalService with saved owner npm/Bun sources. Explicit ProjectRoots are monitored as watch-only unless already selected. Verify boot-before-login and sign-out before relying on unattended monitoring.'
+    Write-Output 'Boot host registered under LocalService with saved owner npm/Bun sources. Explicit ProjectRoots are monitored as watch-only unless already selected, and a watch-only project sends no notification unless Notify about watch-only projects is on in Settings. Verify boot-before-login and sign-out before relying on unattended monitoring.'
   }
   'Start' {
     if ($null -eq $task) { throw 'Install the boot host first.' }

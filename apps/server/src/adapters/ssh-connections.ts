@@ -8,6 +8,7 @@ import type { SshTarget } from "@versionstead/contracts/application";
 import { toolExecutable } from "./development-tools.ts";
 import { peerOrigin } from "./paired-computers.ts";
 import { InputError } from "./projects.ts";
+import { noAutoInstall } from "./tool-paths.ts";
 
 const hostPattern = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,252}$/;
 const userPattern = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,99}$/;
@@ -209,8 +210,6 @@ export function sshTunnelArguments(
     "ProxyCommand=none",
     "-o",
     "ProxyJump=none",
-    "-o",
-    "KnownHostsCommand=none",
     "-p",
     String(port),
   ];
@@ -245,8 +244,10 @@ export async function startSshTunnel(target: SshTarget, origin: string, signal: 
   const child = spawn(executable, sshTunnelArguments(target, origin, port, values), {
     windowsHide: true,
     stdio: ["ignore", "ignore", "pipe"],
+    // Evidence polling restarts a dead tunnel, so ssh found as a shim must not install either.
     env: {
       ...process.env,
+      ...noAutoInstall,
       NODE_OPTIONS: "",
       SSH_ASKPASS: undefined,
       SSH_ASKPASS_REQUIRE: "never",

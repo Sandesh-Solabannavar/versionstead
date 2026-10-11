@@ -1,23 +1,15 @@
-import { useState } from "react";
-import { Link, useLocation, useNavigate } from "@tanstack/react-router";
-import {
-  ArrowLeft,
-  Download,
-  RefreshCw,
-  Settings2,
-  Palette,
-  Keyboard,
-  GitBranch,
-  Link2,
-  ExternalLink,
-  FolderCog,
-  Search,
-  RotateCcw,
-} from "lucide-react";
+import { useEffect, useState } from "react";
+import { Link, useLocation } from "@tanstack/react-router";
 import { type ProviderKind } from "@versionstead/contracts/application";
-import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
+import { decodeLoginItemState } from "@versionstead/contracts/desktop";
+import {
+  decodeMonitoringSettings,
+  isHourMinute,
+  type MonitoringSettings,
+} from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { useMonitoring } from "./monitoring";
+import { actionKeys } from "./monitoring-actions";
 import { useAppearance } from "./theme";
 import { ConnectionsSettings } from "./connections-settings";
 import { ProjectSettings } from "./project-settings";
@@ -33,44 +25,57 @@ import {
   BitbucketIcon,
   ForgejoIcon,
 } from "./components/source-control-icons";
-import { providerPresentation } from "./source-control-status";
+import {
+  credentialStorageLocation,
+  credentialStorageMessage,
+  providerPresentation,
+} from "./source-control-status";
 import { AddProjectDialog } from "./add-project";
 import { RedactedSensitiveText } from "./components/redacted-sensitive-text";
 import { RefreshIcon } from "./components/ui/refresh-icon";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "./components/ui/tooltip";
-import { commands, defaultBindings, bindingConflict, keyChord, type Command } from "./keybindings";
+import {
+  commands,
+  commandModifiers,
+  defaultBindings,
+  bindingConflict,
+  formatShortcut,
+  isMac,
+  keyChord,
+  type Command,
+} from "./keybindings";
 import { Switch } from "./components/ui/switch";
 import {
   Button,
   Badge,
+  ConfirmDialog,
   Dialog,
   Input,
+  useFailure,
   PageHeading,
   EmptyState,
   Evidence,
+  EvidenceBadge,
+  FindingBadge,
   ScanProgress,
+  reportError,
   timestamp,
 } from "./ui";
-import { attentionGroups } from "./monitoring-view";
-import { settingsSections, searchSettings } from "./settings-navigation";
-import { useWorkspaceChrome } from "./workspace-chrome";
+import {
+  attentionGroups,
+  hostLabel,
+  installationCandidate,
+  plural,
+  workspaceLabel,
+} from "./monitoring-view";
+import { latestEvidence } from "./computer-evidence";
+import { settingsSections } from "./settings-navigation";
 import { SettingsSearchTargets } from "./components/settings-controls";
-import { defaultAppearance, readThemeHalves } from "./appearance";
-import { AppLogo } from "./components/app-logo";
-import { toast } from "./components/ui/toast";
 
-const sectionIcons = {
-  General: Settings2,
-  Project: FolderCog,
-  Appearance: Palette,
-  Keybindings: Keyboard,
-  "Source Control": GitBranch,
-  Connections: Link2,
-};
-const sections = settingsSections.map((section) => ({
-  ...section,
-  icon: sectionIcons[section.label],
-}));
+// These route pages load on demand; the always-visible settings chrome lives in router.tsx.
+
+const providerName = (kind: ProviderKind) => (kind === "github" ? "GitHub" : "GitLab");
+
 function scanIntervals(current: number) {
   return [...new Set([15, 60, 360, 720, 1440, current])]
     .sort((a, b) => a - b)
@@ -80,175 +85,106 @@ function scanIntervals(current: number) {
     }));
 }
 
-export function SettingsNavigation() {
-  const { back } = useWorkspaceChrome();
-  const { bindings } = useAppearance();
-  const navigate = useNavigate();
-  const [query, setQuery] = useState("");
-  const [active, setActive] = useState(0);
-  const results = searchSettings(query);
-  const selected = Math.min(active, Math.max(0, results.length - 1));
-  const choose = (result: (typeof results)[number]) => {
-    setQuery("");
-    void navigate({ to: result.path, hash: result.target ?? "" });
-  };
+function cooldownChoices(current: number) {
+  return [...new Set([0, 1, 2, 3, 7, 14, current])]
+    .sort((a, b) => a - b)
+    .map((days) => ({
+      value: String(days),
+      label: days === 0 ? "Off" : `${days} ${days === 1 ? "day" : "days"}`,
+    }));
+}
+
+// Typed against the contract, so a value the coordinator would reject cannot be offered.
+const notificationScopes: readonly {
+  value: NonNullable<MonitoringSettings["notificationScope"]>;
+  label: string;
+}[] = [
+  { value: "all", label: "All updates and advisories" },
+  { value: "advisories", label: "Advisories only" },
+  { value: "high-advisories", label: "High, critical and unrated advisories" },
+];
+
+/** Desktop only: the OS entry that opens the tray app hidden at login, read back from the OS. */
+function LoginItemRow() {
+  const api = window.versionstead;
+  const [openAtLogin, setOpenAtLogin] = useState<boolean | null>(null);
+  const [pending, setPending] = useState(false);
+  useEffect(() => {
+    if (!api?.loginItem) return;
+    let active = true;
+    void api
+      .loginItem()
+      .then((value) => {
+        if (active) setOpenAtLogin(decodeLoginItemState(value).openAtLogin);
+      })
+      .catch(() => {
+        if (active) reportError("The login setting could not be read from the operating system.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [api]);
+  const setLoginItem = api?.setLoginItem;
+  if (!api?.loginItem || !setLoginItem) return null;
   return (
-    <>
-      <Button variant="ghost" className="settings-back" onClick={back}>
-        <ArrowLeft size={15} aria-hidden />
-        Back to workspace
-      </Button>
-      <div className="settings-search">
-        <Search size={14} aria-hidden />
-        <Input
-          id="settings-search"
-          type="search"
-          aria-label="Search settings"
-          placeholder="Search settings…"
-          role="combobox"
-          aria-autocomplete="list"
-          aria-expanded={query.trim().length > 0}
-          aria-controls="settings-search-results"
-          aria-activedescendant={results.length ? `settings-result-${selected}` : undefined}
-          value={query}
-          onChange={(event) => {
-            setQuery(event.target.value);
-            setActive(0);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Escape" && query) {
-              event.preventDefault();
-              event.stopPropagation();
-              setQuery("");
-            } else if ((event.key === "ArrowDown" || event.key === "ArrowUp") && results.length) {
-              event.preventDefault();
-              setActive(
-                (selected + (event.key === "ArrowDown" ? 1 : results.length - 1)) % results.length,
-              );
-            } else if (event.key === "Enter" && results[selected]) {
-              event.preventDefault();
-              choose(results[selected]);
-            }
+    <SettingGroup title="Desktop app">
+      <SettingRow
+        label="Open Versionstead at login"
+        description="Start the tray app hidden when you sign in. The switch shows what the operating system has registered for this app and checkout."
+        searchable={false}
+      >
+        <Switch
+          aria-label="Open Versionstead at login"
+          checked={openAtLogin ?? false}
+          disabled={openAtLogin === null || pending}
+          onCheckedChange={(value) => {
+            setPending(true);
+            void setLoginItem(value)
+              .then((result) => setOpenAtLogin(decodeLoginItemState(result).openAtLogin))
+              .catch((failure: unknown) =>
+                reportError(
+                  failure instanceof Error
+                    ? failure.message
+                    : "The login setting could not be changed.",
+                ),
+              )
+              .finally(() => setPending(false));
           }}
         />
-        {!query && bindings.search === "/" && <kbd aria-hidden>/</kbd>}
-      </div>
-      {query.trim() ? (
-        <div
-          className="settings-search-results"
-          id="settings-search-results"
-          role="listbox"
-          aria-label="Matching settings"
-        >
-          {results.map((result, index) => (
-            <button
-              type="button"
-              key={result.id}
-              id={`settings-result-${index}`}
-              role="option"
-              aria-selected={index === selected}
-              onClick={() => choose(result)}
-            >
-              <span>{result.label}</span>
-              <small>{sections.find((section) => section.path === result.path)!.label}</small>
-            </button>
-          ))}
-          {!results.length && (
-            <p className="muted small" role="status">
-              No matching settings
-            </p>
-          )}
-        </div>
-      ) : (
-        <nav aria-label="Settings navigation">
-          {sections.map(({ path, label, icon: Icon }) => (
-            <Link key={path} to={path}>
-              <Icon size={16} aria-hidden />
-              {label}
-            </Link>
-          ))}
-        </nav>
-      )}
-    </>
+      </SettingRow>
+    </SettingGroup>
   );
 }
-export function RestoreDeviceDefaults() {
-  const [open, setOpen] = useState(false);
-  const {
-    theme,
-    compact,
-    reducedMotion,
-    bindings,
-    appearance,
-    themeHalves,
-    themes,
-    restoreDeviceDefaults,
-  } = useAppearance();
-  const { collapsed, setCollapsed } = useWorkspaceChrome();
-  const changed =
-    collapsed ||
-    theme !== "system" ||
-    compact ||
-    reducedMotion ||
-    JSON.stringify(appearance) !== JSON.stringify(defaultAppearance) ||
-    commands.some((command) => bindings[command.id] !== defaultBindings[command.id]) ||
-    JSON.stringify(themeHalves) !== JSON.stringify(readThemeHalves(null, themes));
-  return (
-    <>
-      <Button
-        variant="ghost"
-        size="compact"
-        className="restore-device-defaults"
-        aria-label="Restore device defaults"
-        disabled={!changed}
-        onClick={() => setOpen(true)}
-      >
-        <RotateCcw size={13} aria-hidden />
-        <span>Restore device defaults</span>
-      </Button>
-      {open && (
-        <Dialog
-          title="Restore device defaults?"
-          description="Reset appearance, keyboard shortcuts, and sidebar visibility on this device. Custom themes, monitoring schedules, projects, and connections are kept."
-          onClose={() => setOpen(false)}
-        >
-          <div className="dialog-actions">
-            <Button onClick={() => setOpen(false)}>Cancel</Button>
-            <Button
-              variant="primary"
-              onClick={() => {
-                restoreDeviceDefaults();
-                setCollapsed(false);
-                setOpen(false);
-                toast.add({
-                  id: "action-feedback",
-                  title: "Device defaults restored.",
-                  type: "success",
-                });
-              }}
-            >
-              Restore defaults
-            </Button>
-          </div>
-        </Dialog>
-      )}
-    </>
-  );
-}
+
 function GeneralSettings() {
-  const { snapshot, busy, connection, mutate } = useMonitoring();
+  const { snapshot, connection, pending, mutate } = useMonitoring();
   const { snapshot: app, change } = useApplication();
   if (!snapshot || !app) return null;
-  const disabled = busy || connection !== "connected";
-  const update = (body: unknown) => {
+  // Each control waits only for its own save, so changing one never holds back another.
+  const unavailable = (key: string) => connection !== "connected" || pending.has(key);
+  const update = (field: string, value: unknown) => {
     void mutate(
       "/api/settings",
-      body,
+      { [field]: value },
       decodeMonitoringSettings,
       "Monitoring preferences saved.",
       "PATCH",
+      { key: actionKeys.setting(field) },
     );
   };
+  const preference = (field: string, value: boolean, message: string) => {
+    void change("preferences", { [field]: value }, message, "PATCH", {
+      key: actionKeys.preference(field),
+    });
+  };
+  const cooldown = snapshot.settings.releaseCooldownDays ?? 3;
+  const quiet = snapshot.settings.quietHours ?? null;
+  const digestAt = snapshot.settings.digestAt ?? null;
+  // A time field is read-only, not disabled, while it saves, so Tab from one into the next keeps focus.
+  const timeField = (key: string) => ({
+    disabled: connection !== "connected",
+    readOnly: pending.has(key),
+  });
 
   return (
     <>
@@ -260,8 +196,8 @@ function GeneralSettings() {
           <Switch
             aria-label="Scheduled scans"
             checked={!snapshot.settings.paused}
-            disabled={disabled}
-            onCheckedChange={(value) => update({ paused: !value })}
+            disabled={unavailable(actionKeys.setting("paused"))}
+            onCheckedChange={(value) => update("paused", !value)}
           />
         </SettingRow>
         <SettingRow
@@ -272,8 +208,8 @@ function GeneralSettings() {
             label="PC scan interval"
             value={String(snapshot.settings.pcIntervalMinutes)}
             items={scanIntervals(snapshot.settings.pcIntervalMinutes)}
-            disabled={disabled}
-            onChange={(value) => update({ pcIntervalMinutes: Number(value) })}
+            disabled={unavailable(actionKeys.setting("pcIntervalMinutes"))}
+            onChange={(value) => update("pcIntervalMinutes", Number(value))}
           />
         </SettingRow>
         <SettingRow
@@ -284,8 +220,8 @@ function GeneralSettings() {
             label="Project scan interval"
             value={String(snapshot.settings.projectIntervalMinutes)}
             items={scanIntervals(snapshot.settings.projectIntervalMinutes)}
-            disabled={disabled}
-            onChange={(value) => update({ projectIntervalMinutes: Number(value) })}
+            disabled={unavailable(actionKeys.setting("projectIntervalMinutes"))}
+            onChange={(value) => update("projectIntervalMinutes", Number(value))}
           />
         </SettingRow>
         <SettingRow
@@ -295,15 +231,35 @@ function GeneralSettings() {
           <Switch
             aria-label="Scan selected repositories automatically"
             checked={app.preferences.automaticRepositoryScans}
-            disabled={disabled}
-            onCheckedChange={(value) => {
-              void change(
-                "preferences",
-                { automaticRepositoryScans: value },
-                "Repository scan preference saved.",
-                "PATCH",
-              );
-            }}
+            disabled={unavailable(actionKeys.preference("automaticRepositoryScans"))}
+            onCheckedChange={(value) =>
+              preference("automaticRepositoryScans", value, "Repository scan preference saved.")
+            }
+          />
+        </SettingRow>
+      </SettingGroup>
+      <SettingGroup title="Package releases">
+        <SettingRow
+          label="Release cooldown"
+          description="An update candidate released more recently than this is marked, and Update now asks before installing it. A release with no known date reads Release age unknown and is not held back. Off removes the age check."
+        >
+          <Choice
+            label="Release cooldown"
+            value={String(cooldown)}
+            items={cooldownChoices(cooldown)}
+            disabled={unavailable(actionKeys.setting("releaseCooldownDays"))}
+            onChange={(value) => update("releaseCooldownDays", Number(value))}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Use deps.dev for release age, license and provenance"
+          description="Sends the package name and version of each public npm update candidate to deps.dev. Off leaves release age, license, and provenance unknown. A change applies from the next scan."
+        >
+          <Switch
+            aria-label="Use deps.dev for release age, license and provenance"
+            checked={snapshot.settings.useDepsDev ?? true}
+            disabled={unavailable(actionKeys.setting("useDepsDev"))}
+            onCheckedChange={(value) => update("useDepsDev", value)}
           />
         </SettingRow>
       </SettingGroup>
@@ -315,9 +271,115 @@ function GeneralSettings() {
           <Switch
             aria-label="Notify about new findings"
             checked={snapshot.settings.notifyNewFindings}
-            disabled={disabled}
-            onCheckedChange={(value) => update({ notifyNewFindings: value })}
+            disabled={unavailable(actionKeys.setting("notifyNewFindings"))}
+            onCheckedChange={(value) => update("notifyNewFindings", value)}
           />
+        </SettingRow>
+        <SettingRow
+          label="Notify about"
+          description="Which new findings produce a notification; this applies only while Notify about new findings is on. Every finding stays in Needs attention either way. High, critical and unrated includes advisories with no severity rating, since a missing rating is not evidence of safety."
+        >
+          <Choice
+            label="Notify about"
+            value={snapshot.settings.notificationScope ?? "all"}
+            items={notificationScopes}
+            disabled={unavailable(actionKeys.setting("notificationScope"))}
+            onChange={(value) => update("notificationScope", value)}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Notify about watch-only projects"
+          description="Watch-only projects stay in Needs attention; turn this on to be notified about their new findings too. This applies only while Notify about new findings is on."
+        >
+          <Switch
+            aria-label="Notify about watch-only projects"
+            checked={snapshot.settings.notifyWatchOnly ?? false}
+            disabled={unavailable(actionKeys.setting("notifyWatchOnly"))}
+            onCheckedChange={(value) => update("notifyWatchOnly", value)}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Quiet hours"
+          description="Native notifications wait until quiet hours end; summaries inside Versionstead still appear. The window may cross midnight, and its start and end must differ."
+        >
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {quiet && (
+              <>
+                <Input
+                  key={`start-${quiet.start}`}
+                  type="time"
+                  className="w-28 shrink-0"
+                  aria-label="Quiet hours start"
+                  defaultValue={quiet.start}
+                  {...timeField(actionKeys.setting("quietHours"))}
+                  onBlur={(event) => {
+                    const start = event.currentTarget.value;
+                    // A value that cannot be saved is not left showing as if it were.
+                    if (!isHourMinute(start) || start === quiet.end)
+                      event.currentTarget.value = quiet.start;
+                    else if (start !== quiet.start) update("quietHours", { ...quiet, start });
+                  }}
+                />
+                <span className="muted small">to</span>
+                <Input
+                  key={`end-${quiet.end}`}
+                  type="time"
+                  className="w-28 shrink-0"
+                  aria-label="Quiet hours end"
+                  defaultValue={quiet.end}
+                  {...timeField(actionKeys.setting("quietHours"))}
+                  onBlur={(event) => {
+                    const end = event.currentTarget.value;
+                    if (!isHourMinute(end) || end === quiet.start)
+                      event.currentTarget.value = quiet.end;
+                    else if (end !== quiet.end) update("quietHours", { ...quiet, end });
+                  }}
+                />
+              </>
+            )}
+            <Switch
+              aria-label="Quiet hours"
+              checked={quiet !== null}
+              disabled={unavailable(actionKeys.setting("quietHours"))}
+              onCheckedChange={(value) =>
+                update("quietHours", value ? { start: "22:00", end: "07:00" } : null)
+              }
+            />
+          </div>
+        </SettingRow>
+        <SettingRow
+          label="Notification delivery"
+          description="After each scan cycle, or one daily digest of everything new since the last one."
+        >
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {digestAt !== null && (
+              <Input
+                key={digestAt}
+                type="time"
+                className="w-28 shrink-0"
+                aria-label="Daily digest time"
+                defaultValue={digestAt}
+                {...timeField(actionKeys.setting("digestAt"))}
+                onBlur={(event) => {
+                  const value = event.currentTarget.value;
+                  if (!isHourMinute(value)) event.currentTarget.value = digestAt;
+                  else if (value !== digestAt) update("digestAt", value);
+                }}
+              />
+            )}
+            <Choice
+              label="Notification delivery"
+              value={digestAt === null ? "cycle" : "digest"}
+              items={[
+                { value: "cycle", label: "After each scan cycle" },
+                { value: "digest", label: "Daily digest" },
+              ]}
+              disabled={unavailable(actionKeys.setting("digestAt"))}
+              onChange={(value) =>
+                update("digestAt", value === "digest" ? (digestAt ?? "18:00") : null)
+              }
+            />
+          </div>
         </SettingRow>
         <SettingRow
           label="Check for Versionstead releases"
@@ -326,20 +388,16 @@ function GeneralSettings() {
           <Switch
             aria-label="Check for Versionstead releases"
             checked={app.preferences.automaticAppUpdateChecks}
-            disabled={disabled}
-            onCheckedChange={(value) => {
-              void change(
-                "preferences",
-                { automaticAppUpdateChecks: value },
-                "Release check preference saved.",
-                "PATCH",
-              );
-            }}
+            disabled={unavailable(actionKeys.preference("automaticAppUpdateChecks"))}
+            onCheckedChange={(value) =>
+              preference("automaticAppUpdateChecks", value, "Release check preference saved.")
+            }
           />
         </SettingRow>
       </SettingGroup>
+      <LoginItemRow />
       <p className="muted">
-        Host: {snapshot.runtime.host === "boot-task" ? "Windows boot task" : "Signed-in session"}.{" "}
+        Host: {hostLabel(snapshot.runtime.host, snapshot.runtime.platform)}.{" "}
         <Link to="/service" className="text-link">
           View background setup, scan history, and service health
         </Link>
@@ -352,70 +410,80 @@ function KeybindingsSettings() {
   const { bindings, setBindings } = useAppearance();
   const [capture, setCapture] = useState<Command | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const mac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const [resetting, setResetting] = useState(false);
+  const mac = isMac();
   return (
     <>
       <SettingGroup title="Workspace shortcuts">
-        {commands.map((command) => (
-          <SettingRow
-            key={command.id}
-            label={command.label}
-            description={`Default: ${command.binding.replaceAll("mod", mac ? "⌘" : "Ctrl")}`}
-          >
-            <div className="row-actions">
-              <Button
-                aria-label={`Change shortcut for ${command.label}`}
-                onClick={() => {
-                  setError(null);
-                  setCapture(command.id);
-                }}
-              >
-                <kbd>
-                  {bindings[command.id]
-                    ? bindings[command.id].replaceAll("mod", mac ? "⌘" : "Ctrl")
-                    : "Disabled"}
-                </kbd>
-              </Button>
-              <Button
-                variant="ghost"
-                aria-label={`Disable shortcut for ${command.label}`}
-                disabled={!bindings[command.id]}
-                onClick={() => setBindings({ ...bindings, [command.id]: "" })}
-              >
-                Disable
-              </Button>
-            </div>
-          </SettingRow>
-        ))}
+        {commands.map((command) => {
+          const shown = bindings[command.id]
+            ? formatShortcut(bindings[command.id], mac)
+            : "Disabled";
+          return (
+            <SettingRow
+              key={command.id}
+              label={command.label}
+              description={`Default: ${formatShortcut(command.binding, mac)}`}
+            >
+              <div className="row-actions">
+                <Button
+                  // The name holds the text the button shows, so it is also said by speech control.
+                  aria-label={`Change shortcut for ${command.label}, currently ${shown}`}
+                  onClick={() => {
+                    setError(null);
+                    setCapture(command.id);
+                  }}
+                >
+                  <kbd>{shown}</kbd>
+                </Button>
+                <Button
+                  variant="ghost"
+                  aria-label={`Disable shortcut for ${command.label}`}
+                  disabled={!bindings[command.id]}
+                  onClick={() => setBindings({ ...bindings, [command.id]: "" })}
+                >
+                  Disable
+                </Button>
+              </div>
+            </SettingRow>
+          );
+        })}
       </SettingGroup>
-      <Button onClick={() => setBindings({ ...defaultBindings })}>Reset all shortcuts</Button>
+      <Button onClick={() => setResetting(true)}>Reset all shortcuts</Button>
       <p className="muted">
         Shortcuts are saved on this device and ignored while typing in a field or using a dialog.
+        The command palette shortcut also works in a field when it uses {commandModifiers(mac)}.
       </p>
+      {resetting && (
+        <ConfirmDialog
+          title="Reset all shortcuts?"
+          description="Every workspace shortcut returns to its default on this device, including any you disabled. Shortcuts saved on project commands are not changed."
+          confirmLabel="Reset shortcuts"
+          onConfirm={() => {
+            setBindings({ ...defaultBindings });
+            setResetting(false);
+          }}
+          onClose={() => setResetting(false)}
+        />
+      )}
       {capture && (
         <Dialog
           title={`Shortcut: ${commands.find((c) => c.id === capture)!.label}`}
           onClose={() => setCapture(null)}
         >
-          <p>Focus the field and press the new shortcut. Escape cancels.</p>
+          <p>Focus the field and press the new shortcut. Escape cancels; Tab leaves the field.</p>
           <Input
             autoFocus
             readOnly
             aria-label="Press a shortcut"
             value="Press keys…"
             onKeyDown={(event) => {
+              // Tab and Escape keep their usual job, so the field never traps keyboard focus.
+              if (event.key === "Tab" || event.key === "Escape") return;
               event.preventDefault();
               event.stopPropagation();
-              if (event.key === "Escape") {
-                setCapture(null);
-                return;
-              }
               const chord = keyChord(event, mac);
               if (!chord) return;
-              if (chord === "tab" || chord === "enter") {
-                setError("Use a letter, number, punctuation key, or modified shortcut.");
-                return;
-              }
               const conflict = bindingConflict(bindings, capture, chord);
               if (conflict) {
                 setError(`Already used by ${conflict}. Disable or change that shortcut first.`);
@@ -448,18 +516,27 @@ function KeybindingsSettings() {
 
 function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose: () => void }) {
   const { snapshot, change } = useApplication();
-  const { snapshot: monitoring, busy, error } = useMonitoring();
+  const { snapshot: monitoring, pending } = useMonitoring();
   const [token, setToken] = useState("");
+  // Why the last attempt failed. It belongs to this dialog, so it never outlives it or leaks elsewhere.
+  const [error, fail, clearError] = useFailure();
   const name = kind === "github" ? "GitHub" : "GitLab";
+  const key = actionKeys.provider(kind);
+  const connecting = pending.has(key);
+  const storageNote = snapshot ? credentialStorageMessage(snapshot) : null;
   return (
-    <Dialog title={`Connect ${name}`} onClose={onClose}>
+    // Closing mid-request would lose the message, so the dialog stays until the request settles.
+    <Dialog title={`Connect ${name}`} onClose={onClose} dismissible={!connecting}>
       <form
         onSubmit={(event) => {
           event.preventDefault();
+          clearError();
           void change(
             "providers/connect",
             { kind, token },
             `${name} connected. Select repositories to start monitoring.`,
+            "POST",
+            { key, onError: fail },
           ).then((result) => {
             if (result) {
               setToken("");
@@ -487,30 +564,33 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
           />
         </label>
         <p className="muted small">
-          Stored with Windows DPAPI on this monitoring host. Tokens never appear in saved browser
-          preferences.
+          {credentialStorageLocation(monitoring?.runtime.platform ?? "")} Tokens never appear in
+          saved browser preferences.
         </p>
         <div className="dialog-actions">
           <Button
             variant="primary"
             type="submit"
-            disabled={busy || !snapshot?.credentialStorageAvailable || !token.trim()}
+            disabled={connecting || !snapshot?.credentialStorageAvailable || !token.trim()}
           >
             Connect
           </Button>
           <Button
             type="button"
             disabled={
-              busy ||
+              connecting ||
               !snapshot?.credentialStorageAvailable ||
               !snapshot.tools[kind].available ||
               monitoring?.runtime.mode !== "interactive"
             }
             onClick={() => {
+              clearError();
               void change(
                 "providers/connect",
                 { kind, useCli: true },
                 `${name} connected from your signed-in CLI.`,
+                "POST",
+                { key, onError: fail },
               ).then((result) => {
                 if (result) onClose();
               });
@@ -519,9 +599,7 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
             Use signed-in {kind === "github" ? "gh" : "glab"} CLI
           </Button>
         </div>
-        {!snapshot?.credentialStorageAvailable && (
-          <p role="alert">Protected provider credentials currently require Windows.</p>
-        )}
+        {storageNote && <p role="alert">{storageNote}</p>}
         {error && (
           <p className="error-text" role="alert">
             {error}
@@ -533,11 +611,18 @@ function ConnectProviderDialog({ kind, onClose }: { kind: ProviderKind; onClose:
 }
 function SourceControlSettings() {
   const { snapshot: app, change, discover, discovering } = useApplication();
-  const { snapshot, busy, connection, mutate } = useMonitoring();
+  const { snapshot, pending, connection, mutate } = useMonitoring();
   const [connect, setConnect] = useState<ProviderKind | null>(null);
   const [picker, setPicker] = useState<ProviderKind | null>(null);
+  const [disconnecting, setDisconnecting] = useState<ProviderKind | null>(null);
+  const [disconnectError, failDisconnect, clearDisconnectError] = useFailure(
+    disconnecting !== null,
+  );
   if (!app || !snapshot) return null;
-  const disabled = busy || connection !== "connected";
+  const storageNote = credentialStorageMessage(app);
+  const disabled = connection !== "connected";
+  // Each control waits only for its own save, so changing one never holds back another.
+  const unavailable = (key: string) => disabled || pending.has(key);
   const interval = snapshot.settings.projectIntervalMinutes;
   return (
     <div className="source-control-settings">
@@ -549,13 +634,14 @@ function SourceControlSettings() {
           <Switch
             aria-label="Automatically scan repositories"
             checked={app.preferences.automaticRepositoryScans}
-            disabled={disabled}
+            disabled={unavailable(actionKeys.preference("automaticRepositoryScans"))}
             onCheckedChange={(value) => {
               void change(
                 "preferences",
                 { automaticRepositoryScans: value },
                 "Automatic repository scans saved.",
                 "PATCH",
+                { key: actionKeys.preference("automaticRepositoryScans") },
               );
             }}
           />
@@ -568,7 +654,7 @@ function SourceControlSettings() {
             label="Repository scan interval"
             value={String(interval)}
             items={scanIntervals(interval)}
-            disabled={disabled}
+            disabled={unavailable(actionKeys.setting("projectIntervalMinutes"))}
             onChange={(value) => {
               void mutate(
                 "/api/settings",
@@ -576,6 +662,7 @@ function SourceControlSettings() {
                 decodeMonitoringSettings,
                 "Project and repository scan interval saved.",
                 "PATCH",
+                { key: actionKeys.setting("projectIntervalMinutes") },
               );
             }}
           />
@@ -631,13 +718,16 @@ function SourceControlSettings() {
             <Switch
               aria-label="Enable Git context"
               checked={app.tools.git.available && app.preferences.gitEnabled}
-              disabled={disabled || !app.tools.git.available}
+              disabled={
+                unavailable(actionKeys.preference("gitEnabled")) || !app.tools.git.available
+              }
               onCheckedChange={(value) => {
                 void change(
                   "preferences",
                   { gitEnabled: value },
                   "Git context preference saved.",
                   "PATCH",
+                  { key: actionKeys.preference("gitEnabled") },
                 );
               }}
             />
@@ -699,7 +789,10 @@ function SourceControlSettings() {
                 <Switch
                   aria-label={`Enable ${name} repository scans`}
                   checked={!!provider.account && provider.enabled}
-                  disabled={disabled || (!provider.account && !app.credentialStorageAvailable)}
+                  disabled={
+                    unavailable(actionKeys.provider(provider.kind)) ||
+                    (!provider.account && !app.credentialStorageAvailable)
+                  }
                   onCheckedChange={(enabled) => {
                     if (!provider.account) {
                       setConnect(provider.kind);
@@ -710,6 +803,7 @@ function SourceControlSettings() {
                       { kind: provider.kind, enabled },
                       `${name} scans ${enabled ? "enabled" : "paused"}.`,
                       "PATCH",
+                      { key: actionKeys.provider(provider.kind) },
                     );
                   }}
                 />
@@ -732,22 +826,19 @@ function SourceControlSettings() {
                         {project.name}
                       </Link>
                       <code>{project.repository?.ref}</code>
-                      <Badge>
-                        {project.evidence.status === "not-scanned"
-                          ? "Not scanned"
-                          : project.evidence.status}
-                      </Badge>
+                      <EvidenceBadge status={project.evidence.status} />
                     </li>
                   ))}
                 </ul>
               )}
-              {!app.credentialStorageAvailable && (
-                <p role="status">Protected provider connections require Windows.</p>
-              )}
+              {storageNote && <p role="status">{storageNote}</p>}
               <div className="provider-actions">
                 <Button
                   size="sm"
-                  disabled={disabled || !app.credentialStorageAvailable}
+                  disabled={
+                    unavailable(actionKeys.provider(provider.kind)) ||
+                    !app.credentialStorageAvailable
+                  }
                   onClick={() => setConnect(provider.kind)}
                 >
                   {provider.account ? "Reconnect" : `Connect ${name}`}
@@ -764,14 +855,10 @@ function SourceControlSettings() {
                     <Button
                       size="sm"
                       variant="ghost"
-                      disabled={disabled}
+                      disabled={unavailable(actionKeys.provider(provider.kind))}
                       onClick={() => {
-                        void change(
-                          "providers",
-                          { kind: provider.kind, enabled: false, disconnect: true },
-                          `${name} disconnected. Previous repository evidence is retained.`,
-                          "PATCH",
-                        );
+                        clearDisconnectError();
+                        setDisconnecting(provider.kind);
                       }}
                     >
                       Disconnect
@@ -815,6 +902,29 @@ function SourceControlSettings() {
       {picker && (
         <AddProjectDialog initialSource={picker} close={() => setPicker(null)} added={() => {}} />
       )}
+      {disconnecting && (
+        <ConfirmDialog
+          danger
+          title={`Disconnect ${providerName(disconnecting)}?`}
+          description="Versionstead forgets the saved credential. Selected repositories keep their evidence but are not scanned until you reconnect. Revoke the token with the provider to fully end access."
+          confirmLabel="Disconnect"
+          pending={pending.has(actionKeys.provider(disconnecting))}
+          error={disconnectError}
+          onClose={() => setDisconnecting(null)}
+          onConfirm={() => {
+            clearDisconnectError();
+            void change(
+              "providers",
+              { kind: disconnecting, enabled: false, disconnect: true },
+              `${providerName(disconnecting)} disconnected. Previous repository evidence is retained.`,
+              "PATCH",
+              { key: actionKeys.provider(disconnecting), onError: failDisconnect },
+            ).then((result) => {
+              if (result) setDisconnecting(null);
+            });
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -823,11 +933,13 @@ export function SettingsPage() {
   const path = useLocation({ select: (l) => l.pathname });
   const { snapshot, error, refresh } = useApplication();
   const section = settingsSections.find((s) => s.path === path) ?? settingsSections[0];
+  // Appearance and Keybindings live in this device's storage, so they need no coordinator.
+  const deviceOnly = path.endsWith("appearance") || path.endsWith("keybindings");
   return (
     <SettingsSearchTargets>
       <div className="settings-page">
         <h1 className="sr-only">{section.label}</h1>
-        {error && (
+        {error && !deviceOnly && (
           <div className="connection-banner warning" role="alert">
             {error}
             <Button
@@ -839,14 +951,14 @@ export function SettingsPage() {
             </Button>
           </div>
         )}
-        {!snapshot ? (
-          <EmptyState title="Loading settings">
-            Connect to your local coordinator to read its preferences.
-          </EmptyState>
-        ) : path.endsWith("appearance") ? (
+        {path.endsWith("appearance") ? (
           <AppearanceSettings />
         ) : path.endsWith("keybindings") ? (
           <KeybindingsSettings />
+        ) : !snapshot ? (
+          <EmptyState title="Loading settings">
+            Connect to your local coordinator to read its preferences.
+          </EmptyState>
         ) : path.endsWith("source-control") ? (
           <SourceControlSettings />
         ) : path.endsWith("connections") ? (
@@ -861,114 +973,46 @@ export function SettingsPage() {
   );
 }
 
-export function UtilityControls() {
-  const { snapshot, change } = useApplication();
-  const { busy, connection } = useMonitoring();
-  const [open, setOpen] = useState(false);
-  const update = snapshot?.update;
-  const available = update?.status === "available";
-  return (
-    <>
-      <div className="sidebar-utilities">
-        <Link
-          to="/settings/general"
-          className="utility-button"
-          aria-label="Settings"
-          title="Settings"
-        >
-          <Settings2 size={17} aria-hidden />
-        </Link>
-        <Button
-          variant="ghost"
-          className={`utility-button ${available ? "update-available" : ""}`}
-          aria-label={available ? "Versionstead update available" : "Versionstead updates"}
-          title={
-            available ? `Versionstead ${update.latestVersion} available` : "Versionstead updates"
-          }
-          onClick={() => {
-            setOpen(true);
-            if (update?.status === "idle")
-              void change("update", {}, "Versionstead release check finished.");
-          }}
-        >
-          {update?.status === "checking" ? (
-            <RefreshCw size={17} className="update-checking" aria-hidden />
-          ) : (
-            <Download size={17} aria-hidden />
-          )}
-          {available && <span className="update-indicator" />}
-        </Button>
-        <span className="muted small">v{update?.currentVersion ?? "0.1.0"}</span>
-      </div>
-      {open && (
-        <Dialog drawer title="Versionstead updates" onClose={() => setOpen(false)}>
-          <div className="app-identity">
-            <AppLogo />
-            <strong>Versionstead</strong>
-          </div>
-          <p className="muted">Installed source build: {update?.currentVersion ?? "Unknown"}</p>
-          <h3>
-            {update?.status === "checking"
-              ? "Checking releases…"
-              : available
-                ? `Version ${update.latestVersion} available`
-                : update?.status === "current"
-                  ? "This build matches the latest stable release"
-                  : update?.status === "unpublished"
-                    ? "No stable release has been published"
-                    : update?.status === "failed"
-                      ? "Release check could not be verified"
-                      : "Check for a Versionstead release"}
-          </h3>
-          {update?.error && (
-            <p className="error-text" role="alert">
-              {update.error}
-            </p>
-          )}
-          <p className="muted small">Last checked {timestamp(update?.checkedAt ?? null)}</p>
-          <div className="row-actions">
-            <Button
-              disabled={busy || connection !== "connected" || update?.status === "checking"}
-              onClick={() => {
-                void change("update", {}, "Versionstead release check finished.");
-              }}
-            >
-              Check for updates
-            </Button>
-            {update?.releaseUrl && (
-              <a
-                className="button outline"
-                href={update.releaseUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                View release <ExternalLink size={14} />
-              </a>
-            )}
-          </div>
-          <p className="muted">
-            This checkout runs from source. Installer download and restart-to-install will be
-            enabled when packaged releases are available.
-          </p>
-          {update?.notes && (
-            <section>
-              <h3>Release notes</h3>
-              <pre className="release-notes">{update.notes}</pre>
-            </section>
-          )}
-        </Dialog>
-      )}
-    </>
-  );
-}
-
 export function ComputerPage() {
   const path = useLocation({ select: (l) => l.pathname });
   const id = path.split("/").at(-1);
-  const { snapshot: app, change } = useApplication();
-  const { busy, connection } = useMonitoring();
+  const {
+    snapshot: app,
+    computerEvidence,
+    unreadableEvidence,
+    retryEvidence,
+    error,
+    refresh,
+    change,
+  } = useApplication();
+  const { pending, connection } = useMonitoring();
   const computer = app?.computers.find((c) => c.id === id);
-  const snapshot = computer?.snapshot;
+  // The provider reads a PC's evidence when its digest changes, which includes this page's Refresh.
+  const snapshot = computer && computerEvidence.get(computer.id)?.snapshot;
+  // Until the coordinator's settings arrive, no PC is known to be missing.
+  if (!app)
+    return error ? (
+      <EmptyState
+        title="Paired PCs could not be read"
+        action={
+          <Button
+            onClick={() => {
+              void refresh();
+            }}
+          >
+            Retry
+          </Button>
+        }
+      >
+        {error}
+      </EmptyState>
+    ) : connection === "connected" ? (
+      <EmptyState title="Loading…">Reading this PC from your local coordinator.</EmptyState>
+    ) : (
+      <EmptyState title="Waiting for your coordinator">
+        Connect to your local coordinator to read paired PCs.
+      </EmptyState>
+    );
   if (!computer)
     return (
       <EmptyState title="PC is not connected">
@@ -978,26 +1022,52 @@ export function ComputerPage() {
         .
       </EmptyState>
     );
+  // The page's actions and Connections' environment menu share one key, so they wait for each other.
+  const key = actionKeys.environment(computer.id);
+  const unavailable = pending.has(key) || connection !== "connected" || computer.enabled === false;
+  // Held evidence of an earlier digest is not what this PC last sent, so it says so.
+  const latest = latestEvidence(computer, computerEvidence, unreadableEvidence);
+  const retry = (
+    <Button disabled={connection !== "connected"} onClick={() => retryEvidence(computer.id)}>
+      Retry
+    </Button>
+  );
   return (
     <>
       <PageHeading
         title={computer.label}
-        description={`Paired PC · ${computer.origin} · Last received ${timestamp(computer.checkedAt)}`}
+        description={
+          <>
+            Paired PC · {computer.origin} · Last received {timestamp(computer.checkedAt)}
+          </>
+        }
         actions={
           <>
             <Button
-              disabled={busy || connection !== "connected" || computer.enabled === false}
+              disabled={unavailable}
               onClick={() => {
-                void change("computers/refresh", { id: computer.id }, "Paired evidence refreshed.");
+                void change(
+                  "computers/refresh",
+                  { id: computer.id },
+                  "Paired evidence refreshed.",
+                  "POST",
+                  { key },
+                );
               }}
             >
               Refresh
             </Button>
             <Button
               variant="primary"
-              disabled={busy || connection !== "connected" || computer.enabled === false}
+              disabled={unavailable}
               onClick={() => {
-                void change("computers/scan", { id: computer.id }, "Paired scan requested.");
+                void change(
+                  "computers/scan",
+                  { id: computer.id },
+                  "Paired scan requested.",
+                  "POST",
+                  { key },
+                );
               }}
             >
               Scan selected sources
@@ -1017,11 +1087,32 @@ export function ComputerPage() {
         </div>
       )}
       {!snapshot ? (
-        <EmptyState title="No evidence received">
-          Check that the other PC is running and reachable on your LAN or tailnet.
-        </EmptyState>
+        latest === "none" ? (
+          <EmptyState title="No evidence received">
+            Check that the other PC is running and reachable on your LAN or tailnet.
+          </EmptyState>
+        ) : latest === "failed" ? (
+          <EmptyState title="Evidence could not be read" action={retry}>
+            Your coordinator holds what this PC last sent, but reading it failed.
+          </EmptyState>
+        ) : (
+          <EmptyState title="Loading evidence">Reading what this PC last sent.</EmptyState>
+        )
       ) : (
         <>
+          {latest !== "current" && (
+            <div
+              className={`connection-banner${latest === "failed" ? " warning" : ""}`}
+              role="status"
+            >
+              <p>
+                {latest === "failed"
+                  ? "The latest evidence this PC sent could not be read. Earlier evidence is shown."
+                  : "Earlier evidence is shown while the latest this PC sent is read."}
+              </p>
+              {latest === "failed" && retry}
+            </div>
+          )}
           <ScanProgress
             snapshot={snapshot}
             connected={!computer.error && connection === "connected"}
@@ -1030,7 +1121,8 @@ export function ComputerPage() {
             <h2>Needs attention</h2>
             {attentionGroups(snapshot).length === 0 ? (
               <p className="muted">
-                No findings in the received evidence. Review timestamps and coverage below.
+                No findings need attention in the received evidence. Review timestamps and coverage
+                below.
               </p>
             ) : (
               attentionGroups(snapshot).map((group) => (
@@ -1038,20 +1130,23 @@ export function ComputerPage() {
                   <summary>
                     <span>{group.label}</span>
                     <span className="muted">
-                      {group.counts.updates} updates · {group.counts.advisories} advisories ·{" "}
-                      {group.evidence.status}
+                      {plural(group.counts.updates, "update available", "updates available")} ·{" "}
+                      {plural(group.counts.advisories, "advisory", "advisories")} ·{" "}
+                      {plural(group.counts.lifecycle, "lifecycle finding")} ·{" "}
+                      <EvidenceBadge status={group.evidence.status} />
                     </span>
                   </summary>
-                  <Evidence evidence={group.evidence} />
+                  <Evidence level={3} evidence={group.evidence} />
                   {group.findings.map((finding) => (
                     <div className="preference-row" key={finding.id}>
                       <div>
                         <strong>{finding.name}</strong>
                         <p className="muted">{finding.description}</p>
                       </div>
-                      <Badge tone={finding.kind === "advisory" ? "warning" : "neutral"}>
-                        {finding.kind}
-                      </Badge>
+                      <FindingBadge
+                        finding={finding}
+                        cooldownDays={snapshot.settings.releaseCooldownDays ?? 3}
+                      />
                     </div>
                   ))}
                 </details>
@@ -1060,9 +1155,9 @@ export function ComputerPage() {
           </section>
           <section className="setting-section">
             <h2>Global tools · {snapshot.inventory.installations.length}</h2>
-            <Evidence evidence={snapshot.inventory.evidence} />
+            <Evidence level={3} evidence={snapshot.inventory.evidence} />
             {snapshot.inventory.updateEvidence && (
-              <Evidence evidence={snapshot.inventory.updateEvidence} />
+              <Evidence level={3} evidence={snapshot.inventory.updateEvidence} />
             )}
             <div className="setting-group">
               {snapshot.inventory.installations.map((installation) => (
@@ -1071,9 +1166,15 @@ export function ComputerPage() {
                   label={installation.name}
                   description={`${installation.manager} · ${installation.version ?? "Unknown version"}`}
                 >
+                  {/* Retained evidence from an unreachable PC, or a failed check, is not current:
+                      it reads "previous, unverified" as This PC's own rows do. */}
                   <Badge>
                     {installation.availableVersion
-                      ? `Update: ${installation.availableVersion}`
+                      ? `Update available: ${installationCandidate(
+                          installation,
+                          Boolean(computer.error) ||
+                            snapshot.inventory.updateEvidence?.status === "failed",
+                        )}`
                       : "No verified update"}
                   </Badge>
                 </SettingRow>
@@ -1087,8 +1188,8 @@ export function ComputerPage() {
                 <summary>
                   <strong>{project.name}</strong>
                   <span className="muted">
-                    {project.evidence.status} · {project.dependencies.length} dependency
-                    observations
+                    <EvidenceBadge status={project.evidence.status} /> ·{" "}
+                    {plural(project.dependencies.length, "dependency", "dependencies")}
                   </span>
                 </summary>
                 {project.repository && (
@@ -1097,7 +1198,7 @@ export function ComputerPage() {
                     {project.repository.commit ?? "Commit not checked"}
                   </p>
                 )}
-                <Evidence evidence={project.evidence} />
+                <Evidence level={3} evidence={project.evidence} />
                 {project.dependencies
                   .filter(
                     (d) =>
@@ -1111,14 +1212,14 @@ export function ComputerPage() {
                     <SettingRow
                       key={`${dependency.name}:${dependency.importer}:${index}`}
                       label={dependency.name}
-                      description={`${dependency.importer} · ${dependency.resolved ?? dependency.requested}`}
+                      description={`${workspaceLabel(dependency.importer)} · ${dependency.resolved ?? dependency.requested}`}
                     >
                       <span className="muted">
                         {dependency.availableVersion ??
                           dependency.latestVersion ??
                           "Attention needed"}
                         {dependency.advisoryIds.length
-                          ? ` · ${dependency.advisoryIds.length} advisories`
+                          ? ` · ${plural(dependency.advisoryIds.length, "advisory", "advisories")}`
                           : ""}
                       </span>
                     </SettingRow>

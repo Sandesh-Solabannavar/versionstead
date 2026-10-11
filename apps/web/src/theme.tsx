@@ -42,34 +42,85 @@ function readLocal(key: string) {
     return null;
   }
 }
+/** What this device saved, validated. A missing or restricted store gives the defaults. */
+function readSaved() {
+  let theme: Theme = "system";
+  try {
+    theme = readTheme(localStorage.getItem(storageKey));
+  } catch {
+    // Restricted browser storage keeps the system theme for this session.
+  }
+  const customThemes = readCustomThemes(readLocal("versionstead.themes"));
+  return {
+    theme,
+    compact: readLocal("versionstead.compact") === true,
+    reducedMotion: readLocal("versionstead.reducedMotion") === true,
+    bindings: readBindings(readLocal("versionstead.keybindings") ?? defaultBindings),
+    appearance: readAppearance(readLocal("versionstead.appearance")),
+    customThemes,
+    themeHalves: readThemeHalves(readLocal("versionstead.theme-halves"), [
+      ...builtInThemes,
+      ...customThemes,
+    ]),
+  };
+}
+const systemIsDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+
+/** Puts a theme on the page and returns the palette halves it used, once validated. */
+function applyTheme(
+  theme: Theme,
+  resolvedTheme: ThemeMode,
+  appearance: Appearance,
+  themes: readonly ThemeDefinition[],
+  themeHalves: ThemeHalves,
+) {
+  const root = document.documentElement;
+  root.dataset.theme = theme;
+  root.dataset.resolvedTheme = resolvedTheme;
+  root.dataset.wordWrap = String(appearance.wordWrap);
+  root.dataset.tableFontCustom = String(appearance.tableFontSize !== 0);
+  root.style.colorScheme = resolvedTheme;
+  root.style.fontSize = `${appearance.interfaceFontSize}px`;
+  const validHalves = readThemeHalves(themeHalves, themes);
+  const variables = appearanceVariables(
+    resolvePalette(validHalves, themes, resolvedTheme),
+    appearance,
+    resolvedTheme,
+  );
+  for (const [key, value] of Object.entries(variables)) root.style.setProperty(key, value);
+  return validHalves;
+}
+function applyPreferences(compact: boolean, reducedMotion: boolean) {
+  document.documentElement.dataset.density = compact ? "compact" : "comfortable";
+  document.documentElement.dataset.reducedMotion = String(reducedMotion);
+}
+/**
+ * Applies the saved theme before React renders, so a reload shows it from the first frame instead of
+ * the defaults followed by a jump. A script in the page would break the CSP, so main.tsx calls this.
+ */
+export function applySavedAppearance() {
+  const saved = readSaved();
+  applyTheme(
+    saved.theme,
+    saved.theme === "system" ? (systemIsDark() ? "dark" : "light") : saved.theme,
+    saved.appearance,
+    [...builtInThemes, ...saved.customThemes],
+    saved.themeHalves,
+  );
+  applyPreferences(saved.compact, saved.reducedMotion);
+}
+
 export function AppearanceProvider({ children }: { children: ReactNode }) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    try {
-      return readTheme(localStorage.getItem(storageKey));
-    } catch {
-      return "system";
-    }
-  });
-  const [compact, setCompact] = useState(() => readLocal("versionstead.compact") === true);
-  const [reducedMotion, setReducedMotion] = useState(
-    () => readLocal("versionstead.reducedMotion") === true,
-  );
-  const [bindings, setBindings] = useState(() =>
-    readBindings(readLocal("versionstead.keybindings") ?? defaultBindings),
-  );
-  const [appearance, setAppearance] = useState(() =>
-    readAppearance(readLocal("versionstead.appearance")),
-  );
-  const [customThemes, setCustomThemes] = useState(() =>
-    readCustomThemes(readLocal("versionstead.themes")),
-  );
+  const [saved] = useState(readSaved);
+  const [theme, setTheme] = useState<Theme>(saved.theme);
+  const [compact, setCompact] = useState(saved.compact);
+  const [reducedMotion, setReducedMotion] = useState(saved.reducedMotion);
+  const [bindings, setBindings] = useState(saved.bindings);
+  const [appearance, setAppearance] = useState(saved.appearance);
+  const [customThemes, setCustomThemes] = useState(saved.customThemes);
   const themes = useMemo(() => [...builtInThemes, ...customThemes], [customThemes]);
-  const [themeHalves, setThemeHalves] = useState(() =>
-    readThemeHalves(readLocal("versionstead.theme-halves"), themes),
-  );
-  const [systemDark, setSystemDark] = useState(
-    () => matchMedia("(prefers-color-scheme: dark)").matches,
-  );
+  const [themeHalves, setThemeHalves] = useState(saved.themeHalves);
+  const [systemDark, setSystemDark] = useState(systemIsDark);
   const resolvedTheme = theme === "system" ? (systemDark ? "dark" : "light") : theme;
   useEffect(() => {
     void window.versionstead?.setWindowTheme(theme).catch(() => {
@@ -85,20 +136,7 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const root = document.documentElement;
-    root.dataset.theme = theme;
-    root.dataset.resolvedTheme = resolvedTheme;
-    root.dataset.wordWrap = String(appearance.wordWrap);
-    root.dataset.tableFontCustom = String(appearance.tableFontSize !== 0);
-    root.style.colorScheme = resolvedTheme;
-    root.style.fontSize = `${appearance.interfaceFontSize}px`;
-    const validHalves = readThemeHalves(themeHalves, themes);
-    const variables = appearanceVariables(
-      resolvePalette(validHalves, themes, resolvedTheme),
-      appearance,
-      resolvedTheme,
-    );
-    for (const [key, value] of Object.entries(variables)) root.style.setProperty(key, value);
+    const validHalves = applyTheme(theme, resolvedTheme, appearance, themes, themeHalves);
     try {
       localStorage.setItem(storageKey, theme);
       localStorage.setItem("versionstead.appearance", JSON.stringify(appearance));
@@ -112,8 +150,7 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     }
   }, [theme, resolvedTheme, appearance, customThemes, themeHalves, themes]);
   useEffect(() => {
-    document.documentElement.dataset.density = compact ? "compact" : "comfortable";
-    document.documentElement.dataset.reducedMotion = String(reducedMotion);
+    applyPreferences(compact, reducedMotion);
     try {
       localStorage.setItem("versionstead.compact", JSON.stringify(compact));
       localStorage.setItem("versionstead.reducedMotion", JSON.stringify(reducedMotion));

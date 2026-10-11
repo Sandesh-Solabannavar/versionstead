@@ -5,7 +5,8 @@ import type { ProviderKind } from "@versionstead/contracts/application";
 import { decodeProject, type Project } from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { useMonitoring } from "./monitoring";
-import { Button, Badge, Dialog, Input } from "./ui";
+import { actionKeys } from "./monitoring-actions";
+import { Button, Badge, Dialog, Input, useFailure } from "./ui";
 import { Choice } from "./components/settings-controls";
 import {
   GitHubIcon,
@@ -15,7 +16,8 @@ import {
   ForgejoIcon,
 } from "./components/source-control-icons";
 import { RepositorySelection } from "./repository-picker";
-import { repositoryLocation } from "./project-sources";
+import { platformName } from "./keybindings";
+import { folderPlaceholder, repositoryLocation } from "./project-sources";
 
 const maintenanceItems = [
   { value: "maintained", label: "Maintained by me" },
@@ -32,8 +34,10 @@ export function AddProjectDialog({
   initialSource?: ProviderKind;
 }) {
   const { snapshot: app } = useApplication();
-  const { busy, connection } = useMonitoring();
+  const { connection, pending } = useMonitoring();
   const navigate = useNavigate();
+  // Adding a project, from a folder or a repository, is one action with one key.
+  const adding = pending.has(actionKeys.addProject);
   const [source, setSource] = useState<Source>(initialSource ?? "sources");
   const [query, setQuery] = useState("");
   const [url, setUrl] = useState("");
@@ -49,7 +53,7 @@ export function AddProjectDialog({
     close();
     void navigate({ to: "/settings/source-control" });
   };
-  const disabled = busy || connection !== "connected";
+  const disabled = connection !== "connected";
   const providers = (["github", "gitlab"] as const)
     .map((kind) => {
       const provider = app?.providers.find((p) => p.kind === kind);
@@ -70,7 +74,8 @@ export function AddProjectDialog({
           ? "Add from Git URL"
           : "Add project";
   return (
-    <Dialog title={title} onClose={close}>
+    // Closing mid-request would lose its error, so the dialog stays until the request settles.
+    <Dialog title={title} onClose={close} dismissible={!adding}>
       {source === "sources" ? (
         <div className="project-source-picker">
           <div className="repository-search">
@@ -163,7 +168,7 @@ export function AddProjectDialog({
                   {!provider.ready && (
                     <Button
                       size="sm"
-                      aria-label={`Set up ${provider.name}`}
+                      aria-label={`Setup required for ${provider.name}`}
                       disabled={disabled}
                       onClick={setup}
                     >
@@ -282,10 +287,13 @@ function LocalProjectForm({
   added: (id: string) => void;
   back: () => void;
 }) {
-  const { busy, connection, error, mutate } = useMonitoring();
+  const { connection, pending, mutate } = useMonitoring();
   const [path, setPath] = useState("");
   const [mode, setMode] = useState<Project["mode"]>("maintained");
   const [pickerError, setPickerError] = useState<string | null>(null);
+  // Why the last attempt failed. It belongs to this form, so it never outlives it or leaks elsewhere.
+  const [error, fail, clearError] = useFailure();
+  const adding = pending.has(actionKeys.addProject);
   return (
     <div
       className="local-project-form"
@@ -293,22 +301,26 @@ function LocalProjectForm({
         if (event.key === "Escape") {
           event.preventDefault();
           event.stopPropagation();
-          back();
+          // Going back mid-request would drop the form, and the message with it.
+          if (!adding) back();
         }
       }}
     >
-      <Button variant="ghost" size="sm" onClick={back}>
+      <Button variant="ghost" size="sm" disabled={adding} onClick={back}>
         <ArrowLeft size={14} aria-hidden />
         Sources
       </Button>
       <form
         onSubmit={(event) => {
           event.preventDefault();
+          clearError();
           void mutate(
             "/api/projects",
             { path: path.trim(), mode },
             decodeProject,
             "Project selected. A read-only scan is scheduled.",
+            "POST",
+            { key: actionKeys.addProject, onError: fail },
           ).then((project) => {
             if (project) {
               added(project.id);
@@ -324,14 +336,14 @@ function LocalProjectForm({
             aria-label="Local folder path"
             required
             value={path}
-            placeholder={"D:\\projects\\my-app"}
+            placeholder={folderPlaceholder(platformName())}
             onChange={(event) => setPath(event.target.value)}
             autoComplete="off"
           />
         </label>
         {window.versionstead && (
           <Button
-            disabled={busy}
+            disabled={adding}
             onClick={() => {
               setPickerError(null);
               void window.versionstead
@@ -373,15 +385,15 @@ function LocalProjectForm({
           </p>
         )}
         <div className="form-actions">
-          <Button onClick={close} disabled={busy}>
+          <Button onClick={close} disabled={adding}>
             Cancel
           </Button>
           <Button
             variant="primary"
             type="submit"
-            disabled={!path.trim() || busy || connection !== "connected"}
+            disabled={!path.trim() || adding || connection !== "connected"}
           >
-            {busy ? "Adding…" : "Add project"}
+            {adding ? "Adding…" : "Add project"}
           </Button>
         </div>
       </form>

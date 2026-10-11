@@ -6,5 +6,7 @@ if (!runtime) {
   process.exitCode = 1;
 } else {
   // This explicit owner command is the only place the local capability is printed.
-  console.log(`Open ${runtime.origin} and enter this session access code:\n${runtime.token}`);
+  console.log(
+    `Open ${runtime.devOrigin ?? runtime.origin} and enter this session access code:\n${runtime.token}`,
+  );
 }

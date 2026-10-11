@@ -17,7 +17,7 @@ Acceptance:
 
 ## 1 — One PC and one project
 
-Status: npm/Bun detection and top-level global-tool checks, selected npm/pnpm/Bun scans, public npm/OSV lookups, durable evidence, live progress, grouped notifications, and tray/client separation are implemented. Windows registry/WinGet scanning has been removed. The boot-task installer captures owner global roots; elevated installation, actual LocalService metadata/project access, reboot, and sign-out verification remain open. Private registries, prerelease channels, standalone binary discovery and self-updates, and inventory of additional inactive Node prefixes remain deferred. Explicit npm/Bun global-package updates and T3-style Windows CLI discovery fallbacks are implemented; see [Global tool updates](global-tool-updates.md).
+Status: npm/Bun detection and top-level global-tool checks, selected npm/pnpm/Bun scans, public npm/OSV lookups, durable evidence, live progress, grouped notifications, and tray/client separation are implemented. Windows registry/WinGet scanning has been removed. The boot-task installer captures owner global roots; elevated installation, actual LocalService metadata/project access, reboot, and sign-out verification remain open. Private registries, prerelease channels, standalone binary discovery and self-updates, and inventory of additional inactive Node prefixes remain deferred. Explicit npm/Bun global-package updates and T3-style Windows CLI discovery fallbacks are implemented; see [Global tool updates](global-tool-updates.md). Wave 3 made large workspaces and idle polling cheaper: pnpm lockfiles parse on a worker thread with a 30-second deadline, monitoring state is stored as per-subject SQLite rows (schema version 2, migrated in place and not downgradable), npm metadata and OSV advisory details are cached and shared between scans (the OSV batch query is not) while public requests retry once, and the tray takes its settings from progress and reads the snapshot only while a project command runs. Its measurements, mostly synthetic, are in [Wave 3 verification](development.md#wave-3-verification-october-9-2026).
 
 Scope: an independent Windows background host, owner npm/Bun global tools, selected local npm/pnpm/Bun projects, update availability, known project dependency vulnerabilities, SQLite history, and a local notification path. See the [monitoring implementation plan](monitoring-implementation.md) and the implemented four-view interface.
 
@@ -53,7 +53,7 @@ Acceptance:
 
 Project display names/icons, confirmed removal, and manually launched owner commands for local checkouts are implemented; see [Project settings](project-settings.md). Background scanning remains read-only. Remote project administration/command execution, worktree workflows, and automatic project scripts remain outside the current scope.
 
-Status: selected GitHub.com/GitLab.com repository scans, Windows-protected credentials, routed settings, release checks, and pinned HTTPS pairing/evidence/scan/revocation are implemented. Connections follows T3 Code's grouped settings and Remote link/SSH dialog, with pairing-link autofill, saved-environment switches, and action menus. Optional owner-session OpenSSH forwarding targets an already-running monitor. Regression checks exercise two isolated HTTPS coordinators and pinned TLS through a controlled TCP forward. Physical second-PC networking, actual SSH authentication, firewall configuration, sign-out operation, central cross-device notifications, certificate rotation, and managed Tailscale MagicDNS/Serve remain open.
+Status: selected GitHub.com/GitLab.com repository scans, credentials protected by Windows DPAPI, the macOS login keychain, or the Linux Secret Service, routed settings, release checks, and pinned HTTPS pairing/evidence/scan/revocation are implemented. Connections follows T3 Code's grouped settings and Remote link/SSH dialog, with pairing-link autofill, saved-environment switches, and action menus. Optional owner-session OpenSSH forwarding targets an already-running monitor. Each paired PC's evidence is read on demand and saved only when it changes (Wave 3). Regression checks exercise two isolated HTTPS coordinators and pinned TLS through a controlled TCP forward. Physical second-PC networking, actual SSH authentication, firewall configuration, sign-out operation, central cross-device notifications, certificate rotation, and managed Tailscale MagicDNS/Serve remain open.
 
 Scope: independently running coordinators with explicit LAN/Tailscale pairing, and selected GitHub/GitLab repositories.
 
@@ -68,6 +68,16 @@ Acceptance:
 
 ## 4 — Cross-platform daily use
 
+Status: macOS/Linux connection credentials (OS keychain), paired-PC hosting, custom commands, a background host (LaunchAgent, systemd user service) and open-at-login are implemented with the automated checks listed in the [README platform table](../README.md#platform-support); Homebrew and Linux package-manager adapters, packaging and hardware acceptance remain open.
+
+Status: runtime support timelines from endoflife.date (each with its source and check date), deprecated packages, install-script changes, release age with a cooldown, and license/provenance from deps.dev are implemented; see [Architecture](architecture.md).
+
+Noise control is implemented: expiring snooze and reasoned ignore rules, notification scope and watch-only routing, quiet hours, and a daily digest, with deterministic injected-clock and time-zone tests.
+
+Acting on findings is implemented: Update all for This PC's global tools (desktop only, confirmed first, one package at a time), copy-only upgrade commands for each project, Markdown, CSV, and JSON exports, and a Version drift tab with a version matrix and align commands. The command and export builders and the Update all runner have unit tests. Windows hardware ran the commands, exports, and drift view in an isolated check and Update all with one Bun package; macOS and Linux hardware have not run them. See the [README platform table](../README.md#platform-support) and [Development](development.md#wave-4-verification-act-on-findings-october-11-2026).
+
+Everyday use from the keyboard is implemented: a command palette (Ctrl+K) over pages, settings, projects, packages, and actions; Cancel scan and Retry failed checks; and Needs attention's New since last scan and Resolved views, backed by a 30-day, 500-entry history. Windows hardware ran each of them in an isolated check, except typing with an input method editor, which no platform has tried; macOS and Linux hardware have not run them. See the [README platform table](../README.md#platform-support) and [Development](development.md#wave-4-verification-everyday-desktop-october-11-2026).
+
 Scope: macOS/Homebrew and Linux package-manager adapters, tested desktop packaging, digests, snoozes, and lifecycle signals.
 
 Acceptance:
@@ -76,14 +86,14 @@ Acceptance:
 - Linux findings account for distribution/vendor backports rather than comparing upstream versions alone.
 - Theme selection, keyboard navigation, screen-reader labels, and contrast work throughout core workflows.
 - Daily digests, quiet hours, expiring snoozes, and reconnect behavior have deterministic tests.
-- Backup/restore and database migrations are verified on an existing data file.
+- Backup/restore and database migrations are verified on an existing data file. (Wave 3 verified the monitoring database's version 1 to 2 migration on a database built with the version 1 schema; backup/restore is not yet verified.)
 - Runtime support timelines identify their authoritative source and last verification date.
 
 ## Later, only when needed
 
 - Renovate-assisted upgrade PRs with explicit authorization and reviewable changes.
 - Source analysis and secret scanning as separate capabilities with independent coverage.
-- Archived/deprecated package signals, version drift, and release notes.
-- Always-on coordinator deployment and optional export/SBOM formats.
+- Archived package signals and release notes.
+- Always-on coordinator deployment and SBOM export formats.
 
 Automatic software upgrades, arbitrary remote commands, and executing untrusted project builds are outside the initial scope.

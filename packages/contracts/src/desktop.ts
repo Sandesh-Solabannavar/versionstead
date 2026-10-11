@@ -17,3 +17,8 @@ export const WindowPreferences = Schema.Struct({
 });
 export type WindowPreferences = typeof WindowPreferences.Type;
 export const decodeWindowPreferences = Schema.decodeUnknownSync(WindowPreferences);
+/** What the OS has registered to open this app at login, read back after every change. */
+export const LoginItemState = Schema.Struct({ openAtLogin: Schema.Boolean });
+export type LoginItemState = typeof LoginItemState.Type;
+export const decodeLoginItemState = Schema.decodeUnknownSync(LoginItemState);
+export const decodeLoginItemChange = Schema.decodeUnknownSync(Schema.Boolean);

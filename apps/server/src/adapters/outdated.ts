@@ -2,11 +2,12 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import semver from "semver";
 import type { Dependency, Project } from "@versionstead/contracts/monitoring";
 import { object, packageName, readSelectedFile, selectDirectory, string } from "./projects.ts";
+import { inspectBun, localPath, noAutoInstall, ownNode, toolDirectories } from "./tool-paths.ts";
 
 type Manager = Exclude<Project["packageManager"], "unknown">;
 export type NativeVersions = {
@@ -33,62 +34,55 @@ const inside = (root: string, path: string) => {
 };
 
 // Resolve installed managers directly. Shell wrappers, Corepack downloads, and repository binaries
-// must not become an implicit code-execution/install path during a scheduled scan.
+// must not become an implicit code-execution/install path during a scheduled scan. Nor may a
+// version-manager shim (mise, asdf, Volta), which reads the directory it runs in and may install what
+// that pins: npm and pnpm run as `<node> <script>`, and Bun only as the real executable it reports.
 export async function outdatedExecutable(
   manager: Manager,
   root: string,
+  directories: readonly string[] = toolDirectories(),
+  node: string | null = ownNode(),
 ): Promise<OutdatedCommand | null> {
-  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(isAbsolute)) {
+  for (const directory of directories) {
+    // Never the current directory or a network share, whoever built the list.
+    if (!localPath(directory)) continue;
     try {
       const canonical = await realpath(directory);
       if (inside(root, canonical) || canonical.split(/[\\/]/).includes("node_modules")) continue;
       if (manager === "bun") {
-        const executable = await realpath(
-          join(canonical, process.platform === "win32" ? "bun.exe" : "bun"),
-        );
-        await access(executable, constants.X_OK);
-        if (inside(root, executable) || !(await stat(executable)).isFile()) continue;
-        const command = { executable, prefix: [], version: "" };
-        const version = await runOutdatedCommand(
-          command,
-          ["--version"],
-          tmpdir(),
-          safeEnvironment(),
-        );
-        if (version.code === 0 && semver.valid(version.stdout.trim()))
-          return { ...command, version: version.stdout.trim() };
-        continue;
+        const file = join(canonical, process.platform === "win32" ? "bun.exe" : "bun");
+        // The real file decides whether it belongs to the project, but a POSIX version-manager shim
+        // dispatches on the name it is run by, so only Windows asks the resolved file.
+        const real = await realpath(file);
+        await access(real, constants.X_OK);
+        if (inside(root, real) || !(await stat(real)).isFile()) continue;
+        // Shims read the directory they run in, honor what it pins, and may install it. Ask the candidate
+        // once, from an empty directory, which Bun it resolves to; only that executable runs in a project.
+        const bun = await inspectBun(process.platform === "win32" ? real : file);
+        if (!bun || !semver.valid(bun.version)) continue;
+        const resolved = await realpath(bun.execPath);
+        await access(resolved, constants.X_OK);
+        if (inside(root, resolved) || !(await stat(resolved)).isFile()) continue;
+        return { executable: bun.execPath, prefix: [], version: bun.version };
       }
+      // npm's and pnpm's scripts run under Node; Electron's own binary cannot.
+      if (!node) return null;
       const launcher = await realpath(
         join(canonical, manager + (process.platform === "win32" ? ".cmd" : "")),
       );
+      const script = manager === "npm" ? "npm-cli.js" : "pnpm.cjs";
+      // Beside the launcher, or beside the Node that runs it when the launcher is a version-manager shim.
       const candidates = [
-        join(
-          dirname(launcher),
-          "node_modules",
-          manager,
-          "bin",
-          manager === "npm" ? "npm-cli.js" : "pnpm.cjs",
-        ),
+        join(dirname(launcher), "node_modules", manager, "bin", script),
         launcher,
-        join(
-          dirname(launcher),
-          "..",
-          "lib",
-          "node_modules",
-          manager,
-          "bin",
-          manager === "npm" ? "npm-cli.js" : "pnpm.cjs",
-        ),
+        join(dirname(launcher), "..", "lib", "node_modules", manager, "bin", script),
+        join(dirname(node), "node_modules", manager, "bin", script),
+        join(dirname(node), "..", "lib", "node_modules", manager, "bin", script),
       ];
       for (const candidate of candidates) {
         try {
           const cli = await realpath(candidate);
-          if (
-            inside(root, cli) ||
-            basename(cli) !== (manager === "npm" ? "npm-cli.js" : "pnpm.cjs")
-          )
-            continue;
+          if (inside(root, cli) || basename(cli) !== script) continue;
           const parent = await realpath(join(dirname(cli), ".."));
           const pkg = object(
             JSON.parse((await readSelectedFile(parent, "package.json", 256 * 1024)) ?? "null"),
@@ -101,8 +95,7 @@ export async function outdatedExecutable(
             (manager === "pnpm" && semver.major(pkg.version) !== 10)
           )
             continue;
-          if (!/^node(?:\.exe)?$/i.test(basename(process.execPath))) return null;
-          return { executable: process.execPath, prefix: [cli], version: pkg.version };
+          return { executable: node, prefix: [cli], version: pkg.version };
         } catch {
           /* Try another installed layout. */
         }
@@ -121,6 +114,7 @@ function safeEnvironment(): NodeJS.ProcessEnv {
       delete env[key];
   return {
     ...env,
+    ...noAutoInstall,
     NODE_OPTIONS: "",
     NODE_PATH: "",
     COREPACK_ENABLE_NETWORK: "0",
@@ -133,6 +127,9 @@ function safeEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
+const commandTimeout = 30000;
+// A healthy batch answers in seconds; commandTimeout only bounds a hung one.
+const batchAllowance = 10000;
 export const runOutdatedCommand: OutdatedRunner = (command, args, cwd, env, signal) =>
   new Promise((resolveResult, reject) => {
     execFile(
@@ -142,7 +139,7 @@ export const runOutdatedCommand: OutdatedRunner = (command, args, cwd, env, sign
         cwd,
         env,
         signal,
-        timeout: 30000,
+        timeout: commandTimeout,
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
         encoding: "utf8",
@@ -283,10 +280,23 @@ export async function checkNativeVersions(
       group.push(dep);
       groups.set(dep.importer, group);
     }
+    // Like the registry and OSV stages, the whole stage gets a budget scaled by its work: one command
+    // per batch (two for pnpm), each allowed batchAllowance. That is far below commandTimeout so that
+    // the budget can end a registry outage that would run every command to its own limit.
+    // ponytail: checked between batches, so one command in flight can overrun the budget by its own
+    // timeout; pass the remaining time to the runner as a signal if that matters.
+    const batches = [...groups.values()].reduce(
+      (sum, records) => sum + Math.ceil(new Set(records.map((dep) => dep.name)).size / 40),
+      0,
+    );
+    const deadline =
+      Date.now() +
+      Math.max(90000, batches * (manager === "pnpm" ? 2 : 1) * batchAllowance + commandTimeout);
     let completed = 0;
     onProgress?.(0, eligible.length);
     for (const [importer, records] of groups) {
       if (signal?.aborted) throw new Error("Scan cancelled.");
+      if (Date.now() > deadline) break;
       const cwd = await selectDirectory(resolve(root, importer));
       if (!inside(root, cwd)) throw new Error("Workspace escapes selected folder.");
       const npmrc = (await readSelectedFile(cwd, ".npmrc", 100 * 1024)) ?? "";
@@ -304,6 +314,7 @@ export async function checkNativeVersions(
       // collapsing the same canonical package at different workspace versions/ranges.
       const names = [...new Set(records.map((dep) => dep.name))];
       for (let offset = 0; offset < names.length; offset += 40) {
+        if (Date.now() > deadline) break;
         const selected = names.slice(offset, offset + 40);
         const batch = records.filter((dep) => selected.includes(dep.name));
         try {
@@ -400,6 +411,13 @@ export async function checkNativeVersions(
           onProgress?.(completed, eligible.length);
         }
       }
+    }
+    // Records the deadline skipped stay unreported, so they use the registry fallback like any other.
+    if (completed < eligible.length) {
+      result.coverage.push(
+        `${manager} outdated exceeded its scan time budget; remaining eligible records use the public-registry fallback.`,
+      );
+      onProgress?.(eligible.length, eligible.length);
     }
     result.coverage.push(
       `${manager} outdated ${command.version}: ${result.checked.size}/${eligible.length} direct records verified; unreported or unavailable records use the public-registry fallback`,

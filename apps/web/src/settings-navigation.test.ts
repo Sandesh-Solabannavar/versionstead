@@ -16,6 +16,17 @@ test("settings search finds actual controls across sections, ignores case, and m
   assert.equal(searchSettings("ssh")[0]?.path, "/settings/connections");
   assert.equal(searchSettings("shortcuts")[0]?.path, "/settings/keybindings");
   assert.equal(settingTargetId("Glass opacity"), "setting-glass-opacity");
+  assert.equal(searchSettings("cooldown")[0]?.target, "setting-release-cooldown");
+  assert.equal(
+    searchSettings("deps.dev")[0]?.target,
+    "setting-use-deps-dev-for-release-age-license-and-provenance",
+  );
+  assert.equal(searchSettings("watch-only")[0]?.target, "setting-notify-about-watch-only-projects");
+  assert.ok(searchSettings("notify about").some((item) => item.target === "setting-notify-about"));
+  assert.equal(searchSettings("quiet")[0]?.target, "setting-quiet-hours");
+  assert.equal(searchSettings("delivery")[0]?.target, "setting-notification-delivery");
+  assert.equal(searchSettings("digest")[0]?.target, "setting-notification-delivery");
+  assert.equal(searchSettings("daily digest")[0]?.target, "setting-notification-delivery");
 });
 
 test("Back keeps the last workspace filter and remote PC while rejecting utility and external URLs", () => {

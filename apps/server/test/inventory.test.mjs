@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   bunGlobalDirectory,
   decodeBunConfiguration,
   discoverGlobalToolSources,
   inspectGlobalSources,
+  pathNodeVersion,
   validateGlobalToolSources,
 } from "../dist/adapters/inventory.js";
+import { createSourceCache } from "../dist/adapters/lookups.js";
 
 const checkedAt = "2026-10-02T10:00:00.000Z";
 test("Bun roots follow explicit config and environment precedence without listing a parent project", () => {
@@ -217,8 +219,13 @@ test("all global names are checked with bounded concurrency despite individual s
         active--;
       }
     },
+    createSourceCache(async () => {}),
   );
-  assert.deepEqual(calls.sort(), names);
+  assert.deepEqual(
+    calls.sort(),
+    [...names, "tool-010"].sort(),
+    "Every name once, and the unavailable one retried once",
+  );
   assert.equal(peak, 4);
   assert.equal(result.inventoryChecks, "complete");
   assert.equal(result.updateChecks, "partial");
@@ -342,6 +349,7 @@ test("failed or mismatched public responses preserve unknown updates and attempt
     assert.equal(result.updateChecks, "failed");
     assert.equal(result.installations[0].updateStatus, "unknown");
     assert.equal(result.installations[0].availableVersion, null);
+    assert.equal(result.signals.size, 0, "No signals are reported for an unchecked name");
     assert.deepEqual(progress.at(-1), { stage: "pc-updates", completed: 1, total: 1 });
   }
   const abort = new AbortController();
@@ -376,33 +384,147 @@ test("owner source boundary validates both managers, local roots, versions and b
 });
 
 test("manager discovery reports independent not-installed results without constrained executables", async () => {
-  const names = [
-    "PATH",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "USERPROFILE",
-    "BUN_INSTALL",
-    "VOLTA_HOME",
-    "PNPM_HOME",
-    "ProgramFiles",
-  ];
-  const original = new Map(names.map((name) => [name, process.env[name]]));
-  try {
-    for (const name of names) delete process.env[name];
-    const sources = await discoverGlobalToolSources();
-    assert.deepEqual(
-      sources.map(({ manager, status, root, version }) => ({ manager, status, root, version })),
-      ["npm", "bun"].map((manager) => ({
-        manager,
-        status: "not-installed",
-        root: null,
-        version: null,
-      })),
+  // The platform fallbacks (Homebrew, /usr/local/bin, ...) can hold real tools on this host: search nowhere.
+  const sources = await discoverGlobalToolSources(undefined, [], []);
+  assert.deepEqual(
+    sources.map(({ manager, status, root, version }) => ({ manager, status, root, version })),
+    ["npm", "bun"].map((manager) => ({
+      manager,
+      status: "not-installed",
+      root: null,
+      version: null,
+    })),
+  );
+  assert.equal(
+    sources[0].nodeVersion,
+    null,
+    "No Node.js on the searched path is unknown, not omitted",
+  );
+  assert.equal("nodeVersion" in sources[1], false, "Only the npm source carries the PATH Node.js");
+});
+
+test("This PC records the Node.js first on the owner's PATH and validates it at the source boundary", async (t) => {
+  const { base, npm } = await fixture(t);
+  const bin = join(base, "bin");
+  await mkdir(bin);
+  const executableName = process.platform === "win32" ? "node.exe" : "node";
+  await writeFile(join(bin, executableName), "");
+  await chmod(join(bin, executableName), 0o755);
+  const probed = [];
+  const version = await pathNodeVersion([bin], async (candidate) => {
+    probed.push(candidate);
+    return { version: "20.11.1", execPath: candidate };
+  });
+  assert.equal(version, "20.11.1");
+  assert.equal(probed.length, 1, "One bounded probe per discovery");
+  assert.equal(
+    await pathNodeVersion([bin], async (c) => ({ version: "20.11.1 (custom)", execPath: c })),
+    null,
+    "A version that is not semver is unknown, not an error that fails the npm and Bun discovery",
+  );
+  assert.equal(
+    await pathNodeVersion([bin], async (c) => ({ version: "20.11.1+build.5", execPath: c })),
+    "20.11.1",
+    "Build metadata is dropped, so what is recorded always passes the source boundary",
+  );
+  assert.equal(await pathNodeVersion([bin], async () => null), null, "A failed probe is unknown");
+  assert.equal(
+    await pathNodeVersion([join(base, "empty")], async () => assert.fail("Nothing to run")),
+    null,
+  );
+  const captured = await validateGlobalToolSources([
+    source("npm", npm, { nodeVersion: "20.11.1" }),
+    absent("bun"),
+  ]);
+  assert.equal(captured[0].nodeVersion, "20.11.1");
+  const older = await validateGlobalToolSources([source("npm", npm), absent("bun")]);
+  assert.equal(
+    "nodeVersion" in older[0],
+    false,
+    "A desktop that does not capture Node.js is unchanged",
+  );
+  for (const nodeVersion of ["v20.11.1", "20.x", "latest"])
+    await assert.rejects(
+      validateGlobalToolSources([source("npm", npm, { nodeVersion }), absent("bun")]),
+      /Invalid global tool source/,
     );
-  } finally {
-    for (const [name, value] of original) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
-  }
+  await assert.rejects(
+    validateGlobalToolSources([source("npm", npm), { ...absent("bun"), nodeVersion: "20.11.1" }]),
+    /Invalid global tool source/,
+    "Only the npm source carries the PATH Node.js",
+  );
+});
+
+test("the PATH Node.js version is what the real bounded probe reports", async () => {
+  assert.equal(await pathNodeVersion([dirname(process.execPath)]), process.versions.node);
+});
+
+test("global tool checks report deprecation, added install scripts, and deprecated candidates from the same metadata", async (t) => {
+  const { npm } = await fixture(t);
+  await packageAt(npm, "old-tool");
+  await packageAt(npm, "fresh-tool");
+  const calls = [];
+  const result = await inspectGlobalSources(
+    [source("npm", npm), absent("bun")],
+    undefined,
+    undefined,
+    async (url, options) => {
+      assert.equal(options.redirect, "error");
+      const name = decodeURIComponent(new URL(url).pathname.slice(1));
+      calls.push(name);
+      return Response.json({
+        name,
+        "dist-tags": { latest: "2.0.0" },
+        versions:
+          name === "old-tool"
+            ? {
+                "1.0.0": { deprecated: "Use new-tool." },
+                "2.0.0": { deprecated: "<b>Use</b>\u202E new-tool.\n".repeat(2000) },
+              }
+            : { "1.0.0": {}, "2.0.0": { hasInstallScript: true } },
+      });
+    },
+  );
+  const id = (name) => result.installations.find((item) => item.name === name).id;
+  const old = result.signals.get(id("old-tool"));
+  assert.equal(old.deprecated, "Use new-tool.");
+  assert.equal(old.installScript, false);
+  assert.equal(old.candidateDeprecated.length, 300, "Candidate messages are bounded plain text");
+  assert.ok(old.candidateDeprecated.startsWith("<b>Use</b> new-tool. <b>Use</b>"));
+  assert.deepEqual(result.signals.get(id("fresh-tool")), {
+    deprecated: null,
+    installScript: true,
+    candidateDeprecated: null,
+  });
+  assert.deepEqual(calls.sort(), ["fresh-tool", "old-tool"]);
+  assert.equal(result.updateChecks, "complete");
+});
+
+test("a tool that is current has no candidate to check, and an unreadable name records no signals", async (t) => {
+  const { npm } = await fixture(t);
+  await packageAt(npm, "current-tool");
+  await packageAt(npm, "unreadable-tool");
+  const result = await inspectGlobalSources(
+    [source("npm", npm), absent("bun")],
+    undefined,
+    undefined,
+    async (url) => {
+      const name = decodeURIComponent(new URL(url).pathname.slice(1));
+      return name === "unreadable-tool"
+        ? new Response("unavailable", { status: 500 })
+        : Response.json({
+            name,
+            "dist-tags": { latest: "1.0.0" },
+            versions: { "1.0.0": { deprecated: "Retired." } },
+          });
+    },
+  );
+  const id = (name) => result.installations.find((item) => item.name === name).id;
+  assert.deepEqual(result.signals.get(id("current-tool")), {
+    deprecated: "Retired.",
+    installScript: null,
+    candidateDeprecated: null,
+  });
+  assert.equal(result.signals.has(id("unreadable-tool")), false, "Unknown, never 'not deprecated'");
+  assert.equal(result.updateChecks, "partial");
 });

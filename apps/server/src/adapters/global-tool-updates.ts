@@ -10,7 +10,7 @@ import {
   readGlobalInstallation,
 } from "./inventory.ts";
 import { object, readSelectedFile, string, InputError, packageName } from "./projects.ts";
-import { toolDirectories, toolExecutable } from "./tool-paths.ts";
+import { noAutoInstall, toolDirectories, toolExecutable } from "./tool-paths.ts";
 
 export type GlobalToolUpdatePlan = {
   executable: string;
@@ -87,6 +87,8 @@ export async function resolveGlobalToolUpdate(
   );
   for (const key of Object.keys(env)) if (key.toUpperCase() === "PATH") delete env[key];
   env.PATH = toolDirectories().join(delimiter);
+  // The environment discovery ran the manager with: no mise auto-install, no injected Bun options.
+  Object.assign(env, noAutoInstall, { BUN_OPTIONS: "" });
   let executable: string;
   let args: string[];
   if (source.manager === "npm") {

@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  applicationMenu,
   defaultWindowPreferences,
   initialWindowBounds,
   loadWindowPreferences,
+  maximizedToSave,
+  restoreMaximized,
   saveWindowPreferences,
   titleBarOptions,
 } from "../dist/window.js";
@@ -24,6 +28,50 @@ test("native caption controls follow the theme and leave macOS traffic lights na
     assert.throws(() => decodeWindowTheme(invalid));
 });
 
+test("the application menu keeps editing, zoom and close shortcuts without reload or devtools", () => {
+  const shape = (menu) =>
+    menu.map(
+      (item) =>
+        item.role ??
+        `${item.label}: ${item.submenu.map((child) => child.role ?? child.type).join(" ")}`,
+    );
+  // The standard View menu without Reload, Force Reload or Toggle Developer Tools.
+  const view = "View: resetZoom zoomIn zoomOut separator togglefullscreen";
+  // Window (Windows/Linux) and File (macOS) carry Close, the Ctrl/Cmd+W hide-to-tray shortcut.
+  for (const platform of ["win32", "linux"]) {
+    assert.deepEqual(shape(applicationMenu(platform, false)), ["editMenu", view, "windowMenu"]);
+    assert.deepEqual(shape(applicationMenu(platform, true)), [
+      "editMenu",
+      "viewMenu",
+      "windowMenu",
+    ]);
+  }
+  assert.deepEqual(shape(applicationMenu("darwin", false)), [
+    "appMenu",
+    "fileMenu",
+    "editMenu",
+    view,
+    "windowMenu",
+  ]);
+  assert.deepEqual(shape(applicationMenu("darwin", true)), [
+    "appMenu",
+    "fileMenu",
+    "editMenu",
+    "viewMenu",
+    "windowMenu",
+  ]);
+  const previous = process.env.VERSIONSTEAD_DEVTOOLS;
+  try {
+    process.env.VERSIONSTEAD_DEVTOOLS = "1";
+    assert.deepEqual(shape(applicationMenu("win32")), ["editMenu", "viewMenu", "windowMenu"]);
+    process.env.VERSIONSTEAD_DEVTOOLS = "true";
+    assert.deepEqual(shape(applicationMenu("win32")), ["editMenu", view, "windowMenu"]);
+  } finally {
+    if (previous === undefined) delete process.env.VERSIONSTEAD_DEVTOOLS;
+    else process.env.VERSIONSTEAD_DEVTOOLS = previous;
+  }
+});
+
 test("restore saved windows only when the entire normal bounds fit a connected display", () => {
   const displays = [
     { x: 0, y: 0, width: 1920, height: 1040 },
@@ -37,6 +85,42 @@ test("restore saved windows only when the entire normal bounds fit a connected d
     width: 1280,
     height: 860,
   });
+});
+
+test("a window that starts hidden is maximized by its first show, never at creation", () => {
+  const maximized = [];
+  const fake = (name) =>
+    Object.assign(new EventEmitter(), { maximize: () => maximized.push(name) });
+  // BrowserWindow.maximize() also shows a hidden window, so a hidden login start must wait.
+  const hidden = fake("hidden");
+  restoreMaximized(hidden, true, false);
+  assert.deepEqual(maximized, []);
+  // A window shown at once is maximized at once; a later window must not take over the pending one.
+  const shown = fake("shown");
+  restoreMaximized(shown, true, true);
+  assert.deepEqual(maximized, ["shown"]);
+  hidden.emit("show");
+  hidden.emit("show");
+  assert.deepEqual(maximized, ["shown", "hidden"], "Only the waiting window, only once");
+  // Nothing to restore: no maximize now or later, and no listener left behind.
+  const plain = fake("plain");
+  restoreMaximized(plain, false, true);
+  restoreMaximized(plain, false, false);
+  plain.emit("show");
+  assert.equal(plain.listenerCount("show"), 0);
+  assert.deepEqual(maximized, ["shown", "hidden"]);
+});
+
+test("a hidden start that is never shown keeps the saved maximized choice", () => {
+  const window = (isMaximized, isVisible) => ({
+    isMaximized: () => isMaximized,
+    isVisible: () => isVisible,
+  });
+  assert.equal(maximizedToSave(window(true, true), false), true, "Maximized while shown");
+  assert.equal(maximizedToSave(window(false, true), true), false, "Restored by the owner");
+  assert.equal(maximizedToSave(window(true, false), false), true, "Closed to the tray maximized");
+  assert.equal(maximizedToSave(window(false, false), true), true, "Hidden start, not yet shown");
+  assert.equal(maximizedToSave(window(false, false), false), false);
 });
 
 test("native device settings survive restart and safely ignore malformed or oversized files", async () => {

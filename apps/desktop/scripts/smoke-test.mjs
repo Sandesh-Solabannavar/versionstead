@@ -136,16 +136,31 @@ async function launch(capture = false) {
       result.nativeProjectSettings &&
       result.nativeProjectActions &&
       result.nativeKeybindings &&
+      result.nativePalette &&
+      ["cancelled", "finished-first"].includes(result.nativeCancelScan) &&
       result.nativeUpdatePanel &&
-      (!capture || (result.nativeGroupedProjects && result.nativeEvidenceSheet)),
+      ["declined", "no-updates", "updated"].includes(result.nativeUpdateAll) &&
+      result.nativeClipboard &&
+      result.nativeExport &&
+      (!capture ||
+        (result.nativeGroupedProjects &&
+          result.nativeEvidenceSheet &&
+          result.nativeUpgradeCommands &&
+          result.nativeVersionDrift)),
     "Real renderer, native bridge, and tray lifecycle must pass",
   );
   for (const line of output.split(/\r?\n/)) {
-    if (/^Desktop smoke: native (npm|bun) Update now/.test(line)) console.log(line);
+    if (/^Desktop smoke: native (npm|bun) Update (now|all)/.test(line)) console.log(line);
+    if (/^Desktop smoke: Cancel scan/.test(line)) console.log(line);
+    if (/^Desktop smoke: Update all not exercised/.test(line)) console.log(line);
     try {
-      if (JSON.parse(line)?.nativeProjectTable) console.log(line);
+      const parsed = JSON.parse(line);
+      if (parsed?.nativeProjectTable) console.log(line);
+      if (parsed?.nativeUpdateAll)
+        console.log(`Desktop smoke: Update all ${parsed.nativeUpdateAll}`);
     } catch {}
   }
+  return result;
 }
 
 async function request(path, init = {}) {
@@ -233,7 +248,10 @@ try {
     );
     console.log("Desktop smoke: isolated npm/Bun update fixtures installed");
   }
-  await launch();
+  const first = await launch();
+  // The live fixtures leave exactly one update, so a first launch that reports none has not run Update all.
+  if (process.env.VERSIONSTEAD_SMOKE_VERIFY_GLOBAL_UPDATES === "1")
+    assert.equal(first.nativeUpdateAll, "updated", "Update all must run the live Bun fixture");
   console.log("Desktop smoke: first launch and close-to-tray passed");
   coordinator = await readRuntime(dataDir);
   assert(coordinator, "Coordinator must remain running after Electron quits");

@@ -8,10 +8,11 @@ import {
 import { decodeProject, type Project } from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { useMonitoring, request } from "./monitoring";
+import { actionKeys } from "./monitoring-actions";
 import { repositoryMatches } from "./project-sources";
 import { Choice } from "./components/settings-controls";
 import { RefreshIcon } from "./components/ui/refresh-icon";
-import { Badge, Button, Input } from "./ui";
+import { Badge, Button, Input, useFailure } from "./ui";
 
 export function RepositorySelection({
   kind,
@@ -27,9 +28,10 @@ export function RepositorySelection({
   repositoryName?: string;
 }) {
   const { snapshot: app, refresh } = useApplication();
-  const { mutate, busy, connection } = useMonitoring();
+  const { mutate, connection } = useMonitoring();
   const [repositories, setRepositories] = useState<readonly Repository[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [addError, failAdd, clearAddError] = useFailure();
   const [query, setQuery] = useState(repositoryName ?? "");
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [confirming, setConfirming] = useState(false);
@@ -81,10 +83,11 @@ export function RepositorySelection({
     };
   }, [kind, repositoryName, refresh, generation]);
   const count = Object.keys(selected).length;
-  const disabled = busy || submitting || connection !== "connected" || !available;
+  const disabled = submitting || connection !== "connected" || !available;
   const add = async () => {
     setSubmitting(true);
     setError(null);
+    clearAddError();
     try {
       for (const [repositoryId, ref] of Object.entries(selected)) {
         const project = await mutate(
@@ -92,13 +95,17 @@ export function RepositorySelection({
           { kind, repositoryId, ref, mode },
           decodeProject,
           "Repository selected for monitoring.",
+          "POST",
+          {
+            key: actionKeys.addProject,
+            // The cause, then what it left behind; the dialog stays open on both.
+            onError: (message) =>
+              failAdd(
+                `${message} Selection stopped. Completed repositories remain selected for monitoring; retry the remaining ones.`,
+              ),
+          },
         );
-        if (!project) {
-          setError(
-            "Selection stopped. Completed repositories remain selected for monitoring; retry the remaining ones.",
-          );
-          return;
-        }
+        if (!project) return;
         onAdded(project.id);
         setSelected((previous) => {
           const next = { ...previous };
@@ -272,6 +279,11 @@ export function RepositorySelection({
       {error && (
         <p className="error-text" role="alert">
           {error}
+        </p>
+      )}
+      {addError && (
+        <p className="error-text" role="alert">
+          {addError}
         </p>
       )}
       <div className="project-picker-footer">

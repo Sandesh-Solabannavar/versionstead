@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { stripVTControlCharacters } from "node:util";
 import semver from "semver";
 import type { Dependency, Project } from "@versionstead/contracts/monitoring";
 import type { NativeVersions } from "./outdated.ts";
@@ -17,6 +19,8 @@ export type LookupResult = {
   coverage: string[];
   errors: string[];
   versionChecked?: Set<string>;
+  // Dependency id to what npm's metadata says; an id is present only if it was read in this scan.
+  signals?: Map<string, PackageSignals>;
 };
 export type DependencyLookup = (
   dependencies: readonly Dependency[],
@@ -29,11 +33,51 @@ export type LookupProgress = {
   completed: number;
   total: number;
 };
+/** What npm's metadata says about a resolved version and its update candidate. */
+export type PackageSignals = {
+  // The resolved version's message, or null when the metadata lists it without a deprecation.
+  // undefined: the metadata does not list the resolved version, so it was not checked.
+  deprecated: string | null | undefined;
+  // The candidate adds an install script the resolved version lacks. null: no candidate, or the
+  // candidate or the resolved version is missing from the metadata read, so it was not checked.
+  installScript: boolean | null;
+  // The candidate's own message, or null when it is not deprecated or there is no candidate.
+  // undefined: the candidate is newer than the metadata read, so it was not checked.
+  candidateDeprecated: string | null | undefined;
+};
 type CheckedDependency = {
   -readonly [K in keyof Dependency]: K extends "advisoryIds" ? string[] : Dependency[K];
 };
+type Sleep = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+// What a later check reads from each published version. Whole abbreviated manifests (about 1 KiB
+// each) would put several hundred MiB behind 2,000 cached names. `deprecated` is plain text (see
+// `plainMessage`), never the publisher's raw string.
+type VersionDetails = Readonly<{ deprecated?: string; hasInstallScript?: true }>;
+type PackageEntry = {
+  latest: string;
+  versions: Readonly<Record<string, VersionDetails>>;
+  etag: string | null;
+  // When the registry last confirmed this metadata: a 200, or a 304 to our If-None-Match.
+  checkedAt: number;
+};
+// The request settings that one lookup stage shares: its fetcher, budget, cancellation and pacing.
+export type Stage = {
+  fetcher: typeof fetch;
+  deadline: number;
+  signal: AbortSignal | undefined;
+  sleep: Sleep;
+};
 
-async function inParallel<T>(
+// ponytail: bounded by entry count, not bytes. A package's record averaged about 16 KiB over 500
+// real registry documents (at most 50,000 versions); weigh entries by version count if that matters.
+const cacheLimit = 2000;
+const freshFor = 30 * 60 * 1000;
+const stopped = () => new InputError("The scan stopped before public package checks finished.");
+const unavailable = () => new InputError("A public package source is unavailable.");
+// RFC 9110 entity-tag characters only, so a validator is safe to send back as a header.
+const entityTag = /^(?:W\/)?"[\x21\x23-\x7e]{0,128}"$/;
+
+export async function inParallel<T>(
   items: readonly T[],
   run: (item: T) => Promise<void>,
   signal?: AbortSignal,
@@ -49,30 +93,108 @@ async function inParallel<T>(
   );
 }
 
-async function json(
-  url: string,
-  options: RequestInit,
-  fetcher: typeof fetch,
-  deadline: number,
-  signal?: AbortSignal,
-  limit = 4 * 1024 * 1024,
-): Promise<unknown> {
-  if (signal?.aborted)
-    throw new InputError("The scan stopped before public package checks finished.");
-  const remaining = deadline - Date.now();
-  if (remaining <= 0)
-    throw new InputError("Public package checks exceeded their scan time budget.");
-  const response = await fetcher(url, {
-    ...options,
-    redirect: "error",
-    signal: AbortSignal.any([
-      AbortSignal.timeout(Math.min(12000, remaining)),
-      ...(signal ? [signal] : []),
-    ]),
-  });
+// A bounded least-recently-used map. Concurrent loads of one key share a single request, and a
+// value that is no longer fresh goes to the loader so it can revalidate instead of refetching.
+// A failed load stores nothing: the stale value is kept only to revalidate, never to be served.
+function sharedLoads<V>(fresh: (value: V) => boolean) {
+  const values = new Map<string, V>();
+  const loads = new Map<string, Promise<V>>();
+  return (key: string, load: (stale: V | undefined) => Promise<V>): Promise<V> => {
+    const known = values.get(key);
+    if (known !== undefined && fresh(known)) {
+      values.delete(key);
+      values.set(key, known);
+      return Promise.resolve(known);
+    }
+    const running = loads.get(key);
+    if (running) return running;
+    const started = load(known)
+      .then((value) => {
+        values.delete(key);
+        values.set(key, value);
+        if (values.size > cacheLimit) values.delete(values.keys().next().value!);
+        return value;
+      })
+      .finally(() => loads.delete(key));
+    loads.set(key, started);
+    return started;
+  };
+}
+
+export const pause: Sleep = async (milliseconds, signal) => {
+  try {
+    await delay(milliseconds, undefined, signal ? { signal } : {});
+  } catch {
+    throw stopped();
+  }
+};
+
+// What public lookups remember between scans. One instance belongs to one coordinator, so its
+// projects and This PC share requests; `sleep` is replaceable so that tests need not wait.
+export function createSourceCache(sleep: Sleep = pause) {
+  return {
+    packages: sharedLoads<PackageEntry>((entry) => {
+      const age = Date.now() - entry.checkedAt;
+      return age >= 0 && age < freshFor;
+    }),
+    // Keyed by advisory id and the `modified` time that querybatch reported, so it never goes stale.
+    advisories: sharedLoads<Record<string, unknown>>(() => true),
+    sleep,
+  };
+}
+export type SourceCache = ReturnType<typeof createSourceCache>;
+
+// How long to pause before the one retry: the Retry-After the source asked for (seconds or an HTTP
+// date) or 500 ms, plus up to 500 ms of jitter so requests that failed together do not retry together.
+function retryDelay(header: string | null | undefined) {
+  const value = header?.trim() ?? "";
+  const asked = /^\d+$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return (Number.isNaN(asked) ? 500 : Math.max(0, asked)) + Math.random() * 500;
+}
+
+// Sends a request, retrying it once after a pause when the source answers 429 or 503 or the
+// connection fails, unless the scan was cancelled, the request timed out (it already used its
+// 12 seconds), or the pause would end past the stage deadline. Any other response, including a
+// failing status the caller turns into an error, is returned as it is.
+async function exchange(url: string, options: RequestInit, stage: Stage): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    if (stage.signal?.aborted) throw stopped();
+    const remaining = stage.deadline - Date.now();
+    if (remaining <= 0)
+      throw new InputError("Public package checks exceeded their scan time budget.");
+    let response: Response | undefined;
+    let failure: unknown;
+    try {
+      response = await stage.fetcher(url, {
+        ...options,
+        redirect: "error",
+        signal: AbortSignal.any([
+          AbortSignal.timeout(Math.min(12000, remaining)),
+          ...(stage.signal ? [stage.signal] : []),
+        ]),
+      });
+    } catch (error) {
+      failure = error;
+    }
+    const transient = response
+      ? response.status === 429 || response.status === 503
+      : !stage.signal?.aborted &&
+        (failure as { name?: unknown } | null | undefined)?.name !== "TimeoutError";
+    const wait =
+      transient && attempt === 0 ? retryDelay(response?.headers.get("retry-after")) : Infinity;
+    if (wait >= stage.deadline - Date.now()) {
+      if (response) return response;
+      throw failure;
+    }
+    await response?.body?.cancel();
+    await stage.sleep(wait, stage.signal);
+  }
+}
+
+async function read(response: Response, limit: number): Promise<unknown> {
   if (!response.ok || !response.body) {
     await response.body?.cancel();
-    throw new InputError("A public package source is unavailable.");
+    throw unavailable();
   }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -91,6 +213,13 @@ async function json(
   }
 }
 
+export const json = async (
+  url: string,
+  options: RequestInit,
+  stage: Stage,
+  limit = 4 * 1024 * 1024,
+) => read(await exchange(url, options, stage), limit);
+
 function eligible(dependency: Dependency) {
   return (
     dependency.origin === "registry" &&
@@ -100,29 +229,103 @@ function eligible(dependency: Dependency) {
   );
 }
 
+/** Publisher text as one plain line: escape sequences, control, zero-width and bidirectional characters removed, whitespace collapsed, at most `limit` characters. Never HTML. */
+export function plainMessage(value: string, limit = 300): string {
+  // Only the first 4,096 characters are cleaned, which bounds the work on a hostile message.
+  const text = stripVTControlCharacters(value.slice(0, 4096))
+    .replace(/[\p{Cc}\p{Cf}\s]+/gu, " ")
+    .trim();
+  const characters = Array.from(text);
+  return characters.length > limit ? `${characters.slice(0, limit - 1).join("")}…` : text;
+}
+
+function versionDetails(manifest: unknown): VersionDetails {
+  const fields =
+    manifest !== null && typeof manifest === "object" ? (manifest as Record<string, unknown>) : {};
+  // Not `string()`, which drops a message over 4,096 characters and so reads the version as not
+  // deprecated: any non-blank message is a deprecation, kept as bounded plain text.
+  const deprecated =
+    typeof fields.deprecated === "string" && fields.deprecated.trim()
+      ? plainMessage(fields.deprecated) || "Deprecated by its publisher."
+      : null;
+  return {
+    ...(deprecated ? { deprecated } : {}),
+    ...(fields.hasInstallScript === true ? { hasInstallScript: true as const } : {}),
+  };
+}
+
+/** The resolved version's deprecation, and what its update candidate changes, from one metadata read. */
+export function readSignals(
+  details: Readonly<Record<string, VersionDetails>>,
+  resolved: string,
+  candidate: string | null,
+): PackageSignals {
+  const current = details[resolved];
+  // An installed version the metadata does not list (unpublished, or newer than the copy read) is
+  // unchecked: neither "not deprecated" nor a basis for "the candidate adds an install script".
+  const deprecated = current ? (current.deprecated ?? null) : undefined;
+  if (!candidate) return { deprecated, installScript: null, candidateDeprecated: null };
+  const next = details[candidate];
+  // A package manager can report a release newer than this metadata: say it was not checked.
+  if (!next) return { deprecated, installScript: null, candidateDeprecated: undefined };
+  return {
+    deprecated,
+    installScript: current
+      ? next.hasInstallScript === true && current.hasInstallScript !== true
+      : null,
+    candidateDeprecated: next.deprecated ?? null,
+  };
+}
+
 export async function publicPackageVersions(
   name: string,
   fetcher: typeof fetch = fetch,
   deadline = Date.now() + 90000,
   signal?: AbortSignal,
+  cache: SourceCache = createSourceCache(),
 ) {
   if (!packageName(name)) throw new InputError("A public package identity is invalid.");
-  const metadata = object(
-    await json(
+  // ponytail: a shared request runs under its first requester's signal and deadline, which is
+  // enough while scans run one at a time; give each waiter its own cancellation if they overlap.
+  const entry = await cache.packages(name, async (stale) => {
+    const response = await exchange(
       `https://registry.npmjs.org/${encodeURIComponent(name)}`,
-      { headers: { Accept: "application/vnd.npm.install-v1+json" } },
-      fetcher,
-      deadline,
-      signal,
-      16 * 1024 * 1024,
-    ),
-  );
-  if (metadata.name !== name) throw new InputError("The package source returned another identity.");
-  const versions = Object.keys(object(metadata.versions));
-  const latest = string(object(metadata["dist-tags"]).latest);
-  if (!latest || !semver.valid(latest) || versions.length > 50000)
-    throw new InputError("The package source returned invalid versions.");
-  return { versions, latest };
+      {
+        headers: {
+          Accept: "application/vnd.npm.install-v1+json",
+          ...(stale?.etag ? { "If-None-Match": stale.etag } : {}),
+        },
+      },
+      { fetcher, deadline, signal, sleep: cache.sleep },
+    );
+    if (response.status === 304 && stale?.etag) {
+      // The registry confirmed the stored metadata, which was validated when it was fetched.
+      await response.body?.cancel();
+      return { ...stale, checkedAt: Date.now() };
+    }
+    const metadata = object(await read(response, 16 * 1024 * 1024));
+    if (metadata.name !== name)
+      throw new InputError("The package source returned another identity.");
+    const published = object(metadata.versions);
+    const latest = string(object(metadata["dist-tags"]).latest);
+    if (!latest || !semver.valid(latest) || Object.keys(published).length > 50000)
+      throw new InputError("The package source returned invalid versions.");
+    const etag = response.headers.get("etag");
+    return {
+      latest,
+      versions: Object.fromEntries(
+        Object.entries(published).map(([version, manifest]) => [version, versionDetails(manifest)]),
+      ),
+      etag: etag && entityTag.test(etag) ? etag : null,
+      checkedAt: Date.now(),
+    };
+  });
+  return {
+    versions: Object.keys(entry.versions),
+    latest: entry.latest,
+    checkedAt: entry.checkedAt,
+    details: entry.versions,
+  };
 }
 
 export async function lookupDependencies(
@@ -131,7 +334,9 @@ export async function lookupDependencies(
   signal?: AbortSignal,
   onProgress?: (progress: LookupProgress) => void,
   nativeCheck?: () => Promise<NativeVersions>,
+  cache: SourceCache = createSourceCache(),
 ): Promise<LookupResult> {
+  const stage = (deadline: number): Stage => ({ fetcher, deadline, signal, sleep: cache.sleep });
   const result: Omit<LookupResult, "dependencies"> & { dependencies: CheckedDependency[] } = {
     dependencies: dependencies.map((d) => ({
       ...d,
@@ -142,12 +347,14 @@ export async function lookupDependencies(
     coverage: [],
     errors: [],
     versionChecked: new Set(),
+    signals: new Map(),
   };
   const candidates = result.dependencies.filter(eligible);
   const unique = [
     ...new Map(candidates.map((dep) => [`${dep.packageName}@${dep.resolved}`, dep])).values(),
   ];
-  const advisoryIds = new Set<string>();
+  // Each advisory id with the `modified` time that querybatch reported for it.
+  const advisoryIds = new Map<string, string | null>();
   const advisoryDeadline =
     Date.now() + Math.max(90000, Math.ceil(unique.length / 100) * 12000 + 12000);
   onProgress?.({ stage: "advisories", completed: 0, total: unique.length });
@@ -168,9 +375,7 @@ export async function lookupDependencies(
               })),
             }),
           },
-          fetcher,
-          advisoryDeadline,
-          signal,
+          stage(advisoryDeadline),
         ),
       );
       if (!Array.isArray(response.results) || response.results.length !== batch.length)
@@ -181,9 +386,10 @@ export async function lookupDependencies(
           throw new InputError("OSV returned paginated results; coverage is incomplete.");
         if (row.vulns !== undefined && !Array.isArray(row.vulns)) throw new Error();
         const ids = ((row.vulns ?? []) as unknown[]).map((v) => {
-          const id = string(object(v).id);
+          const vuln = object(v);
+          const id = string(vuln.id);
           if (!id || !/^[A-Za-z0-9_-]{1,150}$/.test(id)) throw new Error();
-          advisoryIds.add(id);
+          if (!advisoryIds.has(id)) advisoryIds.set(id, string(vuln.modified));
           return id;
         });
         const candidate = batch[i]!;
@@ -225,20 +431,19 @@ export async function lookupDependencies(
   onProgress?.({ stage: "advisory-details", completed: 0, total: detailIds.length });
   await inParallel(
     detailIds,
-    async (id) => {
+    async ([id, modified]) => {
       try {
-        details.set(
-          id,
+        const load = async () =>
           object(
             await json(
               `https://api.osv.dev/v1/vulns/${encodeURIComponent(id)}`,
               {},
-              fetcher,
-              detailDeadline,
-              signal,
+              stage(detailDeadline),
             ),
-          ),
-        );
+          );
+        // OSV changes `modified` whenever it changes a record, so an id and its modified time
+        // name one immutable version. Without a modified time the record is fetched every time.
+        details.set(id, await (modified ? cache.advisories(`${id} ${modified}`, load) : load()));
       } catch {
         result.errors.push(
           "Some advisory details are unavailable; affected IDs are retained with unknown severity.",
@@ -314,25 +519,24 @@ export async function lookupDependencies(
       result.versionChecked!.add(dep.id);
     }
   }
-  const versionCandidates = candidates.filter(
-    (dep) => dep.role !== "transitive" && !result.versionChecked!.has(dep.id),
-  );
-  const directNames = [...new Set(versionCandidates.map((dep) => dep.packageName))];
+  const direct = candidates.filter((dep) => dep.role !== "transitive");
+  const versionCandidates = direct.filter((dep) => !result.versionChecked!.has(dep.id));
+  const versionNames = new Set(versionCandidates.map((dep) => dep.packageName));
+  // Every direct name is read, including those the package manager checked, for deprecation and
+  // install-script flags; versions come from the registry only where the package manager did not answer.
+  const directNames = [...new Set(direct.map((dep) => dep.packageName))];
   const versionDeadline =
     Date.now() + Math.max(90000, Math.ceil(directNames.length / 4) * 12000 + 12000);
   let versionCount = 0;
   let checkedVersions = 0;
+  let checkedSignals = 0;
   onProgress?.({ stage: "versions", completed: 0, total: directNames.length });
   await inParallel(
     directNames,
     async (name) => {
       try {
-        const { versions, latest } = await publicPackageVersions(
-          name,
-          fetcher,
-          versionDeadline,
-          signal,
-        );
+        const metadata = await publicPackageVersions(name, fetcher, versionDeadline, signal, cache);
+        const { versions, latest } = metadata;
         for (const dep of versionCandidates.filter((d) => d.packageName === name)) {
           const range = requestedRange(dep);
           const compatible =
@@ -344,12 +548,22 @@ export async function lookupDependencies(
           dep.versionSource = "npm registry";
           result.versionChecked!.add(dep.id);
         }
-        checkedVersions++;
+        if (versionNames.has(name)) checkedVersions++;
+        for (const dep of direct.filter((d) => d.packageName === name))
+          result.signals!.set(
+            dep.id,
+            readSignals(metadata.details, dep.resolved!, dep.availableVersion ?? dep.latestVersion),
+          );
+        checkedSignals++;
       } catch {
         for (const dep of versionCandidates.filter((d) => d.packageName === name))
           dep.versionStatus = "failed";
+        if (versionNames.has(name))
+          result.errors.push(
+            "Public-registry version lookup failed; unavailable update evidence remains unknown.",
+          );
         result.errors.push(
-          "Public-registry version lookup failed; unavailable update evidence remains unknown.",
+          "Deprecation and install-script checks failed for some packages; their previous results are kept and new ones are unknown.",
         );
       } finally {
         onProgress?.({ stage: "versions", completed: ++versionCount, total: directNames.length });
@@ -357,9 +571,13 @@ export async function lookupDependencies(
     },
     signal,
   );
+  if (versionNames.size)
+    result.coverage.push(
+      `Public npm registry version checks: ${checkedVersions}/${versionNames.size} unique direct package names, SemVer requested ranges and latest dist-tag`,
+    );
   if (directNames.length)
     result.coverage.push(
-      `Public npm registry version checks: ${checkedVersions}/${directNames.length} unique direct package names, SemVer requested ranges and latest dist-tag`,
+      `Deprecation and install-script checks: ${checkedSignals}/${directNames.length} unique direct package names (npm registry metadata)`,
     );
   result.errors = [...new Set(result.errors)];
   if (signal?.aborted)

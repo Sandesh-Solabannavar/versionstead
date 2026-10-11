@@ -8,11 +8,9 @@ async function connect(
 ) {
   await app.open("/");
   await expect(screen.getByPlaceholder("Local access code")).toBeVisible();
-  await screen
-    .getByPlaceholder("Local access code")
-    .fill(secrets.get("accessToken"));
+  await screen.getByPlaceholder("Local access code").fill(secrets.get("accessToken"));
   await screen.getByRole("button", { name: "Connect" }).click();
-  await expect(screen.getByText("UI connected")).toBeVisible();
+  await expect(screen.getByTestId("connection-state")).toHaveAttribute("data-state", "online");
 }
 
 /**
@@ -35,40 +33,24 @@ test("owner connects and sees the monitoring dashboard", async ({
   await expect(browser).toHaveURL("/");
 });
 
-test("sidebar navigation links reach each section", async ({
-  app,
-  screen,
-  browser,
-}) => {
+test("sidebar navigation links reach each section", async ({ app, screen, browser }) => {
   await connect(app, screen);
 
   await screen.getByRole("link", { name: "This PC", exact: false }).click();
   await expect(browser).toHaveURL("/pc");
-  await expect(
-    screen.getByRole("heading", { name: "This PC", level: 1 }),
-  ).toBeVisible();
+  await expect(screen.getByRole("heading", { name: "This PC", level: 1 })).toBeVisible();
 
   await screen.getByRole("link", { name: "Projects", exact: false }).click();
   await expect(browser).toHaveURL("/projects");
-  await expect(
-    screen.getByRole("heading", { name: "Projects", level: 1 }),
-  ).toBeVisible();
+  await expect(screen.getByRole("heading", { name: "Projects", level: 1 })).toBeVisible();
 
-  await screen
-    .getByRole("link", { name: "Background service", exact: false })
-    .click();
+  await screen.getByRole("link", { name: "Background service", exact: false }).click();
   await expect(browser).toHaveURL("/service");
-  await expect(
-    screen.getByRole("heading", { name: "Background service", level: 1 }),
-  ).toBeVisible();
+  await expect(screen.getByRole("heading", { name: "Background service", level: 1 })).toBeVisible();
 
-  await screen
-    .getByRole("link", { name: "Needs attention", exact: false })
-    .click();
+  await screen.getByRole("link", { name: "Needs attention", exact: false }).click();
   await expect(browser).toHaveURL("/");
-  await expect(
-    screen.getByRole("heading", { name: "Needs attention", level: 1 }),
-  ).toBeVisible();
+  await expect(screen.getByRole("heading", { name: "Needs attention", level: 1 })).toBeVisible();
 });
 
 test("scanning this PC populates the installation list", async ({

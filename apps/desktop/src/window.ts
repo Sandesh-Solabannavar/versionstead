@@ -1,6 +1,10 @@
 import { readFile, writeFile, rename, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { BrowserWindowConstructorOptions } from "electron";
+import type {
+  BrowserWindow,
+  BrowserWindowConstructorOptions,
+  MenuItemConstructorOptions,
+} from "electron";
 import {
   decodeWindowPreferences,
   type WindowBounds,
@@ -28,6 +32,35 @@ export function titleBarOptions(
         },
       };
 }
+/** Role menus keep native editing, zoom, full-screen and close-window (hide to tray) shortcuts.
+ * Reload and developer tools accelerators would override app shortcuts, so the full View menu
+ * exists only with VERSIONSTEAD_DEVTOOLS=1. */
+export function applicationMenu(
+  platform = process.platform,
+  devtools = process.env.VERSIONSTEAD_DEVTOOLS === "1",
+): MenuItemConstructorOptions[] {
+  const view: MenuItemConstructorOptions = devtools
+    ? { role: "viewMenu" }
+    : {
+        label: "View",
+        submenu: [
+          { role: "resetZoom" },
+          { role: "zoomIn" },
+          { role: "zoomOut" },
+          { type: "separator" },
+          { role: "togglefullscreen" },
+        ],
+      };
+  return platform === "darwin"
+    ? [
+        { role: "appMenu" },
+        { role: "fileMenu" },
+        { role: "editMenu" },
+        view,
+        { role: "windowMenu" },
+      ]
+    : [{ role: "editMenu" }, view, { role: "windowMenu" }];
+}
 export function initialWindowBounds(
   preferences: WindowPreferences,
   displays: readonly WindowBounds[],
@@ -44,6 +77,23 @@ export function initialWindowBounds(
     ? b
     : { width: 1280, height: 860 };
 }
+/** BrowserWindow.maximize() also shows a hidden window, so a window that starts hidden (a login start)
+ * is maximized by its own first show instead. */
+export function restoreMaximized(
+  window: Pick<BrowserWindow, "maximize" | "once">,
+  maximized: boolean,
+  show: boolean,
+) {
+  if (!maximized) return;
+  if (show) window.maximize();
+  else window.once("show", () => window.maximize());
+}
+/** The maximized choice to save. A hidden start that was never shown is not maximized yet, so it keeps
+ * the saved choice instead of overwriting it with false. */
+export const maximizedToSave = (
+  window: Pick<BrowserWindow, "isMaximized" | "isVisible">,
+  saved: boolean,
+) => window.isMaximized() || (!window.isVisible() && saved);
 export async function loadWindowPreferences(directory: string): Promise<WindowPreferences> {
   try {
     const file = join(directory, "window-settings.json");

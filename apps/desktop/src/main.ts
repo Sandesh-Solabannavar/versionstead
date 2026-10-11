@@ -16,50 +16,92 @@ import {
 } from "electron";
 import { fileURLToPath } from "node:url";
 import { stat, realpath, mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import {
   coordinatorRequest,
   ensureCoordinator,
+  forwardRequest,
+  pollCoordinator,
   readyCoordinator,
+  recoverCoordinator,
   restartCoordinator,
+  StartupError,
+  startupFailureMessage,
+  stopMonitoringDetail,
+  summaryToShow,
+  webRoot,
+  type CoordinatorPoll,
   type CoordinatorRuntime,
 } from "./coordinator.js";
+import { readWebFile, responseHeaders } from "../../server/dist/web-files.js";
 import { externalApplicationUrl } from "./navigation.js";
 import { decodeAcceptedResponse } from "@versionstead/contracts/monitoring";
 import {
   decodeActionRequest,
   decodeRunActionRequest,
   decodeActionRun,
+  decodeActionShell,
 } from "@versionstead/contracts/project-settings";
-import { ProjectActionRunner } from "./project-actions.js";
+import { ProjectActionRunner, projectActionShell } from "./project-actions.js";
 import {
+  decodeGlobalToolUpdateBatch,
+  decodeGlobalToolUpdateBatchRequest,
+  decodeGlobalToolUpdateBatchStatus,
   decodeGlobalToolUpdateRequest,
   decodeGlobalToolUpdateRun,
   decodeGlobalToolUpdateRuns,
 } from "@versionstead/contracts/global-tool-updates";
-import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
 import {
+  currentUpdateItems,
+  GlobalToolUpdateRunner,
+  globalToolUpdateDependencies,
+} from "./global-tool-updates.js";
+import {
+  decodeLoginItemChange,
+  decodeLoginItemState,
   decodeWindowTheme,
   decodeWindowPreferences,
   type WindowPreferences,
 } from "@versionstead/contracts/desktop";
+import { changeLoginItem, readLoginItem, type LoginItemContext } from "./login-item.js";
 import {
+  applicationMenu,
   defaultWindowPreferences,
   initialWindowBounds,
   loadWindowPreferences,
+  maximizedToSave,
+  restoreMaximized,
   saveWindowPreferences,
   titleBarOptions,
 } from "./window.js";
 
 const smoke = process.argv.includes("--smoke-test");
+// A login entry starts the tray app without a window; launching it by hand still shows one.
+const startHidden = process.argv.includes("--hidden");
+const loginContext = (): LoginItemContext => ({
+  platform: process.platform,
+  home: homedir(),
+  env: process.env,
+  executable: process.execPath,
+  appPath: app.getAppPath(),
+  app,
+});
 let runtime: CoordinatorRuntime | null = null;
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
+// Set once the protocol handler and first window exist.
+let started = false;
+let monitoringStopped = false;
 let quitting = false;
 let polling = false;
+// The last good tray poll; the full snapshot is read again only when its revision changes.
+let lastPoll: CoordinatorPoll | null = null;
 let notificationTimer: ReturnType<typeof setInterval> | undefined;
 const presented = new Set<string>();
 const pendingReceipts = new Set<string>();
+// Pages and assets the window asked for, kept only for the smoke check.
+const requestedFiles = new Set<string>();
 const notifications = new Map<string, Notification>();
 const projectActionRunner = new ProjectActionRunner();
 const globalToolUpdateRunner = new GlobalToolUpdateRunner({
@@ -87,7 +129,7 @@ function captureWindowPreferences() {
     windowPreferences = decodeWindowPreferences({
       ...windowPreferences,
       bounds: window.getNormalBounds(),
-      maximized: window.isMaximized(),
+      maximized: maximizedToSave(window, windowPreferences.maximized),
     });
   } catch {
     /* Ignore transient/undersized geometry, including the narrow smoke viewport. */
@@ -137,6 +179,8 @@ function trustedLocation(value: string) {
 }
 
 async function showWindow(path = "/") {
+  // During startup the first window is about to appear; never load early or create a second one.
+  if (!started) return;
   if (!window || window.isDestroyed()) await createWindow();
   if (!window) return;
   if (path !== "/") await window.loadURL(`versionstead://app${path}`);
@@ -145,7 +189,7 @@ async function showWindow(path = "/") {
   window.focus();
 }
 
-async function createWindow() {
+async function createWindow(show = !smoke) {
   window = new BrowserWindow({
     ...initialWindowBounds(
       windowPreferences,
@@ -157,7 +201,7 @@ async function createWindow() {
     minHeight: 520,
     title: "Versionstead",
     icon: trayIcon(),
-    show: !smoke,
+    show,
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: false,
@@ -167,7 +211,7 @@ async function createWindow() {
       preload: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
     },
   });
-  if (windowPreferences.maximized) window.maximize();
+  restoreMaximized(window, windowPreferences.maximized, show);
   window.on("move", scheduleWindowPreferences);
   window.on("resize", scheduleWindowPreferences);
   window.on("maximize", scheduleWindowPreferences);
@@ -219,14 +263,45 @@ function trayIcon() {
       pixels[index + 3] = 255;
     }
   }
-  return nativeImage.createFromBitmap(pixels, { width: 32, height: 32 });
+  return nativeImage.createFromBitmap(pixels, {
+    width: 32,
+    height: 32,
+    // macOS shows the 32 px bitmap at 2x: the 16 pt menu-bar size.
+    scaleFactor: process.platform === "darwin" ? 2 : 1,
+  });
+}
+
+// A failed page load (for example one superseded by another navigation) never quits the tray UI.
+function reopenFailed() {
+  console.error("The Versionstead window could not finish loading.");
+  void showWindow().catch(() => console.error("The Versionstead window could not be shown."));
+}
+
+/** The tray's Start and Restart monitoring failure: a StartupError's own message, else the generic advice. */
+function showStartupFailure(verb: "start" | "restart") {
+  return (error: unknown) => {
+    dialog.showErrorBox(
+      "Versionstead",
+      error instanceof StartupError
+        ? error.message
+        : `Monitoring could not ${verb}. Check Node.js 24 and the background host status, then retry. Saved evidence is retained.`,
+    );
+  };
 }
 
 async function updateTray() {
-  const connected = await readyCoordinator();
-  if (connected) await projectActionRunner.reconcile(connected.snapshot.projects);
+  // Only a running project command needs the project actions, which take a snapshot read.
+  const reconcile = projectActionRunner.active;
+  const connected = await pollCoordinator(lastPoll, reconcile);
+  if (connected) {
+    lastPoll = connected;
+    if (reconcile && connected.projects) await projectActionRunner.reconcile(connected.projects);
+  } else
+    void recoverCoordinator(monitoringStopped)
+      .then((recovered) => recovered && updateTray())
+      .catch(() => console.error("Monitoring stopped unexpectedly and could not restart."));
   runtime = connected?.runtime ?? null;
-  const paused = connected?.snapshot.settings.paused ?? false;
+  const paused = connected?.settings.paused ?? false;
   tray?.setToolTip(
     `Versionstead — ${connected ? (paused ? "scans paused" : "monitoring") : "coordinator disconnected"}`,
   );
@@ -235,7 +310,7 @@ async function updateTray() {
       {
         label: "Open Versionstead",
         click: () => {
-          void showWindow().catch(fail);
+          void showWindow().catch(reopenFailed);
         },
       },
       {
@@ -257,23 +332,20 @@ async function updateTray() {
         label: "Start monitoring",
         enabled: !runtime,
         click: () => {
+          monitoringStopped = false;
           void ensureCoordinator()
             .then(() => updateTray())
-            .catch(fail);
+            .catch(showStartupFailure("start"));
         },
       },
       {
         label: "Restart monitoring",
         enabled: runtime?.host === "session" && runtime.mode === "interactive",
         click: () => {
+          monitoringStopped = false;
           void restartCoordinator()
             .then(() => updateTray())
-            .catch(() => {
-              dialog.showErrorBox(
-                "Versionstead",
-                "Monitoring could not restart. Check Node.js 24 and the background host status, then retry. Saved evidence is retained.",
-              );
-            });
+            .catch(showStartupFailure("restart"));
         },
       },
       {
@@ -320,12 +392,12 @@ async function stopMonitoring() {
     title: "Stop background monitoring?",
     message:
       "This stops the coordinator. Closing or quitting the interface normally keeps monitoring running.",
-    detail:
-      runtime.host === "boot-task"
-        ? "Windows startup registration stays installed; the task can start again at the next boot."
-        : "Use Start monitoring to resume.",
+    detail: stopMonitoringDetail(runtime.host),
   });
-  if (result.response === 1) await action("/api/shutdown", "POST");
+  if (result.response === 1) {
+    monitoringStopped = true;
+    await action("/api/shutdown", "POST");
+  }
 }
 
 async function pollNotifications() {
@@ -341,9 +413,13 @@ async function pollNotifications() {
       notificationRuntimePid = connected.runtime.pid;
     }
     for (const id of pendingReceipts) await acknowledgeSummary(connected.runtime, id);
-    if (!connected.snapshot.settings.notifyNewFindings) return;
-    const summary = connected.snapshot.notificationSummary;
-    if (!summary || presented.has(summary.id) || notifications.has(summary.id)) return;
+    if (!connected.settings.notifyNewFindings) return;
+    // Quiet hours hold the native notification until they end; the in-app summary is unaffected.
+    const summary = summaryToShow(
+      connected.notificationSummary,
+      (id) => presented.has(id) || notifications.has(id),
+    );
+    if (!summary) return;
     notifications.clear();
     const notification = new Notification({
       id: "versionstead-summary",
@@ -365,7 +441,7 @@ async function pollNotifications() {
     notification.once("failed", () => notifications.delete(summary.id));
     notification.once("close", () => notifications.delete(summary.id));
     notification.once("click", () => {
-      void showWindow(`/?filter=${summary.filter}`).catch(fail);
+      void showWindow(`/?filter=${summary.filter}`).catch(reopenFailed);
     });
     notification.show();
   } catch {
@@ -393,6 +469,20 @@ async function acknowledgeSummary(coordinator: CoordinatorRuntime, id: string) {
 async function runSmoke() {
   if (!window || !runtime || !tray || tray.isDestroyed())
     throw new Error("Desktop initialization incomplete");
+  const menuRoles = (Menu.getApplicationMenu()?.items ?? []).flatMap((item) => [
+    item.role?.toLowerCase(),
+    ...(item.submenu?.items ?? []).map((child) => child.role?.toLowerCase()),
+  ]);
+  if (
+    !["copy", "paste", "resetzoom", "zoomin", "zoomout", "close"].every((role) =>
+      menuRoles.includes(role),
+    ) ||
+    (process.env.VERSIONSTEAD_DEVTOOLS !== "1" &&
+      menuRoles.some((role) => ["reload", "forcereload", "toggledevtools"].includes(role ?? "")))
+  )
+    throw new Error(
+      "The application menu must keep editing, zoom and close, not reload or devtools",
+    );
   const result: unknown = await window.webContents
     .executeJavaScript(`new Promise((resolve, reject) => {
     const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Monitoring UI did not connect')); }, 20000);
@@ -405,11 +495,45 @@ async function runSmoke() {
     const observer = new MutationObserver(check);
     observer.observe(document.body, { subtree: true, attributes: true, childList: true }); check();
   })`);
+  // The cooldown is off so that the opt-in live Update now click never meets its release-age question.
   const rendererWrite: unknown = await window.webContents
     .executeJavaScript(`fetch('/api/settings', {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false })
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false, releaseCooldownDays: 0 })
   }).then(response => response.ok)`);
   if (rendererWrite !== true) throw new Error("Authenticated renderer mutation failed");
+  // Asked without writing, so the owner's clipboard is never touched: writes allowed, reads denied.
+  const clipboard: unknown = await window.webContents.executeJavaScript(
+    "Promise.all([navigator.permissions.query({ name: 'clipboard-write' }), navigator.permissions.query({ name: 'clipboard-read' })]).then(([write, read]) => write.state + ' ' + read.state)",
+  );
+  if (clipboard !== "granted denied")
+    throw new Error(`Copy buttons may write plain text only: ${String(clipboard)}`);
+  // The native protocol passes the renderer's revision tag through and the coordinator's 304 back.
+  const revalidated: unknown = await window.webContents.executeJavaScript(`(async () => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const fresh = await fetch('/api/monitoring');
+      const tag = fresh.headers.get('ETag');
+      if (fresh.status !== 200 || !tag) return 'GET answered ' + fresh.status;
+      const cached = await fetch('/api/monitoring', { headers: { 'If-None-Match': tag } });
+      if (cached.status === 304) return true;
+      if (cached.status !== 200) return 'the conditional GET answered ' + cached.status;
+      await new Promise(resolve => setTimeout(resolve, 200)); // The revision moved on; ask again.
+    }
+    return 'the revision kept changing';
+  })()`);
+  if (revalidated !== true)
+    throw new Error(
+      `A conditional request must return 304 through the protocol: ${String(revalidated)}`,
+    );
+  // Settings and paired-PC pages are fetched once the shell has rendered, before any visit to them.
+  // (Custom-scheme requests make no resource timing entries, so the protocol handler's log is read.)
+  const settingsDeadline = Date.now() + 10_000;
+  while (![...requestedFiles].some((path) => /^\/assets\/settings-[\w-]+\.js$/.test(path))) {
+    if (Date.now() > settingsDeadline)
+      throw new Error(
+        `The settings chunk must load once the shell has rendered: ${[...requestedFiles].join(", ")}`,
+      );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   const currentBuild: unknown = await window.webContents.executeJavaScript(
     "!document.body.textContent.includes('Monitoring is running an older build')",
   );
@@ -420,7 +544,7 @@ async function runSmoke() {
     await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
       const deadline = Date.now() + 15000;
       const check = () => {
-        const button = [...document.querySelectorAll('button')].find(button => (button.textContent?.includes(${JSON.stringify(label)}) || button.getAttribute('aria-label')===${JSON.stringify(label)}) && !button.disabled);
+        const button = [...document.querySelectorAll('button')].find(button => (button.textContent?.includes(${JSON.stringify(label)}) || button.getAttribute('aria-label')===${JSON.stringify(label)}) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
         if (button) { ${click ? "button.focus(); button.click();" : ""} resolve(true); }
         else if (Date.now() > deadline) reject(new Error('Native smoke action unavailable: ' + ${JSON.stringify(label)}));
         else setTimeout(check, 100);
@@ -428,6 +552,8 @@ async function runSmoke() {
     })`);
   };
   const initialPc = (await readyCoordinator())?.snapshot.inventory;
+  // Large tables render 200 rows at a time.
+  const firstPage = (count = 0) => Math.min(count, 200);
   const selectOption = async (label: string, option: string) => {
     if (!window) throw new Error("Smoke window unavailable");
     await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
@@ -444,6 +570,18 @@ async function runSmoke() {
       }; choose();
     })`);
   };
+  // Headings read as an outline: the page starts at h1 and no level is skipped, sheets included.
+  const expectOutline = async (where: string) => {
+    if (!window) throw new Error("Smoke window unavailable");
+    const problems = (await window.webContents.executeJavaScript(`(() => {
+      const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter(h => !h.closest('[data-slot="toast-viewport"]'));
+      const levels = headings.map(h => Number(h.tagName[1]));
+      return levels.flatMap((level, i) => i === 0
+        ? (level === 1 ? [] : ['the first heading is h' + level])
+        : (level > levels[i - 1] + 1 ? ['h' + levels[i - 1] + ' jumps to h' + level + ' at "' + headings[i].textContent.trim().slice(0, 40) + '"'] : []));
+    })()`)) as string[];
+    if (problems.length > 0) throw new Error(`Heading levels on ${where}: ${problems.join("; ")}`);
+  };
   await window.loadURL("versionstead://app/pc");
   await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
     const deadline = Date.now() + 15000;
@@ -453,6 +591,36 @@ async function runSmoke() {
       else setTimeout(check, 100);
     }; check();
   })`);
+  // Update all's IPC validates its input and reports no batch until one starts. A refusal counts
+  // only when the handler made it: a channel nobody handles must not pass for validation.
+  const updateAllBoundary: unknown = await window.webContents.executeJavaScript(
+    `(() => {
+      const refused = (request) => window.versionstead.updateAllGlobalTools(request)
+        .then(() => false, (error) => !String(error).includes('No handler registered'));
+      return Promise.all([
+        refused({ items: [] }),
+        refused({ items: [{ installationId: 'x', expectedVersion: '1.0.0', targetVersion: '2.0.0' }] }),
+        refused('not a request'),
+        window.versionstead.stopGlobalToolUpdates(),
+        window.versionstead.globalToolUpdateBatch(),
+      ]).then(([empty, malformed, wrongType, stopped, batch]) => empty && malformed && wrongType && stopped === null && batch === null);
+    })()`,
+  );
+  if (updateAllBoundary !== true)
+    throw new Error(
+      "Update all IPC must refuse malformed requests and report no batch before one starts",
+    );
+  // A page load is not a route change: it names the page but leaves focus where it is.
+  const loaded: unknown = await window.webContents.executeJavaScript(
+    "document.title==='This PC · Versionstead' && document.activeElement?.id!=='content'",
+  );
+  if (loaded !== true) throw new Error("A page load must set the title and leave focus alone");
+  // The scan status is in the page before any scan, so its first message is announced as a change.
+  const statusRegions: unknown = await window.webContents.executeJavaScript(
+    'document.querySelectorAll(\'[data-testid="scan-progress"] [role="status"]\').length',
+  );
+  if (statusRegions !== 1)
+    throw new Error("Scan progress must keep exactly one status region, even before a scan");
   if (initialPc?.evidence.lastAttempt === null) {
     const empty: unknown = await window.webContents.executeJavaScript(`(() => {
       return document.body.textContent.includes('Scan this PC to check your global tools') && !document.querySelector('tbody tr') && !document.body.textContent.includes('Not checked');
@@ -468,7 +636,9 @@ async function runSmoke() {
     if (
       defaults.filter !== "Updates available" ||
       defaults.rows !==
-        initialPc?.installations.filter((item) => item.updateStatus === "available").length
+        firstPage(
+          initialPc?.installations.filter((item) => item.updateStatus === "available").length,
+        )
     )
       throw new Error("This PC must default to confirmed update rows");
     await selectOption("Global tool update filter", "All global tools");
@@ -476,7 +646,7 @@ async function runSmoke() {
       [...document.querySelectorAll('tbody tr')].map(row => ({ available: row.cells[2].textContent.trim(), check: row.cells[4].textContent.trim() }))
     `);
     const observations = allRows as { available: string; check: string }[];
-    if (observations.length !== initialPc?.installations.length)
+    if (!initialPc || observations.length !== firstPage(initialPc.installations.length))
       throw new Error("All global tools filter must retain every installation");
     initialPc.installations.forEach((item, index) => {
       if (item.updateStatus === "unknown" && !item.availableVersion) {
@@ -496,7 +666,8 @@ async function runSmoke() {
     };
     if (
       managerView.managerCards !== initialPc.managers?.length ||
-      managerView.rows !== initialPc.installations.filter((item) => item.manager === "bun").length
+      managerView.rows !==
+        firstPage(initialPc.installations.filter((item) => item.manager === "bun").length)
     )
       throw new Error("Native manager status and Bun filter must reflect actual inventory");
     for (const manager of initialPc.managers ?? []) {
@@ -533,23 +704,42 @@ async function runSmoke() {
     (meter.value !== null && (!meter.max || Number(meter.value) > Number(meter.max)))
   )
     throw new Error("Scan progress must be labeled and use bounded real counts");
+  await expectOutline("This PC");
+  const updateAllStatus: unknown = await window.webContents.executeJavaScript(
+    'document.querySelectorAll(\'[data-testid="update-all-status"][role="status"]\').length',
+  );
+  if (updateAllStatus !== 1)
+    throw new Error("Update all must keep its status line in the page before any run");
+  const waitForPc = async (timeout = 30000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const connected = await readyCoordinator();
+      if (
+        connected &&
+        connected.snapshot.inventory.evidence.status !== "scanning" &&
+        !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
+      )
+        return connected;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("The PC scan did not finish");
+  };
+  const updateAllRows = async () => {
+    if (!window) throw new Error("Smoke window unavailable");
+    return (await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const check = () => {
+        const boxes = [...document.querySelectorAll('dialog[open] input[type="checkbox"]')];
+        if (boxes.length) resolve(boxes.map(box => ({ label: box.getAttribute('aria-label') ?? '', checked: box.checked })));
+        else if (Date.now() > deadline) reject(new Error('The Update all confirmation did not open'));
+        else setTimeout(check, 50);
+      }; check();
+    })`)) as { label: string; checked: boolean }[];
+  };
+  let nativeUpdateAll: "declined" | "no-updates" | "updated" = "no-updates";
   if (process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT) {
     // Only the smoke harness's two disposable roots may be updated by this test.
     const base = await realpath(process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT);
-    const waitForPc = async () => {
-      const deadline = Date.now() + 30000;
-      while (Date.now() < deadline) {
-        const connected = await readyCoordinator();
-        if (
-          connected &&
-          connected.snapshot.inventory.evidence.status !== "scanning" &&
-          !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
-        )
-          return connected;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      throw new Error("Fixture PC scan did not finish");
-    };
     await waitForPc();
     for (const manager of ["npm", "bun"] as const) {
       const connected = await readyCoordinator();
@@ -568,36 +758,105 @@ async function runSmoke() {
         throw new Error("Unexpected live update fixture version");
       }
       await window.loadURL("versionstead://app/pc");
-      await clickButton("Update now semver", false);
-      await selectOption("Global package manager", manager === "npm" ? "npm" : "Bun");
-      await clickButton("Update now semver");
-      const deadline = Date.now() + 30000;
-      let succeeded = false;
-      while (Date.now() < deadline) {
-        const run = globalToolUpdateRunner
-          .read()
-          .find((r) => r.rootId === item.rootId && r.name === item.name);
-        if (run?.status === "failed")
-          throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
-        if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
-          succeeded = true;
-          break;
+      if (manager === "npm") {
+        await clickButton("Update now semver", false);
+        await selectOption("Global package manager", "npm");
+        await clickButton("Update now semver");
+        const deadline = Date.now() + 30000;
+        let succeeded = false;
+        while (Date.now() < deadline) {
+          const run = globalToolUpdateRunner
+            .read()
+            .find((r) => r.rootId === item.rootId && r.name === item.name);
+          if (run?.status === "failed")
+            throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
+          if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
+            succeeded = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (!succeeded) throw new Error("Native Update now did not finish");
+      } else {
+        // Bun's fixture goes through Update all: it is the only update left in the disposable roots.
+        await clickButton("Update all (1)");
+        const rows = await updateAllRows();
+        if (rows.length !== 1 || !rows[0]!.checked || !rows[0]!.label.includes("semver"))
+          throw new Error("Update all must list exactly the disposable semver fixture, ticked");
+        await clickButton("Update 1 package");
+        const deadline = Date.now() + 60000;
+        let finished = false;
+        while (Date.now() < deadline) {
+          const batch = globalToolUpdateRunner.readBatch();
+          if (batch?.status === "finished") {
+            if (batch.items[0]?.status !== "succeeded")
+              throw new Error(
+                `Live bun Update all failed: ${batch.items[0]?.message ?? "no item"}`,
+              );
+            finished = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!finished) throw new Error("Native Update all did not finish");
+        nativeUpdateAll = "updated";
       }
-      if (!succeeded) throw new Error("Native Update now did not finish");
       const refreshed = await waitForPc();
       const updated = refreshed.snapshot.inventory.installations.find(
         (i) => i.name === "semver" && i.manager === manager,
       );
       if (updated?.version !== item.availableVersion || updated.updateStatus !== "current")
         throw new Error("The update did not refresh installed PC evidence");
+      const request = JSON.stringify({
+        installationId: item.id,
+        expectedVersion: item.version,
+        targetVersion: item.availableVersion,
+      });
       const staleRejected: unknown = await window.webContents.executeJavaScript(
-        `window.versionstead.updateGlobalTool(${JSON.stringify({ installationId: item.id, expectedVersion: item.version, targetVersion: item.availableVersion })}).then(() => false, () => true)`,
+        `Promise.all([window.versionstead.updateGlobalTool(${request}).then(() => false, () => true), window.versionstead.updateAllGlobalTools({ items: [${request}] }).then(() => false, () => true)]).then(([single, all]) => single && all)`,
       );
       if (staleRejected !== true) throw new Error("A stale native update request was accepted");
       console.log(
-        `Desktop smoke: native ${manager} Update now installed and verified ${item.availableVersion} in a disposable root`,
+        `Desktop smoke: native ${manager} ${manager === "npm" ? "Update now" : "Update all"} installed and verified ${item.availableVersion} in a disposable root`,
+      );
+    }
+  } else {
+    // The owner's real tools: open Update all and decline it. Nothing may start.
+    const pc = (await waitForPc(60_000)).snapshot.inventory;
+    const checkFailed = pc.evidence.status === "failed" || pc.updateEvidence?.status === "failed";
+    const eligible = checkFailed
+      ? []
+      : pc.installations.filter(
+          (i) =>
+            i.updateStatus === "available" &&
+            i.origin === "registry" &&
+            i.availableVersion !== null &&
+            i.rootId &&
+            i.packageId &&
+            i.manager,
+        );
+    if (eligible.length > 0) {
+      await window.loadURL("versionstead://app/pc");
+      await clickButton(`Update all (${eligible.length})`);
+      if ((await updateAllRows()).length !== eligible.length)
+        throw new Error("Update all must list every verified update");
+      window.webContents.focus();
+      window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+      const declined: unknown = await window.webContents.executeJavaScript(
+        "new Promise(resolve => setTimeout(() => resolve(!document.querySelector('dialog[open]')), 300))",
+      );
+      if (
+        declined !== true ||
+        globalToolUpdateRunner.readBatch() !== null ||
+        globalToolUpdateRunner.active
+      )
+        throw new Error("Declining Update all must close it without starting any update");
+      nativeUpdateAll = "declined";
+    } else {
+      // "no-updates" must not pass for a check that failed: say which it was.
+      console.log(
+        `Desktop smoke: Update all not exercised (${checkFailed ? "the PC scan or its update check failed" : "no verified update on this PC"})`,
       );
     }
   }
@@ -613,7 +872,47 @@ async function runSmoke() {
     }; check();
   })`);
   if (notificationFilter !== true) throw new Error("Summary click route must filter updates");
+  // Export opens over Needs attention with its scope and format choices; the smoke cancels its download before anything is saved.
+  await clickButton("Export");
+  const exportDialog: unknown = await window.webContents
+    .executeJavaScript(`new Promise((resolve, reject) => {
+    const deadline = Date.now() + 5000;
+    const check = () => {
+      const dialog = document.querySelector('dialog[open]');
+      if (dialog?.querySelector('[aria-label="Include"]') && dialog.querySelector('[aria-label="Format"]') && [...dialog.querySelectorAll('button')].some(button => button.textContent.includes('Save file'))) resolve(true);
+      else if (Date.now() > deadline) reject(new Error('The export dialog did not open'));
+      else setTimeout(check, 50);
+    }; check();
+  })`);
+  if (exportDialog !== true)
+    throw new Error("Export must offer scope, format, Copy, and Save file");
+  await expectOutline("Export");
+  const exportStatus: unknown = await window.webContents.executeJavaScript(
+    "document.querySelectorAll('dialog[open] [role=\"status\"]').length",
+  );
+  if (exportStatus !== 1) throw new Error("Export must keep a status line for its copy result");
+  // Save file hands the export to the browser's download; cancel it at will-download, so no file is written.
+  const download = new Promise<{ name: string; mime: string }>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Save file started no download")), 5000);
+    session.defaultSession.once("will-download", (event, item) => {
+      event.preventDefault();
+      clearTimeout(timer);
+      resolve({ name: item.getFilename(), mime: item.getMimeType() });
+    });
+  });
+  await clickButton("Save file");
+  const saved = await download;
+  if (
+    !/^versionstead-this-pc-and-projects-[0-9]{4}-[0-9]{2}-[0-9]{2}[.]md$/.test(saved.name) ||
+    saved.mime !== "text/markdown"
+  )
+    throw new Error(`Save file must offer a Markdown file: ${saved.name} ${saved.mime}`);
+  window.webContents.focus();
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
   await window.loadURL("versionstead://app/service");
+  await clickButton("Pause schedules", false);
+  await expectOutline("Background service");
   for (const [label, paused] of [
     ["Pause schedules", true],
     ["Resume schedules", false],
@@ -682,9 +981,13 @@ async function runSmoke() {
   await window.webContents.executeJavaScript(
     "document.querySelector('.local-project-form form').requestSubmit()",
   );
-  await waitSettings(
-    "[...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].some(item=>item.textContent.includes('Versionstead needs attention')) && document.querySelector('.local-project-form [role=\"alert\"]')",
+  await waitSettings("document.querySelector('.local-project-form [role=\"alert\"]')");
+  // A failed action is reported once: in the dialog that owns it, with no toast or banner repeating it.
+  const reportedOnce: unknown = await window.webContents.executeJavaScript(
+    "![...document.querySelectorAll('[data-slot=\"toast\"]:not([data-ending-style])')].some(item=>item.textContent.includes('Versionstead needs attention')) && !document.querySelector('.connection-banner')",
   );
+  if (reportedOnce !== true)
+    throw new Error("A failed Add project must be reported once, inside its own dialog");
   await window.webContents.executeJavaScript(
     `document.querySelector('.local-project-form > button').click()`,
   );
@@ -709,7 +1012,7 @@ async function runSmoke() {
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
   await waitSettings("document.querySelector('dialog[open] .project-source-picker')");
   await window.webContents.executeJavaScript(
-    `document.querySelector('[aria-label="Set up GitHub"]').click()`,
+    `document.querySelector('[aria-label="Setup required for GitHub"]').click()`,
   );
   await waitSettings(
     "document.querySelector('h1')?.textContent==='Source Control' && !document.querySelector('dialog[open]')",
@@ -763,6 +1066,8 @@ async function runSmoke() {
   const projects = (await readyCoordinator())?.snapshot.projects ?? [];
   let nativeGroupedProjects = false;
   let nativeEvidenceSheet = false;
+  let nativeUpgradeCommands = false;
+  let nativeVersionDrift = false;
   if (projects.length > 0) {
     await clickButton("All projects");
     const projectGroups: unknown = await window.webContents
@@ -771,6 +1076,18 @@ async function runSmoke() {
     }, 100))`);
     if (projectGroups !== projects.length)
       throw new Error("All projects must retain selected folders");
+    await expectOutline("Projects");
+    // A button's accessible name starts with the text it shows, as speech control needs.
+    const scanNames: unknown = await window.webContents.executeJavaScript(`(() => {
+      const buttons = [...document.querySelectorAll('[data-testid="project-group"] .target-group-actions button')];
+      return buttons.length > 0 && buttons.every(button => {
+        const name = (button.getAttribute('aria-label') ?? '').toLowerCase();
+        const shown = (button.textContent ?? '').trim().replace(/…$/, '').toLowerCase();
+        return shown !== '' && name.startsWith(shown) && name.length > shown.length;
+      });
+    })()`);
+    if (scanNames !== true)
+      throw new Error("A scan button's accessible name must start with its visible text");
     const initiallyClosed = await window.webContents.executeJavaScript(
       "[...document.querySelectorAll('[data-testid=\"project-disclosure\"]')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
     );
@@ -806,8 +1123,24 @@ async function runSmoke() {
         .executeJavaScript(`new Promise(resolve => setTimeout(() => {
         resolve(document.querySelector('[data-testid="project-group"]').querySelectorAll('tbody tr').length);
       }, 250))`);
-      if (rows !== firstProject.dependencies.length)
+      if (rows !== firstPage(firstProject.dependencies.length))
         throw new Error("All dependencies must expose retained dependency records");
+      const remaining = firstProject.dependencies.length - 200;
+      if (remaining > 0) {
+        const label = `Show ${firstPage(remaining)} more (${remaining} remaining)`;
+        const nextPage: unknown = await window.webContents
+          .executeJavaScript(`new Promise(resolve => {
+          const group = document.querySelector('[data-testid="project-group"]');
+          [...group.querySelectorAll('button')].find(button => button.textContent === ${JSON.stringify(label)})?.click();
+          setTimeout(() => {
+            const rows = group.querySelectorAll('tbody tr');
+            resolve({ rows: rows.length, focused: document.activeElement === rows[200]?.querySelector('button') });
+          }, 250);
+        })`);
+        const page = nextPage as { rows: number; focused: boolean };
+        if (page.rows !== Math.min(firstProject.dependencies.length, 400) || !page.focused)
+          throw new Error("Show more must reveal the next rows and focus the first revealed row");
+      }
       await window.webContents.executeJavaScript(`(() => {
         const trigger = document.querySelector('.project-detail .item-label');
         trigger.focus(); trigger.click();
@@ -815,9 +1148,10 @@ async function runSmoke() {
       const sheetFocus: unknown = await window.webContents
         .executeJavaScript(`new Promise(resolve => setTimeout(() => {
         const popup = document.querySelector('[data-slot="sheet-popup"][role="dialog"]');
-        resolve(Boolean(popup?.contains(document.activeElement)));
+        resolve(Boolean(popup?.querySelector('.dialog-body')?.contains(document.activeElement)));
       }, 250))`);
       if (sheetFocus !== true) throw new Error("Evidence Sheet must receive focus");
+      await expectOutline("the evidence sheet");
       window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Tab" });
       window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Tab" });
       const focusTrapped: unknown = await window.webContents.executeJavaScript(
@@ -833,6 +1167,28 @@ async function runSmoke() {
       if (sheetClosed !== true) throw new Error("Evidence Sheet Escape must restore package focus");
       nativeEvidenceSheet = true;
     }
+    if (firstProject?.dependencies.length) {
+      await clickButton("Upgrade commands");
+      await waitSettings(
+        "document.querySelector('dialog[open] [aria-label=\"Include major updates\"]')",
+      );
+      await expectOutline("Upgrade commands");
+      // A copy is reported in the dialog itself: a toast sits outside a modal dialog, unannounced.
+      await waitSettings("document.querySelector('dialog[open] [role=\"status\"]')");
+      window.webContents.focus();
+      window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+      await waitSettings("!document.querySelector('dialog[open]')");
+      nativeUpgradeCommands = true;
+    }
+    await clickButton("Version drift");
+    const driftView: unknown = await window.webContents.executeJavaScript(
+      "new Promise(resolve => setTimeout(() => resolve(Boolean(document.querySelector('[aria-label=\"Version drift\"]') || document.body.textContent.includes('No version drift in collected evidence'))), 250))",
+    );
+    if (driftView !== true)
+      throw new Error("Version drift must show its table or say there is none");
+    await expectOutline("Version drift");
+    nativeVersionDrift = true;
     nativeGroupedProjects = true;
   }
   window.close();
@@ -952,6 +1308,7 @@ async function runSmoke() {
     await waitSettings(
       `document.querySelector('h1')?.textContent === ${JSON.stringify(title)} && document.querySelector('.setting-group') && document.querySelector('[data-testid="connection-state"]')?.getAttribute('data-state')==='online'`,
     );
+    await expectOutline(`${title} settings`);
     if (path === "source-control") {
       await waitSettings(
         "document.querySelectorAll('.source-control-row').length===7 && document.querySelectorAll('.source-control-mark svg').length===7",
@@ -1221,6 +1578,7 @@ async function runSmoke() {
     await waitSettings(
       "document.querySelector('[aria-label=\"Project name\"]') && !document.querySelector('[aria-label=\"Project name\"]').disabled",
     );
+    await expectOutline("Project settings");
     await fillProjectField('[aria-label="Project name"]', "  Native project settings  ");
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Project name\"]').dispatchEvent(new FocusEvent('focusout',{bubbles:true}))",
@@ -1266,7 +1624,21 @@ async function runSmoke() {
     await clickButton("Add action");
     await waitSettings("document.querySelector('dialog[open] h2')?.textContent==='Add Action'");
     await fillProjectField('dialog[open] input[placeholder="Test"]', "Native action");
-    await fillProjectField("dialog[open] textarea", "Write-Output 'native-action-ok'");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Write-Output 'native-action-ok'" : "printf native-action-ok",
+    );
+    // The keybinding field never traps focus, and Tab is not recorded as a shortcut.
+    await window.webContents.executeJavaScript(
+      "document.querySelector('[aria-label=\"Action keybinding\"]').focus()",
+    );
+    window.focus();
+    window.webContents.focus();
+    window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Tab", modifiers: ["shift"] });
+    window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Tab", modifiers: ["shift"] });
+    await waitSettings(
+      "document.activeElement?.getAttribute('aria-label')!=='Action keybinding' && document.querySelector('[aria-label=\"Action keybinding\"]').value==='' && !document.querySelector('dialog [role=\"alert\"]')",
+    );
     await window.webContents.executeJavaScript(
       "document.querySelector('[aria-label=\"Action keybinding\"]').dispatchEvent(new KeyboardEvent('keydown',{key:'t',ctrlKey:true,altKey:true,bubbles:true}))",
     );
@@ -1302,7 +1674,10 @@ async function runSmoke() {
     await clickButton("Close dialog");
     await waitSettings("!document.querySelector('dialog[open]')");
     await clickButton("Edit Native action");
-    await fillProjectField("dialog[open] textarea", "Start-Sleep -Seconds 30");
+    await fillProjectField(
+      "dialog[open] textarea",
+      process.platform === "win32" ? "Start-Sleep -Seconds 30" : "sleep 30",
+    );
     await clickButton("Save changes");
     await waitSettings(
       "!document.querySelector('dialog[open]') && !document.querySelector('[aria-label=\"Run Native action\"]').disabled",
@@ -1384,10 +1759,10 @@ async function runSmoke() {
   );
   await window.webContents.executeJavaScript(`
     document.querySelector('[aria-label="Use Grove light mode"]').click();
-    document.querySelector('[aria-label="Use Chat dark mode"]').click();
+    document.querySelector('[aria-label="Use T3 Chat dark mode"]').click();
   `);
   await waitSettings(
-    `JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='grove' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='chat'`,
+    `JSON.parse(localStorage.getItem('versionstead.theme-halves')).light==='grove' && JSON.parse(localStorage.getItem('versionstead.theme-halves')).dark==='t3-chat'`,
   );
   await window.webContents.executeJavaScript(`(() => {
     for (const [label, value] of [['Contrast',150],['Glass opacity',50],['Panel animation duration',250]]) {
@@ -1481,14 +1856,32 @@ async function runSmoke() {
   }
   await window.loadURL("versionstead://app/settings/keybindings");
   await waitSettings(
-    "document.querySelector('[aria-label=\"Change shortcut for Open settings\"]')",
+    "document.querySelector('[aria-label^=\"Change shortcut for Open settings\"]')",
   );
   await window.webContents.executeJavaScript(
-    `document.querySelector('[aria-label="Change shortcut for Open settings"]').click()`,
+    `document.querySelector('[aria-label^="Change shortcut for Open settings"]').click()`,
   );
   await waitSettings("document.querySelector('dialog[open] input')");
   window.focus();
   window.webContents.focus();
+  // The capture field never traps focus: Shift+Tab leaves it and Escape closes the dialog.
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Tab", modifiers: ["shift"] });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Tab", modifiers: ["shift"] });
+  await waitSettings(
+    "document.activeElement?.getAttribute('aria-label')==='Close dialog' && !document.querySelector('dialog [role=\"alert\"]')",
+  );
+  await window.webContents.executeJavaScript(
+    "document.querySelector('dialog[open] input').focus()",
+  );
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+,'",
+  );
+  await window.webContents.executeJavaScript(
+    `document.querySelector('[aria-label^="Change shortcut for Open settings"]').click()`,
+  );
+  await waitSettings("document.querySelector('dialog[open] input')");
   window.webContents.sendInputEvent({
     type: "keyDown",
     keyCode: "S",
@@ -1515,7 +1908,19 @@ async function runSmoke() {
   await waitSettings(
     "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+alt+k'",
   );
+  // Resetting every shortcut asks first; declining keeps the custom binding.
   await clickButton("Reset all shortcuts");
+  await waitSettings("document.querySelector('dialog[open]')");
+  await clickButton("Cancel");
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+alt+k'",
+  );
+  await clickButton("Reset all shortcuts");
+  await waitSettings("document.querySelector('dialog[open]')");
+  await clickButton("Reset shortcuts");
+  await waitSettings(
+    "!document.querySelector('dialog[open]') && JSON.parse(localStorage.getItem('versionstead.keybindings')).settings==='mod+,'",
+  );
   await window.webContents.executeJavaScript("document.getElementById('content').focus()");
   window.webContents.sendInputEvent({
     type: "keyDown",
@@ -1539,6 +1944,23 @@ async function runSmoke() {
   );
   if ((await readyCoordinator())?.snapshot.settings.paused === scheduled)
     throw new Error("Native monitoring switch did not persist");
+  // Login items belong to the owner's account, so the smoke only reads this one and never toggles it.
+  const loginItem = await readLoginItem(loginContext());
+  // The switch reads Off and is disabled until the renderer's read of the OS state resolves, so a
+  // matching state alone would pass while it is still loading.
+  await waitSettings(
+    `(() => { const toggle = document.querySelector('[aria-label="Open Versionstead at login"]'); return toggle?.getAttribute('aria-checked') === ${JSON.stringify(String(loginItem.openAtLogin))} && toggle.getAttribute('aria-disabled') !== 'true'; })()`,
+  );
+  // The command dialog names the shell that runs commands; the renderer asks the desktop for it through IPC.
+  const commandShell: unknown = await window.webContents.executeJavaScript(
+    "window.versionstead.projectActionShell()",
+  );
+  if (
+    process.platform === "win32"
+      ? commandShell !== "Windows PowerShell"
+      : typeof commandShell !== "string" || !isAbsolute(commandShell)
+  )
+    throw new Error("The command shell must reach the renderer through the desktop bridge");
   await window.webContents.executeJavaScript(
     `document.querySelector('[aria-label="Scheduled scans"]').click();document.querySelector('[aria-label="Versionstead updates"]').click()`,
   );
@@ -1551,6 +1973,96 @@ async function runSmoke() {
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
   await waitSettings("!document.querySelector('[data-slot=\"sheet-popup\"]')");
+  // Cancel scan: a running PC scan offers it, and a cancelled attempt says so while This PC keeps the
+  // evidence it had. A scan that finishes or starts writing first is reported, not failed.
+  await window.loadURL("versionstead://app/pc");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  const evidenceBeforeCancel = JSON.stringify(
+    (await readyCoordinator())?.snapshot.inventory.evidence,
+  );
+  let nativeCancelScan: unknown = await window.webContents.executeJavaScript(`(async () => {
+    await fetch('/api/scans', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: 'pc' }) });
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const button = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === 'Cancel scan' && !item.disabled);
+      if (button) { button.click(); return 'clicked'; }
+      const progress = await (await fetch('/api/monitoring/progress')).json();
+      if (!progress.scanProgress.active && !progress.scanProgress.queued.length) return 'finished-first';
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return 'missing';
+  })()`);
+  if (nativeCancelScan === "missing") throw new Error("A running PC scan must offer Cancel scan");
+  for (const deadline = Date.now() + 30000; Date.now() < deadline;) {
+    const current = (await readyCoordinator())?.snapshot;
+    const attempt = current?.history.find((item) => item.kind === "pc");
+    if (attempt && attempt.status !== "scanning") {
+      if (attempt.cancelled === true) {
+        if (
+          attempt.errors[0] !== "Cancelled by you" ||
+          JSON.stringify(current?.inventory.evidence) !== evidenceBeforeCancel
+        )
+          throw new Error("A cancelled PC scan must say so and keep the previous evidence");
+        nativeCancelScan = "cancelled";
+      } else nativeCancelScan = "finished-first";
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (nativeCancelScan === "clicked") throw new Error("Cancel scan did not end the PC scan");
+  console.log(`Desktop smoke: Cancel scan ${String(nativeCancelScan)}`);
+  // The command palette: its shortcut opens a combobox over a listbox, Enter runs the active option,
+  // the shortcut does nothing over another dialog, and a project link opens that project.
+  const press = (keyCode: string, modifiers: ("control" | "meta")[] = []) => {
+    window?.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
+    if (keyCode === "Enter")
+      window?.webContents.sendInputEvent({ type: "char", keyCode, modifiers });
+    window?.webContents.sendInputEvent({ type: "keyUp", keyCode, modifiers });
+  };
+  const mod = process.platform === "darwin" ? "meta" : "control";
+  const activeOption =
+    "document.getElementById(document.activeElement?.getAttribute('aria-activedescendant'))";
+  await window.loadURL("versionstead://app/");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
+  press("K", [mod]);
+  await waitSettings(
+    `document.activeElement?.getAttribute('role')==='combobox' && ${activeOption}?.getAttribute('aria-selected')==='true'`,
+  );
+  await window.webContents.insertText("this pc");
+  await waitSettings(`${activeOption}?.textContent.startsWith('This PC')`);
+  press("Enter");
+  await waitSettings("location.pathname==='/pc' && !document.querySelector('dialog[open]')");
+  press("K", [mod]);
+  await waitSettings("document.querySelector('dialog.command-palette[open]')");
+  await window.webContents.insertText("add project");
+  await waitSettings(`${activeOption}?.textContent.startsWith('Add project')`);
+  press("Enter");
+  await waitSettings(
+    "document.querySelector('dialog[open] input[aria-label=\"Search project sources\"]')",
+  );
+  press("K", [mod]);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const paletteOverDialog: unknown = await window.webContents.executeJavaScript(
+    "document.querySelectorAll('dialog[open]').length===1 && !document.querySelector('dialog.command-palette')",
+  );
+  if (paletteOverDialog !== true)
+    throw new Error("The command palette must not open over another dialog");
+  press("Escape");
+  await waitSettings("!document.querySelector('dialog[open]')");
+  // Closing a dialog an action opened returns focus to where the palette was opened.
+  await waitSettings("document.activeElement?.id==='content'");
+  const linked = (await readyCoordinator())?.snapshot.projects[0];
+  if (linked) {
+    await window.loadURL(`versionstead://app/projects?project=${encodeURIComponent(linked.id)}`);
+    await waitSettings(
+      `location.search==='' && document.querySelector('[data-project-id=${JSON.stringify(linked.id)}] [data-testid="project-disclosure"]')?.getAttribute('aria-expanded')==='true'`,
+    );
+  }
   // Exercise the shared title bar/settings shell in the real sandboxed renderer.
   await window.loadURL("versionstead://app/pc");
   await waitSettings(
@@ -1559,8 +2071,9 @@ async function runSmoke() {
   await window.webContents.executeJavaScript(
     "document.querySelector('[aria-label=\"Settings\"]').click()",
   );
+  // A route change names the new page and moves focus to its content.
   await waitSettings(
-    "location.pathname==='/settings/general' && document.getElementById('settings-search')",
+    "location.pathname==='/settings/general' && document.getElementById('settings-search') && document.title==='General · Versionstead' && document.activeElement?.id==='content'",
   );
   if (process.platform === "win32" || process.platform === "linux") {
     const chrome = await window.webContents.executeJavaScript(`(() => {
@@ -1771,6 +2284,7 @@ async function runSmoke() {
     "[...document.querySelectorAll('.target-group-trigger')].every(trigger=>trigger.getAttribute('aria-expanded')==='false')",
   );
   if (!attentionClosed) throw new Error("Needs attention accordions must start closed");
+  await expectOutline("Needs attention");
   await window.loadURL("versionstead://app/settings/general");
   await waitSettings(
     "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
@@ -1809,6 +2323,8 @@ async function runSmoke() {
       nativeProjectSettings: true,
       nativeProjectActions: true,
       nativeKeybindings: true,
+      nativePalette: true,
+      nativeCancelScan,
       nativeUpdatePanel: true,
       nativeTitleBar: true,
       nativeSettingsSearch: true,
@@ -1818,6 +2334,11 @@ async function runSmoke() {
       nativeToasts: true,
       nativeClosedAccordions: true,
       nativeLogo: true,
+      nativeUpdateAll,
+      nativeClipboard: true,
+      nativeExport: true,
+      nativeUpgradeCommands,
+      nativeVersionDrift,
     }),
   );
   app.quit();
@@ -1825,24 +2346,25 @@ async function runSmoke() {
 
 function fail(error: unknown) {
   // Routine logs must not print private discovery tokens or selected filesystem paths.
-  console.error(
-    "Versionstead desktop initialization failed. Check Node.js 24, data-directory access, and background host status.",
-  );
+  const message = startupFailureMessage(error);
+  console.error(message);
+  // A launch from Explorer, Finder or the Dock has no visible console, so startup failures are shown.
   if (smoke)
     console.error(
       `Desktop smoke diagnostic: ${error instanceof Error ? error.message : "unknown error"}`,
     );
+  else if (!started) dialog.showErrorBox("Versionstead", message);
   app.exit(1);
 }
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    if (app.isReady()) void showWindow().catch(fail);
+  app.on("second-instance", (_event, argv) => {
+    if (!argv.includes("--hidden")) void showWindow().catch(reopenFailed);
   });
   app.on("activate", () => {
-    void showWindow().catch(fail);
+    void showWindow().catch(reopenFailed);
   });
   app.on("window-all-closed", () => {});
   app.on("before-quit", (event) => {
@@ -1870,14 +2392,22 @@ if (!app.requestSingleInstanceLock()) {
   void app
     .whenReady()
     .then(async () => {
+      Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenu()));
       windowPreferences = await loadWindowPreferences(app.getPath("userData"));
       nativeTheme.themeSource = windowPreferences.theme;
       nativeTheme.on("updated", syncWindowAppearance);
       if (smoke) console.log("Desktop smoke: native ready");
-      session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
-        callback(false),
+      // Copy buttons write plain text from the app's own pages; every other permission stays denied.
+      const clipboardWrite = (permission: string, origin: string) =>
+        permission === "clipboard-sanitized-write" && trustedLocation(origin);
+      session.defaultSession.setPermissionRequestHandler(
+        (_webContents, permission, callback, details) =>
+          callback(clipboardWrite(permission, details.requestingUrl)),
       );
-      session.defaultSession.setPermissionCheckHandler(() => false);
+      session.defaultSession.setPermissionCheckHandler(
+        (_webContents, permission, requestingOrigin) =>
+          clipboardWrite(permission, requestingOrigin),
+      );
       ipcMain.handle("versionstead:select-project-directory", async (event) => {
         if (
           !window ||
@@ -1913,41 +2443,49 @@ if (!app.requestSingleInstanceLock()) {
         syncWindowAppearance();
         await persistWindowPreferences();
       });
+      ipcMain.handle("versionstead:login-item", async (event) => {
+        assertActionSender(event);
+        return decodeLoginItemState(await readLoginItem(loginContext()));
+      });
+      ipcMain.handle("versionstead:login-item-set", async (event, input: unknown) => {
+        assertActionSender(event);
+        return decodeLoginItemState(
+          await changeLoginItem(loginContext(), decodeLoginItemChange(input)),
+        );
+      });
       for (const operation of ["start", "command"] as const)
         ipcMain.handle(
           `versionstead:global-tool-update-${operation}`,
           async (event, input: unknown) => {
             assertActionSender(event);
             const request = decodeGlobalToolUpdateRequest(input);
-            const connected = await readyCoordinator();
-            const inventory = connected?.snapshot.inventory;
-            const item = inventory?.installations.find(
-              (candidate) => candidate.id === request.installationId,
-            );
-            if (
-              !connected ||
-              !item ||
-              item.version !== request.expectedVersion ||
-              item.availableVersion !== request.targetVersion ||
-              item.updateStatus !== "available"
-            )
-              throw new Error("This update changed. Scan this PC and review the current version.");
-            if (
-              inventory?.evidence.status === "scanning" ||
-              connected.snapshot.scanProgress?.active?.kind === "pc" ||
-              connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
-            )
-              throw new Error("Wait for the PC scan to finish before updating.");
-            if (
-              inventory?.evidence.status === "failed" ||
-              inventory?.updateEvidence?.status === "failed"
-            )
-              throw new Error("Scan this PC successfully before updating a previous result.");
+            const item = currentUpdateItems((await readyCoordinator())?.snapshot ?? null, [
+              request,
+            ])[0]!;
             return operation === "command"
               ? (await globalToolUpdateDependencies.resolve(item)).command
               : decodeGlobalToolUpdateRun(globalToolUpdateRunner.start(item));
           },
         );
+      ipcMain.handle("versionstead:global-tool-update-all", async (event, input: unknown) => {
+        assertActionSender(event);
+        const { items } = decodeGlobalToolUpdateBatchRequest(input);
+        // Every package is checked against the current evidence before any of them starts.
+        return decodeGlobalToolUpdateBatch(
+          globalToolUpdateRunner.startAll(
+            currentUpdateItems((await readyCoordinator())?.snapshot ?? null, items),
+          ),
+        );
+      });
+      for (const operation of ["stop", "batch"] as const)
+        ipcMain.handle(`versionstead:global-tool-update-${operation}`, (event) => {
+          assertActionSender(event);
+          return decodeGlobalToolUpdateBatchStatus(
+            operation === "stop"
+              ? globalToolUpdateRunner.stopAll()
+              : globalToolUpdateRunner.readBatch(),
+          );
+        });
       ipcMain.handle("versionstead:global-tool-update-status", (event) => {
         assertActionSender(event);
         return decodeGlobalToolUpdateRuns(globalToolUpdateRunner.read());
@@ -1967,6 +2505,10 @@ if (!app.requestSingleInstanceLock()) {
         if (project.actions?.find((a) => a.id === actionId)?.command !== expectedCommand)
           throw new Error("This command changed. Refresh and review it before running.");
         return decodeActionRun(await projectActionRunner.start(project, actionId));
+      });
+      ipcMain.handle("versionstead:project-action-shell", async (event) => {
+        assertActionSender(event);
+        return decodeActionShell(await projectActionShell());
       });
       for (const operation of ["status", "stop"] as const)
         ipcMain.handle(`versionstead:project-action-${operation}`, async (event, id: unknown) => {
@@ -2001,6 +2543,19 @@ if (!app.requestSingleInstanceLock()) {
           )
         )
           return new Response("Forbidden", { status: 403 });
+        // Pages and assets are this app's own build, read with the coordinator's allowlist and headers,
+        // so a stopped coordinator never strands the window on an error page; only API calls go to it.
+        if (!api) {
+          if (smoke) requestedFiles.add(url.pathname);
+          const found = await readWebFile(webRoot, url.pathname).catch(() => null);
+          return new Response(found && request.method === "GET" ? found.content : null, {
+            status: found ? 200 : 404,
+            headers: {
+              ...responseHeaders,
+              ...(found ? { "Content-Type": found.contentType } : {}),
+            },
+          });
+        }
         if (!runtime) runtime = (await readyCoordinator())?.runtime ?? null;
         if (!runtime) return new Response("Coordinator disconnected", { status: 503 });
         const removingProject =
@@ -2014,38 +2569,44 @@ if (!app.requestSingleInstanceLock()) {
             : await request.arrayBuffer();
         if (body && body.byteLength > 64 * 1024)
           return new Response("Request too large", { status: 413 });
-        try {
-          const response = await net.fetch(`${runtime.origin}${url.pathname}${url.search}`, {
+        // Only the renderer's revision tag is forwarded; 304 and ETag pass back unchanged.
+        const ifNoneMatch = request.headers.get("If-None-Match");
+        const response = await forwardRequest(
+          (target, init) => net.fetch(target, init),
+          `${runtime.origin}${url.pathname}${url.search}`,
+          {
             method: request.method,
             headers: {
               Authorization: `Bearer ${runtime.token}`,
               ...(body ? { "Content-Type": "application/json" } : {}),
+              ...(ifNoneMatch ? { "If-None-Match": ifNoneMatch } : {}),
             },
             ...(body ? { body } : {}),
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (
-            response.ok &&
-            request.method === "PATCH" &&
-            /^\/api\/projects\/[a-zA-Z0-9-]{1,100}$/.test(url.pathname)
-          ) {
-            await updateTray();
-          }
-          return response;
-        } catch {
+          },
+          request.signal,
+        );
+        if (!response) {
           runtime = null;
           return new Response("Coordinator disconnected", { status: 503 });
         }
+        if (
+          response.ok &&
+          request.method === "PATCH" &&
+          /^\/api\/projects\/[a-zA-Z0-9-]{1,100}$/.test(url.pathname)
+        )
+          await updateTray();
+        return response;
       });
       tray = new Tray(trayIcon());
       tray.on("click", () => {
-        void showWindow().catch(fail);
+        void showWindow().catch(reopenFailed);
       });
       tray.on("double-click", () => {
-        void showWindow().catch(fail);
+        void showWindow().catch(reopenFailed);
       });
       await updateTray();
-      await createWindow();
+      await createWindow(!smoke && !startHidden);
+      started = true;
       if (smoke) console.log("Desktop smoke: renderer loaded");
       if (smoke) await runSmoke();
       else {

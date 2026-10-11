@@ -1,10 +1,25 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
-import { mkdtemp, mkdir, realpath, rm, readFile, writeFile, symlink } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  realpath,
+  rm,
+  readFile,
+  writeFile,
+  symlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { toolDirectories, toolExecutable } from "../dist/adapters/tool-paths.js";
-import { readGlobalInstallation } from "../dist/adapters/inventory.js";
+import semver from "semver";
+import { noAutoInstall, toolDirectories, toolExecutable } from "../dist/adapters/tool-paths.js";
+import {
+  discoverGlobalToolSources,
+  npmGlobalCommand,
+  readGlobalInstallation,
+} from "../dist/adapters/inventory.js";
 import {
   resolveGlobalToolUpdate,
   verifyGlobalToolUpdate,
@@ -99,26 +114,26 @@ test("Windows fallback paths preserve PATH priority and include known directorie
   assert(paths.every((p) => /^[a-z]:[\\/]/i.test(p)));
 });
 
-test(
-  "executable discovery finds a missing-PATH Bun in its configured Windows install",
-  { skip: process.platform !== "win32" },
-  async (t) => {
-    const f = await fixture(t);
-    await mkdir(join(f.base, "bin"));
-    await writeFile(join(f.base, "bin", "versionstead-fixture.exe"), "fixture");
-    const original = process.env.BUN_INSTALL;
-    process.env.BUN_INSTALL = f.base;
-    try {
-      assert.equal(
-        await toolExecutable("versionstead-fixture.exe"),
-        await realpath(join(f.base, "bin", "versionstead-fixture.exe")),
-      );
-    } finally {
-      if (original === undefined) delete process.env.BUN_INSTALL;
-      else process.env.BUN_INSTALL = original;
-    }
-  },
-);
+test("executable discovery finds a missing-PATH Bun in its configured install", async (t) => {
+  const f = await fixture(t);
+  const name = process.platform === "win32" ? "versionstead-fixture.exe" : "versionstead-fixture";
+  const file = join(f.base, "bin", name);
+  await mkdir(join(f.base, "bin"));
+  await writeFile(file, "fixture");
+  await chmod(file, 0o755);
+  const original = process.env.BUN_INSTALL;
+  process.env.BUN_INSTALL = f.base;
+  try {
+    // POSIX keeps the name a shim was found by; Windows keeps its canonical file.
+    assert.equal(
+      await toolExecutable(name),
+      process.platform === "win32" ? await realpath(file) : file,
+    );
+  } finally {
+    if (original === undefined) delete process.env.BUN_INSTALL;
+    else process.env.BUN_INSTALL = original;
+  }
+});
 
 test("npm update targets the observed global prefix and exact canonical/alias version", async (t) => {
   const f = await fixture(t, "npm", "alias-tool", "@scope/tool");
@@ -141,6 +156,8 @@ test("npm update targets the observed global prefix and exact canonical/alias ve
     }),
   });
   assert(approved.args.includes("--allow-scripts=@scope/tool"));
+  for (const [key, value] of Object.entries(noAutoInstall)) assert.equal(plan.env[key], value, key);
+  assert.equal(plan.env.BUN_OPTIONS, "", "Discovery's environment: no injected Bun options");
 });
 
 test("Bun update pins the global directory and preserves aliases in executable and copied command", async (t) => {
@@ -159,6 +176,8 @@ test("Bun update pins the global directory and preserves aliases in executable a
   assert(plan.command.includes(dirname(f.root)));
   await writeFile(f.manifest, JSON.stringify({ name: "@scope/tool", version: "2.0.0" }));
   await verifyGlobalToolUpdate(plan, f.item);
+  for (const [key, value] of Object.entries(noAutoInstall)) assert.equal(plan.env[key], value, key);
+  assert.equal(plan.env.BUN_OPTIONS, "", "Discovery's environment: no injected Bun options");
 });
 
 test("Bun refuses a missing exact global manifest or declaration before resolving an installer", async (t) => {
@@ -292,3 +311,75 @@ test("manual update subprocesses have sanitized failures, cancellation, output a
   setTimeout(() => controller.abort(), 100);
   await assert.rejects(running, /stopped/);
 });
+
+test(
+  "live: a disposable npm prefix updates semver@7.0.0 to the current release, and a read-only one reports it is not writable",
+  {
+    skip: process.platform === "win32" || process.env.VERSIONSTEAD_LIVE_GLOBAL_UPDATE !== "1",
+    timeout: 300_000,
+  },
+  async (t) => {
+    assert.notEqual(
+      process.getuid(),
+      0,
+      "Run as a non-root user: root can write a read-only prefix",
+    );
+    const npm = await npmGlobalCommand();
+    assert.ok(npm, "npm must be installed for the live check");
+    const base = await realpath(await mkdtemp(join(tmpdir(), "versionstead-live-update-")));
+    const previous = process.env.npm_config_prefix;
+    t.after(async () => {
+      if (previous === undefined) delete process.env.npm_config_prefix;
+      else process.env.npm_config_prefix = previous;
+      for (const directory of ["lib/node_modules/semver", "lib/node_modules"])
+        await chmod(join(base, "locked", directory), 0o755).catch(() => {});
+      await rm(base, { recursive: true, force: true });
+    });
+    const install = (prefix) =>
+      execFileSync(
+        npm.executable,
+        [
+          npm.cli,
+          "install",
+          "--global",
+          "--prefix",
+          prefix,
+          "--no-audit",
+          "--no-fund",
+          "semver@7.0.0",
+        ],
+        { stdio: "ignore", timeout: 120_000 },
+      );
+    const latest = JSON.parse(
+      await (await fetch("https://registry.npmjs.org/semver/latest")).text(),
+    ).version;
+    assert(semver.gt(latest, "7.0.0"));
+    const update = async (prefix) => {
+      process.env.npm_config_prefix = prefix;
+      const source = (await discoverGlobalToolSources()).find((s) => s.manager === "npm");
+      assert.equal(source.root, await realpath(join(prefix, "lib", "node_modules")));
+      const item = {
+        ...(await readGlobalInstallation(source, "semver", null)),
+        availableVersion: latest,
+        updateStatus: "available",
+      };
+      assert.equal(item.version, "7.0.0");
+      const plan = await resolveGlobalToolUpdate(item);
+      await executeGlobalToolUpdate(plan, new AbortController().signal);
+      await verifyGlobalToolUpdate(plan, item);
+    };
+    install(join(base, "writable"));
+    await update(join(base, "writable"));
+    const installed = JSON.parse(
+      await readFile(
+        join(base, "writable", "lib", "node_modules", "semver", "package.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(installed.version, latest);
+    install(join(base, "locked"));
+    await chmod(join(base, "locked", "lib", "node_modules", "semver"), 0o555);
+    await chmod(join(base, "locked", "lib", "node_modules"), 0o555);
+    await assert.rejects(update(join(base, "locked")), /The global location is not writable/);
+  },
+);

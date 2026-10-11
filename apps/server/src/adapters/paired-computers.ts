@@ -1,14 +1,14 @@
-import { execFile } from "node:child_process";
-import { randomBytes, X509Certificate } from "node:crypto";
+import { X509Certificate } from "node:crypto";
 import { createServer, request as httpsRequest, Agent } from "node:https";
 import { connect } from "node:tls";
 import { networkInterfaces } from "node:os";
-import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import type { MonitoringSnapshot } from "@versionstead/contracts/monitoring";
+import type { ActiveScan, Finding, MonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { decodeMonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { normalizePeerOrigin, privatePeerAddress } from "@versionstead/contracts/application";
 import { InputError, object } from "./projects.ts";
+
+export { createPeerCertificate } from "./certificate.ts";
 
 export const privateAddress = privatePeerAddress;
 
@@ -32,60 +32,131 @@ export function peerOrigin(value: string) {
   }
 }
 
-export type PeerCertificate = { pfx: string; password: string; fingerprint: string };
-export async function createPeerCertificate(): Promise<PeerCertificate> {
-  if (process.platform !== "win32")
-    throw new InputError("Creating the paired-PC HTTPS host currently requires Windows.");
-  const password = randomBytes(32).toString("base64url");
-  const script = `$ErrorActionPreference = 'Stop'
-$password = [Console]::In.ReadToEnd()
-$rsa = [Security.Cryptography.RSACng]::new(2048)
-$request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Versionstead paired device', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
-$request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false, $false, 0, $true))
-$certificate = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5), [DateTimeOffset]::UtcNow.AddYears(1))
-$pfx = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pfx, $password))
-$der = [Convert]::ToBase64String($certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-[Console]::Out.Write((@{pfx=$pfx; der=$der} | ConvertTo-Json -Compress))
-$certificate.Dispose()
-$rsa.Dispose()`;
-  const text = await new Promise<string>((resolve, reject) => {
-    const child = execFile(
-      join(
-        process.env.SystemRoot ?? "C:\\Windows",
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-        "powershell.exe",
-      ),
-      [
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-EncodedCommand",
-        Buffer.from(script, "utf16le").toString("base64"),
-      ],
-      { timeout: 10000, maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
-      (error, stdout) =>
-        error
-          ? reject(new InputError("The PC's HTTPS certificate could not be created."))
-          : resolve(stdout),
-    );
-    child.stdin?.end(password);
-  });
-  const data = object(JSON.parse(text));
-  if (typeof data.pfx !== "string" || typeof data.der !== "string")
-    throw new InputError("Invalid HTTPS certificate output.");
-  const certificate = new X509Certificate(Buffer.from(data.der, "base64"));
-  return {
-    pfx: data.pfx,
-    password,
-    fingerprint: certificate.fingerprint256.replaceAll(":", "").toLowerCase(),
-  };
+/** A Node-generated P-256 PEM pair, or the password-protected PFX that earlier Windows builds created. */
+export type PeerCertificate =
+  | { key: string; cert: string; fingerprint: string }
+  | { pfx: string; password: string; fingerprint: string };
+
+/** Validates a stored certificate record before it reaches the TLS listener. */
+export function peerCertificate(value: unknown): PeerCertificate {
+  const data: Record<string, unknown> =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  if (typeof data.fingerprint === "string" && /^[a-f0-9]{64}$/.test(data.fingerprint)) {
+    if (typeof data.key === "string" && typeof data.cert === "string")
+      return { key: data.key, cert: data.cert, fingerprint: data.fingerprint };
+    if (typeof data.pfx === "string" && typeof data.password === "string")
+      return { pfx: data.pfx, password: data.password, fingerprint: data.fingerprint };
+  }
+  throw new InputError("The saved HTTPS certificate of this PC is invalid.");
 }
 
-export function sharedEvidence(snapshot: MonitoringSnapshot): MonitoringSnapshot {
+/**
+ * True once a PEM certificate's validity has ended, which paired PCs refuse; a certificate that cannot
+ * be parsed throws.
+ *
+ * ponytail: a legacy PFX certificate cannot be dated here without a PKCS#12 reader, so it is never
+ * reported expired; read its expiry too if hosts from earlier Windows builds are seen to expire.
+ */
+export function peerCertificateExpired(certificate: PeerCertificate) {
+  return (
+    "cert" in certificate &&
+    new X509Certificate(certificate.cert).validToDate.getTime() <= Date.now()
+  );
+}
+
+// The header a paired client declares its feature marker in; clients older than Wave 4 send none.
+const featuresHeader = "x-versionstead-features";
+
+/** A finding as clients older than Wave 4 read it: their original fields only. */
+const legacyFinding = ({
+  id,
+  kind,
+  subjectId,
+  subjectLabel,
+  name,
+  packageName,
+  installedVersion,
+  availableVersion,
+  severity,
+  source,
+  description,
+  advisoryUrl,
+  detectedAt,
+  lastSeenAt,
+}: Finding): Finding => ({
+  id,
+  kind,
+  subjectId,
+  subjectLabel,
+  name,
+  packageName,
+  installedVersion,
+  availableVersion,
+  severity,
+  source,
+  description,
+  advisoryUrl,
+  detectedAt,
+  lastSeenAt,
+});
+
+// The scan steps a client older than Wave 4 knows. It refuses any other, so a step added since reads
+// to it as no active step: a new step must not reach it until a marker says that it can.
+const olderScanSteps: ReadonlySet<ActiveScan["stage"]> = new Set([
+  "inventory",
+  "pc-updates",
+  "project-inputs",
+  "advisories",
+  "advisory-details",
+  "native-versions",
+  "versions",
+  "saving",
+]);
+
+/**
+ * Evidence a paired client may read: local paths, commands, notification payloads, and the feature
+ * marker never leave this PC. A client that declares no marker of v10 or later predates Wave 4 and
+ * also gets only what its strict contract can read: update, advisory, and coverage findings with
+ * their original fields, and live progress in which a scan step it does not know reads as no active
+ * step. Everything else stays, including the rest of `scanProgress`.
+ *
+ * ponytail: one cut, at v10; when a later marker adds what v10 clients cannot decode (a new scan
+ * step, say), cut there too.
+ */
+export function sharedEvidence(
+  snapshot: MonitoringSnapshot,
+  clientFeatures?: string,
+): MonitoringSnapshot {
+  // No receiving PC reads the feature marker, and a PC on an older build refuses a marker it does
+  // not know, so the marker is never shared. Nor are the snooze and ignore rules: they hold the
+  // owner's own reasons, and a receiving PC needs only each finding's `ruleId`. Nor is the resolved
+  // history, which no receiving PC reads, the count of events waiting to notify, or the owner's
+  // quiet hours and digest time, which say when they want silence.
+  const {
+    features: _marker,
+    findingRules: _rules,
+    resolvedFindings: _resolved,
+    notificationsWaiting: _waiting,
+    ...evidence
+  } = snapshot;
+  const { quietHours: _quiet, digestAt: _digest, ...settings } = snapshot.settings;
+  // The declared value is request input: only an exact marker counts, anything else reads as none.
+  const declared = /^settings-repositories-connections-v([1-9]\d{0,3})$/.exec(clientFeatures ?? "");
+  const readsWave4 = declared !== null && Number(declared[1]) >= 10;
+  const progress = snapshot.scanProgress;
   return decodeMonitoringSnapshot({
-    ...snapshot,
+    ...evidence,
+    settings,
+    ...(readsWave4
+      ? {}
+      : {
+          findings: snapshot.findings
+            .filter(({ kind }) => kind === "update" || kind === "advisory" || kind === "coverage")
+            .map(legacyFinding),
+          ...(progress?.active && !olderScanSteps.has(progress.active.stage)
+            ? { scanProgress: { ...progress, active: null } }
+            : {}),
+        }),
     inventory: {
       ...snapshot.inventory,
       managers: (snapshot.inventory.managers ?? []).map((m) => ({ ...m, root: null })),
@@ -149,8 +220,12 @@ export async function startPeerServer(options: {
   const lastScan = new Map<string, number>();
   const server = createServer(
     {
-      pfx: Buffer.from(options.certificate.pfx, "base64"),
-      passphrase: options.certificate.password,
+      ...("pfx" in options.certificate
+        ? {
+            pfx: Buffer.from(options.certificate.pfx, "base64"),
+            passphrase: options.certificate.password,
+          }
+        : { key: options.certificate.key, cert: options.certificate.cert }),
       minVersion: "TLSv1.2",
       maxHeaderSize: 8192,
     },
@@ -195,7 +270,14 @@ export async function startPeerServer(options: {
           const nonce = request.headers["x-versionstead-nonce"];
           if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(nonce))
             throw new InputError("Invalid evidence nonce.");
-          reply({ nonce, snapshot: sharedEvidence(options.snapshot()) });
+          const declared = request.headers[featuresHeader];
+          reply({
+            nonce,
+            snapshot: sharedEvidence(
+              options.snapshot(),
+              typeof declared === "string" ? declared : undefined,
+            ),
+          });
           return;
         }
         if (request.url === "/scan" && request.method === "POST") {
@@ -254,6 +336,8 @@ export async function peerRequest(
     token?: string;
     body?: unknown;
     nonce?: string;
+    /** The client's feature marker; the host shapes its evidence by it. */
+    features?: string;
     signal?: AbortSignal;
     tunnelPort?: number;
   } = {},
@@ -320,6 +404,7 @@ export async function peerRequest(
             "Content-Type": "application/json",
             ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
             ...(options.nonce ? { "X-Versionstead-Nonce": options.nonce } : {}),
+            ...(options.features ? { [featuresHeader]: options.features } : {}),
           },
         },
         (response) => {
@@ -335,7 +420,14 @@ export async function peerRequest(
           response.on("error", reject);
           response.on("end", () => {
             if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-              reject(new InputError("The paired PC rejected access or is unavailable."));
+              reject(
+                new InputError(
+                  // The listener's per-client scan cooldown; the PC itself is reachable and paired.
+                  response.statusCode === 429
+                    ? "This PC was asked to scan recently. Try again in a minute."
+                    : "The paired PC rejected access or is unavailable.",
+                ),
+              );
               return;
             }
             try {
