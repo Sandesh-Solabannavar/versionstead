@@ -161,10 +161,13 @@ export function readCustomThemes(value: unknown): ThemeDefinition[] {
   }
   return result;
 }
+// Built-in theme IDs that were renamed, so a saved choice keeps its palette.
+const renamedThemes = new Map([["t3-chat", "orchid"]]);
 export function readThemeHalves(value: unknown, themes: readonly ThemeDefinition[]): ThemeHalves {
   const v = record(value) ? value : {};
+  const find = (id: unknown) => themes.find((theme) => theme.id === id);
   const resolve = (mode: ThemeMode) =>
-    themes.find((theme) => theme.id === v[mode])?.id ?? "default";
+    (find(v[mode]) ?? find(renamedThemes.get(String(v[mode]))))?.id ?? "default";
   return { light: resolve("light"), dark: resolve("dark") };
 }
 export function resolvePalette(

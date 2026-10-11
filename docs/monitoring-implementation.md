@@ -4,7 +4,7 @@ This accepted plan develops [roadmap milestone 1](roadmap.md) using the boundari
 
 The firm requirement is **monitoring continues after the window closes and after Windows sign-out, and starts at Windows boot**. An Electron tray process or a login item alone cannot meet it. The PC must still be awake and powered on.
 
-## Ownership and the T3 Code reference
+## Ownership and process boundaries
 
 Move the existing coordinator into one independent headless process. Windows owns its lifetime; Electron and the browser attach to it. Keep scanning, scheduling, SQLite, and notification decisions in `apps/server`; keep rendering in `apps/web`, desktop integrations in `apps/desktop`, and boundary schemas in `packages/contracts`. Use one local collector inside the coordinator initially.
 
@@ -20,18 +20,16 @@ flowchart LR
 
 UI close/sign-out disconnects the client and notifier; it does not stop the coordinator. Explicitly stopping background monitoring stops it. Findings detected while signed out remain pending for the notifier after the owner returns.
 
-These patterns were checked against `D:\production_code\t3code`, revision `54084ae1e6c3`:
+Adopt these patterns:
 
-| Adopt                                                                                  | Observed source                                                                                                                                                             |
-| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Separate execution owner and client; thin transports invoke focused services.          | [T3 architecture](../../t3code/docs/internals/overview.md), [Effect service boundaries](../../t3code/docs/internals/effect-services.md)                                     |
-| A real readiness check, owned-process cleanup, and bounded restart backoff.            | [Desktop backend manager](../../t3code/apps/desktop/src/backend/DesktopBackendManager.ts), especially `runBackendProcess` at line 440 and `makeBackendInstance` at line 635 |
-| Server-owned SQLite with migrations, foreign keys, WAL, and bounded busy waits.        | [SQLite layer](../../t3code/apps/server/src/persistence/Layers/Sqlite.ts), `setup` at line 14                                                                               |
-| Changed findings have stable identities; presentation links back to the affected item. | [Update notification identity](../../t3code/apps/web/src/components/ProviderUpdateLaunchNotification.logic.ts), `localEnvironmentUpdateNotificationKey` at line 763         |
+- Separate execution owner and client; thin transports invoke focused services.
+- A real readiness check, owned-process cleanup, and bounded restart backoff.
+- Server-owned SQLite with migrations, foreign keys, WAL, and bounded busy waits.
+- Changed findings have stable identities; presentation links back to the affected item.
 
-T3 does not supply the Windows host needed here: [its service dispatcher](../../t3code/apps/server/src/cloud/bootService.ts), `selectBootServiceManager` at line 385, supports Linux and macOS only. Its [desktop lifecycle](../../t3code/apps/desktop/src/app/DesktopLifecycle.ts) quits after the last Windows window closes, and [desktop finalization](../../t3code/apps/desktop/src/app/DesktopApp.ts) stops its owned backends. Reuse the boundaries, not that ownership rule. Event sourcing, remote enrollment, and T3's staged runtime updater are unnecessary for this increment.
+A desktop-owned backend cannot supply the Windows host needed here: a Linux/macOS-only service dispatcher, a desktop lifecycle that quits after the last Windows window closes, or a finalizer that stops owned backends would all end monitoring. Reuse the boundaries, not that ownership rule. Event sourcing, remote enrollment, and a staged runtime updater are unnecessary for this increment.
 
-The current interface adapts T3's source-owned shadcn/Base UI [buttons](../../t3code/apps/web/src/components/ui/button.tsx), [badges](../../t3code/apps/web/src/components/ui/badge.tsx), [collapsibles](../../t3code/apps/web/src/components/ui/collapsible.tsx), [sheets](../../t3code/apps/web/src/components/ui/sheet.tsx), and [tables](../../t3code/apps/web/src/components/ui/table.tsx), retaining their MIT notice. The approved layout uses a 205 px sidebar, a 44 px brand bar, T3's [52 px page header and native font](../../t3code/apps/web/src/index.css), and Versionstead's green accent. [T3's connection rules](../../t3code/docs/internals/connection-runtime.md) also inform the disconnected scenario: connection health and evidence freshness are separate, and previous evidence stays readable.
+The current interface uses source-owned shadcn/Base UI buttons, badges, collapsibles, sheets, and tables; their MIT notices are in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md). The approved layout uses a 205 px sidebar, a 44 px brand bar, a 52 px page header with the native system font, and Versionstead's green accent. In the disconnected scenario, connection health and evidence freshness are separate, and previous evidence stays readable.
 
 ## Resolve Windows hosting before registering anything
 
@@ -85,4 +83,4 @@ Prototype verification on October 2, 2026 covered all 12 example screen/scenario
 
 ## Settings and selected remote sources
 
-General, Appearance, Keybindings, Source Control, and Connections are implemented as routed T3-inspired settings. GitHub/GitLab selected repositories reuse the existing scanner at immutable commits and credentials protected by Windows DPAPI, the macOS login keychain, or the Linux Secret Service; connection alone never scans an account. Paired PCs use a separate pinned HTTPS evidence listener with one-time invitations and revocation, leaving administrative HTTP on loopback. Shared evidence keeps timestamps/coverage while omitting local paths, unsupported credential-bearing dependency requests, notification payloads, snooze and ignore rules with their reasons, the resolved-findings history, and the owner's quiet hours and digest time. Node-generated certificate and two isolated coordinator integration checks pass; physical LAN/Tailscale/firewall/sign-out acceptance and central peer notifications remain open. [Setup and limits](settings-and-connections.md) describe the shipped scope.
+General, Appearance, Keybindings, Source Control, and Connections are implemented as routed settings. GitHub/GitLab selected repositories reuse the existing scanner at immutable commits and credentials protected by Windows DPAPI, the macOS login keychain, or the Linux Secret Service; connection alone never scans an account. Paired PCs use a separate pinned HTTPS evidence listener with one-time invitations and revocation, leaving administrative HTTP on loopback. Shared evidence keeps timestamps/coverage while omitting local paths, unsupported credential-bearing dependency requests, notification payloads, snooze and ignore rules with their reasons, the resolved-findings history, and the owner's quiet hours and digest time. Node-generated certificate and two isolated coordinator integration checks pass; physical LAN/Tailscale/firewall/sign-out acceptance and central peer notifications remain open. [Setup and limits](settings-and-connections.md) describe the shipped scope.

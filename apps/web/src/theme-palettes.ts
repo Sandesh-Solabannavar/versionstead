@@ -1,4 +1,4 @@
-// Palette values copied from packages/shared/src/themePalettes.ts.
+// Palette values adapted from third-party code; see THIRD_PARTY_NOTICES.md.
 export const colorRoles = [
   "canvas",
   "sidebar",
@@ -40,7 +40,7 @@ export type ThemeDefinition = {
 export const builtInThemes: readonly ThemeDefinition[] = [
   {
     id: "default",
-    label: "T3 Code",
+    label: "Default",
     light: {
       canvas: "#fcfcfc",
       sidebar: "#fafafa",
@@ -99,8 +99,8 @@ export const builtInThemes: readonly ThemeDefinition[] = [
     },
   },
   {
-    id: "t3-chat",
-    label: "T3 Chat",
+    id: "orchid",
+    label: "Orchid",
     light: {
       canvas: "oklch(0.982446 0.010114 325.653)",
       sidebar: "oklch(0.928886 0.031178 322.592)",

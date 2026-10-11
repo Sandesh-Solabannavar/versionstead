@@ -1,4 +1,4 @@
-// Adapted from shadcn/ui's Base UI Toast. See public/THIRD_PARTY_NOTICES.txt.
+// Adapted from shadcn/ui's Base UI Toast. See THIRD_PARTY_NOTICES.md.
 import * as React from "react";
 import { Toast as ToastPrimitive } from "@base-ui/react/toast";
 import { cn } from "cn";

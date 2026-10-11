@@ -1,6 +1,6 @@
 # Project settings
 
-Settings → Project follows T3 Code's project selector, environment scope, grouped Name/icon rows, Actions editor, and confirmed removal. The New threads section is omitted. Project settings links in Projects open the matching entry; its Actions menu opens a command panel.
+Settings → Project has a project selector, environment scope, grouped Name/icon rows, Actions editor, and confirmed removal. Project settings links in Projects open the matching entry; its Actions menu opens a command panel.
 
 ## Identity and scope
 
@@ -26,6 +26,6 @@ Remove project opens a confirmation describing the selected entries. Confirm rem
 
 ## Reference and validation
 
-The implementation adapts the behavior of T3 Code's `ProjectSettingsPanel.tsx`, `ProjectActionsSettings.tsx`, `useProjectScriptSettings.ts`, `ProjectIconPickerDialog.tsx`, `projectScriptEditor.tsx`, `ProjectScriptsControl.tsx`, and project identity/color helpers from the local reference clone. Thread, worktree, bootstrap, and agent-preview controls have no corresponding Versionstead workflow and are omitted. The current paired-PC permission model does not grant remote project administration.
+Third-party sources for this behavior are listed in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md). Thread, worktree, bootstrap, and agent-preview controls have no Versionstead workflow. The current paired-PC permission model does not grant remote project administration.
 
 Regression checks cover metadata persistence/identity, read-only scans, invalid inputs, authenticated partial updates, command privacy, grouping and shortcut conflicts, and actual Windows and POSIX execution/exit/stop/deadline/output bounds (POSIX in a Linux container, and on the `macos-latest` CI job, which passed at commit e4e3a53 and has no result yet for later commits). Electron smoke exercises name/icon changes, file normalization, action creation/edit/deletion, keyboard opening, real IPC execution/output/reopen/Stop, removal cancellation, and narrow-window containment in isolated monitoring state. See [development verification](development.md).
