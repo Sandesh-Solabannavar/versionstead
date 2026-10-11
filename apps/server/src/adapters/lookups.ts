@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { stripVTControlCharacters } from "node:util";
 import semver from "semver";
 import type { Dependency, Project } from "@versionstead/contracts/monitoring";
 import type { NativeVersions } from "./outdated.ts";
@@ -18,6 +19,8 @@ export type LookupResult = {
   coverage: string[];
   errors: string[];
   versionChecked?: Set<string>;
+  // Dependency id to what npm's metadata says; an id is present only if it was read in this scan.
+  signals?: Map<string, PackageSignals>;
 };
 export type DependencyLookup = (
   dependencies: readonly Dependency[],
@@ -30,12 +33,25 @@ export type LookupProgress = {
   completed: number;
   total: number;
 };
+/** What npm's metadata says about a resolved version and its update candidate. */
+export type PackageSignals = {
+  // The resolved version's message, or null when the metadata lists it without a deprecation.
+  // undefined: the metadata does not list the resolved version, so it was not checked.
+  deprecated: string | null | undefined;
+  // The candidate adds an install script the resolved version lacks. null: no candidate, or the
+  // candidate or the resolved version is missing from the metadata read, so it was not checked.
+  installScript: boolean | null;
+  // The candidate's own message, or null when it is not deprecated or there is no candidate.
+  // undefined: the candidate is newer than the metadata read, so it was not checked.
+  candidateDeprecated: string | null | undefined;
+};
 type CheckedDependency = {
   -readonly [K in keyof Dependency]: K extends "advisoryIds" ? string[] : Dependency[K];
 };
 type Sleep = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 // What a later check reads from each published version. Whole abbreviated manifests (about 1 KiB
-// each) would put several hundred MiB behind 2,000 cached names.
+// each) would put several hundred MiB behind 2,000 cached names. `deprecated` is plain text (see
+// `plainMessage`), never the publisher's raw string.
 type VersionDetails = Readonly<{ deprecated?: string; hasInstallScript?: true }>;
 type PackageEntry = {
   latest: string;
@@ -45,7 +61,7 @@ type PackageEntry = {
   checkedAt: number;
 };
 // The request settings that one lookup stage shares: its fetcher, budget, cancellation and pacing.
-type Stage = {
+export type Stage = {
   fetcher: typeof fetch;
   deadline: number;
   signal: AbortSignal | undefined;
@@ -61,7 +77,7 @@ const unavailable = () => new InputError("A public package source is unavailable
 // RFC 9110 entity-tag characters only, so a validator is safe to send back as a header.
 const entityTag = /^(?:W\/)?"[\x21\x23-\x7e]{0,128}"$/;
 
-async function inParallel<T>(
+export async function inParallel<T>(
   items: readonly T[],
   run: (item: T) => Promise<void>,
   signal?: AbortSignal,
@@ -105,7 +121,7 @@ function sharedLoads<V>(fresh: (value: V) => boolean) {
   };
 }
 
-const pause: Sleep = async (milliseconds, signal) => {
+export const pause: Sleep = async (milliseconds, signal) => {
   try {
     await delay(milliseconds, undefined, signal ? { signal } : {});
   } catch {
@@ -197,8 +213,12 @@ async function read(response: Response, limit: number): Promise<unknown> {
   }
 }
 
-const json = async (url: string, options: RequestInit, stage: Stage, limit = 4 * 1024 * 1024) =>
-  read(await exchange(url, options, stage), limit);
+export const json = async (
+  url: string,
+  options: RequestInit,
+  stage: Stage,
+  limit = 4 * 1024 * 1024,
+) => read(await exchange(url, options, stage), limit);
 
 function eligible(dependency: Dependency) {
   return (
@@ -209,13 +229,51 @@ function eligible(dependency: Dependency) {
   );
 }
 
+/** Publisher text as one plain line: escape sequences, control, zero-width and bidirectional characters removed, whitespace collapsed, at most `limit` characters. Never HTML. */
+export function plainMessage(value: string, limit = 300): string {
+  // Only the first 4,096 characters are cleaned, which bounds the work on a hostile message.
+  const text = stripVTControlCharacters(value.slice(0, 4096))
+    .replace(/[\p{Cc}\p{Cf}\s]+/gu, " ")
+    .trim();
+  const characters = Array.from(text);
+  return characters.length > limit ? `${characters.slice(0, limit - 1).join("")}…` : text;
+}
+
 function versionDetails(manifest: unknown): VersionDetails {
   const fields =
     manifest !== null && typeof manifest === "object" ? (manifest as Record<string, unknown>) : {};
-  const deprecated = string(fields.deprecated);
+  // Not `string()`, which drops a message over 4,096 characters and so reads the version as not
+  // deprecated: any non-blank message is a deprecation, kept as bounded plain text.
+  const deprecated =
+    typeof fields.deprecated === "string" && fields.deprecated.trim()
+      ? plainMessage(fields.deprecated) || "Deprecated by its publisher."
+      : null;
   return {
     ...(deprecated ? { deprecated } : {}),
     ...(fields.hasInstallScript === true ? { hasInstallScript: true as const } : {}),
+  };
+}
+
+/** The resolved version's deprecation, and what its update candidate changes, from one metadata read. */
+export function readSignals(
+  details: Readonly<Record<string, VersionDetails>>,
+  resolved: string,
+  candidate: string | null,
+): PackageSignals {
+  const current = details[resolved];
+  // An installed version the metadata does not list (unpublished, or newer than the copy read) is
+  // unchecked: neither "not deprecated" nor a basis for "the candidate adds an install script".
+  const deprecated = current ? (current.deprecated ?? null) : undefined;
+  if (!candidate) return { deprecated, installScript: null, candidateDeprecated: null };
+  const next = details[candidate];
+  // A package manager can report a release newer than this metadata: say it was not checked.
+  if (!next) return { deprecated, installScript: null, candidateDeprecated: undefined };
+  return {
+    deprecated,
+    installScript: current
+      ? next.hasInstallScript === true && current.hasInstallScript !== true
+      : null,
+    candidateDeprecated: next.deprecated ?? null,
   };
 }
 
@@ -289,6 +347,7 @@ export async function lookupDependencies(
     coverage: [],
     errors: [],
     versionChecked: new Set(),
+    signals: new Map(),
   };
   const candidates = result.dependencies.filter(eligible);
   const unique = [
@@ -460,26 +519,24 @@ export async function lookupDependencies(
       result.versionChecked!.add(dep.id);
     }
   }
-  const versionCandidates = candidates.filter(
-    (dep) => dep.role !== "transitive" && !result.versionChecked!.has(dep.id),
-  );
-  const directNames = [...new Set(versionCandidates.map((dep) => dep.packageName))];
+  const direct = candidates.filter((dep) => dep.role !== "transitive");
+  const versionCandidates = direct.filter((dep) => !result.versionChecked!.has(dep.id));
+  const versionNames = new Set(versionCandidates.map((dep) => dep.packageName));
+  // Every direct name is read, including those the package manager checked, for deprecation and
+  // install-script flags; versions come from the registry only where the package manager did not answer.
+  const directNames = [...new Set(direct.map((dep) => dep.packageName))];
   const versionDeadline =
     Date.now() + Math.max(90000, Math.ceil(directNames.length / 4) * 12000 + 12000);
   let versionCount = 0;
   let checkedVersions = 0;
+  let checkedSignals = 0;
   onProgress?.({ stage: "versions", completed: 0, total: directNames.length });
   await inParallel(
     directNames,
     async (name) => {
       try {
-        const { versions, latest } = await publicPackageVersions(
-          name,
-          fetcher,
-          versionDeadline,
-          signal,
-          cache,
-        );
+        const metadata = await publicPackageVersions(name, fetcher, versionDeadline, signal, cache);
+        const { versions, latest } = metadata;
         for (const dep of versionCandidates.filter((d) => d.packageName === name)) {
           const range = requestedRange(dep);
           const compatible =
@@ -491,12 +548,22 @@ export async function lookupDependencies(
           dep.versionSource = "npm registry";
           result.versionChecked!.add(dep.id);
         }
-        checkedVersions++;
+        if (versionNames.has(name)) checkedVersions++;
+        for (const dep of direct.filter((d) => d.packageName === name))
+          result.signals!.set(
+            dep.id,
+            readSignals(metadata.details, dep.resolved!, dep.availableVersion ?? dep.latestVersion),
+          );
+        checkedSignals++;
       } catch {
         for (const dep of versionCandidates.filter((d) => d.packageName === name))
           dep.versionStatus = "failed";
+        if (versionNames.has(name))
+          result.errors.push(
+            "Public-registry version lookup failed; unavailable update evidence remains unknown.",
+          );
         result.errors.push(
-          "Public-registry version lookup failed; unavailable update evidence remains unknown.",
+          "Deprecation and install-script checks failed for some packages; their previous results are kept and new ones are unknown.",
         );
       } finally {
         onProgress?.({ stage: "versions", completed: ++versionCount, total: directNames.length });
@@ -504,9 +571,13 @@ export async function lookupDependencies(
     },
     signal,
   );
+  if (versionNames.size)
+    result.coverage.push(
+      `Public npm registry version checks: ${checkedVersions}/${versionNames.size} unique direct package names, SemVer requested ranges and latest dist-tag`,
+    );
   if (directNames.length)
     result.coverage.push(
-      `Public npm registry version checks: ${checkedVersions}/${directNames.length} unique direct package names, SemVer requested ranges and latest dist-tag`,
+      `Deprecation and install-script checks: ${checkedSignals}/${directNames.length} unique direct package names (npm registry metadata)`,
     );
   result.errors = [...new Set(result.errors)];
   if (signal?.aborted)

@@ -3,7 +3,7 @@ import { createServer, request as httpsRequest, Agent } from "node:https";
 import { connect } from "node:tls";
 import { networkInterfaces } from "node:os";
 import type { IncomingMessage } from "node:http";
-import type { MonitoringSnapshot } from "@versionstead/contracts/monitoring";
+import type { ActiveScan, Finding, MonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { decodeMonitoringSnapshot } from "@versionstead/contracts/monitoring";
 import { normalizePeerOrigin, privatePeerAddress } from "@versionstead/contracts/application";
 import { InputError, object } from "./projects.ts";
@@ -64,12 +64,99 @@ export function peerCertificateExpired(certificate: PeerCertificate) {
   );
 }
 
-export function sharedEvidence(snapshot: MonitoringSnapshot): MonitoringSnapshot {
+// The header a paired client declares its feature marker in; clients older than Wave 4 send none.
+const featuresHeader = "x-versionstead-features";
+
+/** A finding as clients older than Wave 4 read it: their original fields only. */
+const legacyFinding = ({
+  id,
+  kind,
+  subjectId,
+  subjectLabel,
+  name,
+  packageName,
+  installedVersion,
+  availableVersion,
+  severity,
+  source,
+  description,
+  advisoryUrl,
+  detectedAt,
+  lastSeenAt,
+}: Finding): Finding => ({
+  id,
+  kind,
+  subjectId,
+  subjectLabel,
+  name,
+  packageName,
+  installedVersion,
+  availableVersion,
+  severity,
+  source,
+  description,
+  advisoryUrl,
+  detectedAt,
+  lastSeenAt,
+});
+
+// The scan steps a client older than Wave 4 knows. It refuses any other, so a step added since reads
+// to it as no active step: a new step must not reach it until a marker says that it can.
+const olderScanSteps: ReadonlySet<ActiveScan["stage"]> = new Set([
+  "inventory",
+  "pc-updates",
+  "project-inputs",
+  "advisories",
+  "advisory-details",
+  "native-versions",
+  "versions",
+  "saving",
+]);
+
+/**
+ * Evidence a paired client may read: local paths, commands, notification payloads, and the feature
+ * marker never leave this PC. A client that declares no marker of v10 or later predates Wave 4 and
+ * also gets only what its strict contract can read: update, advisory, and coverage findings with
+ * their original fields, and live progress in which a scan step it does not know reads as no active
+ * step. Everything else stays, including the rest of `scanProgress`.
+ *
+ * ponytail: one cut, at v10; when a later marker adds what v10 clients cannot decode (a new scan
+ * step, say), cut there too.
+ */
+export function sharedEvidence(
+  snapshot: MonitoringSnapshot,
+  clientFeatures?: string,
+): MonitoringSnapshot {
   // No receiving PC reads the feature marker, and a PC on an older build refuses a marker it does
-  // not know, so the marker is never shared.
-  const { features: _marker, ...evidence } = snapshot;
+  // not know, so the marker is never shared. Nor are the snooze and ignore rules: they hold the
+  // owner's own reasons, and a receiving PC needs only each finding's `ruleId`. Nor is the resolved
+  // history, which no receiving PC reads, the count of events waiting to notify, or the owner's
+  // quiet hours and digest time, which say when they want silence.
+  const {
+    features: _marker,
+    findingRules: _rules,
+    resolvedFindings: _resolved,
+    notificationsWaiting: _waiting,
+    ...evidence
+  } = snapshot;
+  const { quietHours: _quiet, digestAt: _digest, ...settings } = snapshot.settings;
+  // The declared value is request input: only an exact marker counts, anything else reads as none.
+  const declared = /^settings-repositories-connections-v([1-9]\d{0,3})$/.exec(clientFeatures ?? "");
+  const readsWave4 = declared !== null && Number(declared[1]) >= 10;
+  const progress = snapshot.scanProgress;
   return decodeMonitoringSnapshot({
     ...evidence,
+    settings,
+    ...(readsWave4
+      ? {}
+      : {
+          findings: snapshot.findings
+            .filter(({ kind }) => kind === "update" || kind === "advisory" || kind === "coverage")
+            .map(legacyFinding),
+          ...(progress?.active && !olderScanSteps.has(progress.active.stage)
+            ? { scanProgress: { ...progress, active: null } }
+            : {}),
+        }),
     inventory: {
       ...snapshot.inventory,
       managers: (snapshot.inventory.managers ?? []).map((m) => ({ ...m, root: null })),
@@ -183,7 +270,14 @@ export async function startPeerServer(options: {
           const nonce = request.headers["x-versionstead-nonce"];
           if (typeof nonce !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(nonce))
             throw new InputError("Invalid evidence nonce.");
-          reply({ nonce, snapshot: sharedEvidence(options.snapshot()) });
+          const declared = request.headers[featuresHeader];
+          reply({
+            nonce,
+            snapshot: sharedEvidence(
+              options.snapshot(),
+              typeof declared === "string" ? declared : undefined,
+            ),
+          });
           return;
         }
         if (request.url === "/scan" && request.method === "POST") {
@@ -242,6 +336,8 @@ export async function peerRequest(
     token?: string;
     body?: unknown;
     nonce?: string;
+    /** The client's feature marker; the host shapes its evidence by it. */
+    features?: string;
     signal?: AbortSignal;
     tunnelPort?: number;
   } = {},
@@ -308,6 +404,7 @@ export async function peerRequest(
             "Content-Type": "application/json",
             ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
             ...(options.nonce ? { "X-Versionstead-Nonce": options.nonce } : {}),
+            ...(options.features ? { [featuresHeader]: options.features } : {}),
           },
         },
         (response) => {

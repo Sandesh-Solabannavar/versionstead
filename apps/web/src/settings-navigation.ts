@@ -20,7 +20,13 @@ const entries: readonly [SettingsPath, readonly string[]][] = [
       "PC scan interval",
       "Project scan interval",
       "Scan selected repositories automatically",
+      "Release cooldown",
+      "Use deps.dev for release age, license and provenance",
       "Notify about new findings",
+      "Notify about",
+      "Notify about watch-only projects",
+      "Quiet hours",
+      "Notification delivery",
       "Check for Versionstead releases",
     ],
   ],
@@ -61,20 +67,23 @@ export const searchableSettings = [
   ),
 ];
 const pageKeywords: Partial<Record<SettingsPath, string>> = {
-  "/settings/general": "restore device defaults monitoring notifications schedules",
+  "/settings/general": "restore device defaults monitoring notifications schedules quiet snooze",
   "/settings/appearance": "themes palettes system light dark",
   "/settings/project": "remove custom commands checkout",
   "/settings/keybindings": "keyboard shortcuts hotkeys",
   "/settings/source-control": "git github gitlab providers repositories",
   "/settings/connections": "pc device pairing ssh tailscale network",
 };
+// Words a control answers to beyond its label, so the search lands on the control, not its page.
+const rowKeywords: Readonly<Record<string, string>> = { "Notification delivery": "digest daily" };
 export function searchSettings(query: string) {
   const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
   if (!words.length) return [];
   return searchableSettings
     .filter((item) => {
       const section = settingsSections.find((s) => s.path === item.path)!.label;
-      const keywords = item.target === null ? (pageKeywords[item.path] ?? "") : "";
+      const keywords =
+        item.target === null ? (pageKeywords[item.path] ?? "") : (rowKeywords[item.label] ?? "");
       return words.every((word) =>
         `${item.label} ${section} ${keywords}`.toLowerCase().includes(word),
       );

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Dependency } from "@versionstead/contracts/monitoring";
+import type { Dependency, Finding } from "@versionstead/contracts/monitoring";
+import { heldDependencies } from "./monitoring-view.ts";
 import {
   dependencyUpgradeCommand,
   globalUpgradeCommand,
   npmPackageUrl,
+  projectUpgradeCommands,
+  upgradeEmptyText,
 } from "./upgrade-commands.ts";
 
 type Manager = "npm" | "pnpm" | "bun" | "unknown";
@@ -269,4 +272,350 @@ test("npm package links come only from valid package names", () => {
     "x".repeat(215),
   ])
     assert.equal(npmPackageUrl(name), null, name);
+});
+
+const dep = (name: string, changes: Partial<Dependency> = {}): Dependency => ({
+  id: `${changes.importer ?? "."}:${name}`,
+  name,
+  packageName: name,
+  requested: "^1.0.0",
+  resolved: "1.0.0",
+  origin: "registry",
+  role: "production",
+  importer: ".",
+  availableVersion: null,
+  latestVersion: null,
+  versionStatus: "checked",
+  advisoryStatus: "checked",
+  advisoryIds: [],
+  ...changes,
+});
+
+test("project commands combine each workspace's packages by dependency type, compatible updates only by default", () => {
+  const project = {
+    packageManager: "pnpm" as const,
+    dependencies: [
+      dep("lodash", { resolved: "4.17.20", availableVersion: "4.17.21" }),
+      dep("typescript", {
+        role: "development",
+        resolved: "5.4.0",
+        availableVersion: "5.9.2",
+        latestVersion: "6.0.0",
+      }),
+      dep("react", { resolved: "18.3.1", latestVersion: "19.1.0" }),
+      dep("zod", { importer: "packages/app", resolved: "3.22.0", availableVersion: "3.25.0" }),
+      dep("scheduler", { role: "transitive", resolved: "0.23.0", availableVersion: "0.23.2" }),
+      dep("left-pad", { resolved: "1.0.0", availableVersion: "1.3.0", versionStatus: "failed" }),
+    ],
+  };
+  assert.deepEqual(projectUpgradeCommands(project, "compatible"), {
+    commands: [
+      {
+        where: "root · dependencies",
+        role: "production",
+        command: "pnpm add lodash@4.17.21 -w",
+        packages: 1,
+      },
+      {
+        where: "root · devDependencies",
+        role: "development",
+        command: "pnpm add typescript@5.9.2 -D -w",
+        packages: 1,
+      },
+      {
+        where: "packages/app · dependencies",
+        role: "production",
+        command: "pnpm --filter ./packages/app add zod@3.25.0",
+        packages: 1,
+      },
+    ],
+    unsupported: 0,
+    held: 0,
+    tooNew: 0,
+    // left-pad's lookup failed: it is counted, never read as having no update.
+    unchecked: 1,
+  });
+  const major = projectUpgradeCommands(project, "major");
+  assert.deepEqual(
+    major.commands.map((item) => item.command),
+    [
+      "pnpm add lodash@4.17.21 react@19.1.0 -w",
+      "pnpm add typescript@6.0.0 -D -w",
+      "pnpm --filter ./packages/app add zod@3.25.0",
+    ],
+  );
+  assert.equal(major.unchecked, 1);
+});
+
+test("a compatible update never crosses a major version, and npm and Bun take every package in one command", () => {
+  const npm = {
+    packageManager: "npm" as const,
+    dependencies: [
+      dep("anything", { requested: "*", resolved: "1.0.0", availableVersion: "2.0.0" }),
+      dep("a", { importer: "packages/app", role: "development", availableVersion: "1.1.0" }),
+      dep("b", {
+        importer: "packages/app",
+        role: "development",
+        resolved: "2.0.0",
+        availableVersion: "2.0.1",
+      }),
+    ],
+  };
+  assert.deepEqual(
+    projectUpgradeCommands(npm, "compatible").commands.map((item) => item.command),
+    ["npm install a@1.1.0 b@2.0.1 --save-dev --workspace packages/app"],
+  );
+  assert.deepEqual(
+    projectUpgradeCommands(npm, "major").commands.map((item) => item.command),
+    [
+      "npm install anything@2.0.0",
+      "npm install a@1.1.0 b@2.0.1 --save-dev --workspace packages/app",
+    ],
+  );
+  assert.deepEqual(
+    projectUpgradeCommands({ ...npm, packageManager: "bun" }, "compatible").commands.map(
+      (item) => item.command,
+    ),
+    ["bun add a@1.1.0 b@2.0.1 --dev --cwd packages/app"],
+  );
+  assert.deepEqual(
+    projectUpgradeCommands({ ...npm, packageManager: "unknown" }, "major").commands,
+    [],
+  );
+});
+
+test("aliases, other sources, unquotable workspaces, and snoozed or ignored packages are counted, never commanded", () => {
+  const project = {
+    packageManager: "npm" as const,
+    dependencies: [
+      dep("lodash-4", { packageName: "lodash", resolved: "4.17.20", availableVersion: "4.17.21" }),
+      dep("from-git", { origin: "git", availableVersion: "1.1.0" }),
+      dep("unquotable", { importer: "packages/a&calc", availableVersion: "1.1.0" }),
+      dep("held", { availableVersion: "1.1.0" }),
+      dep("fine", { availableVersion: "1.2.0" }),
+    ],
+  };
+  const plan = projectUpgradeCommands(project, "compatible", new Set([".:held"]));
+  assert.deepEqual(
+    plan.commands.map((item) => item.command),
+    ["npm install fine@1.2.0"],
+  );
+  assert.equal(plan.unsupported, 3);
+  assert.equal(plan.held, 1);
+  assert.equal(plan.unchecked, 0);
+  for (const item of plan.commands) assert.doesNotMatch(item.command, /&|lodash|from-git|held/);
+});
+
+test("a direct registry package whose lookup did not finish is counted as unchecked, and nothing else is", () => {
+  const plan = (scope: "compatible" | "major") =>
+    projectUpgradeCommands(
+      {
+        packageManager: "npm",
+        dependencies: [
+          dep("failed", { availableVersion: "1.1.0", versionStatus: "failed" }),
+          dep("not-checked", { versionStatus: "not-checked" }),
+          dep("unsupported", { versionStatus: "unsupported" }),
+          dep("no-status", { versionStatus: undefined }),
+          // A transitive record, a non-registry source, and a checked package are not unchecked.
+          dep("transitive", { role: "transitive", versionStatus: "failed" }),
+          dep("linked", { origin: "workspace", versionStatus: "unsupported" }),
+          dep("fine", { availableVersion: "1.2.0" }),
+        ],
+      },
+      scope,
+    );
+  for (const scope of ["compatible", "major"] as const) {
+    assert.equal(plan(scope).unchecked, 4, scope);
+    assert.equal(plan(scope).unsupported, 0, scope);
+    assert.deepEqual(
+      plan(scope).commands.map((item) => item.command),
+      ["npm install fine@1.2.0"],
+      scope,
+    );
+  }
+});
+
+test("commands come root first, then workspaces by path, then dependency types, whatever the order of the records", () => {
+  const at = (importer: string) => ({ importer, availableVersion: "1.1.0" });
+  const workspaces = projectUpgradeCommands(
+    {
+      packageManager: "npm",
+      dependencies: [
+        dep("web", at("packages/web")),
+        dep("lint", { ...at("packages/app"), role: "development" }),
+        dep("zed", at("packages/app")),
+        dep("alpha", at("packages/app")),
+        // The same package twice in one workspace and dependency type is one package.
+        { ...dep("alpha", at("packages/app")), id: "again" },
+        // A workspace that cannot be quoted counts every package in it, once each.
+        dep("one", at("packages/a&calc")),
+        dep("two", at("packages/a&calc")),
+      ],
+    },
+    "compatible",
+  );
+  assert.deepEqual(
+    workspaces.commands.map((item) => [item.where, item.command, item.packages]),
+    [
+      [
+        "packages/app · dependencies",
+        "npm install alpha@1.1.0 zed@1.1.0 --workspace packages/app",
+        2,
+      ],
+      [
+        "packages/app · devDependencies",
+        "npm install lint@1.1.0 --save-dev --workspace packages/app",
+        1,
+      ],
+      ["packages/web · dependencies", "npm install web@1.1.0 --workspace packages/web", 1],
+    ],
+  );
+  assert.equal(workspaces.unsupported, 2);
+  // The root leads even when another workspace's name sorts before ".".
+  const root = projectUpgradeCommands(
+    {
+      packageManager: "npm",
+      dependencies: [dep("tool", at("_tools")), dep("main", at("."))],
+    },
+    "compatible",
+  );
+  assert.deepEqual(
+    root.commands.map((item) => item.where),
+    ["root · dependencies", "_tools · dependencies"],
+  );
+});
+
+test("a project whose only candidates have no safe command yields no command at all", () => {
+  const plan = projectUpgradeCommands(
+    {
+      packageManager: "npm",
+      dependencies: [
+        dep("lodash-4", { packageName: "lodash", availableVersion: "1.1.0" }),
+        dep("from-git", { origin: "git", availableVersion: "1.1.0" }),
+      ],
+    },
+    "compatible",
+  );
+  assert.deepEqual(plan, { commands: [], unsupported: 2, held: 0, tooNew: 0, unchecked: 0 });
+});
+
+test("optional dependencies get their own command, flag, and label", () => {
+  const plan = projectUpgradeCommands(
+    {
+      packageManager: "pnpm",
+      dependencies: [dep("fsevents", { role: "optional", availableVersion: "1.1.0" })],
+    },
+    "compatible",
+  );
+  assert.deepEqual(plan.commands, [
+    {
+      where: "root · optionalDependencies",
+      role: "optional",
+      command: "pnpm add fsevents@1.1.0 -O",
+      packages: 1,
+    },
+  ]);
+});
+
+test("including majors takes the greater of the latest release and the compatible one", () => {
+  const plan = projectUpgradeCommands(
+    {
+      packageManager: "npm",
+      dependencies: [
+        // A latest tag that sits behind the newest release the range allows.
+        dep("behind-tag", { availableVersion: "1.5.0", latestVersion: "1.2.0" }),
+        dep("ahead-tag", { availableVersion: "1.5.0", latestVersion: "2.0.0" }),
+        dep("only-latest", { availableVersion: null, latestVersion: "3.0.0" }),
+      ],
+    },
+    "major",
+  );
+  assert.deepEqual(
+    plan.commands.map((item) => item.command),
+    ["npm install ahead-tag@2.0.0 behind-tag@1.5.0 only-latest@3.0.0"],
+  );
+});
+
+test("a release younger than the cooldown is left out and counted, in compatible and major alike", () => {
+  const project = {
+    packageManager: "npm" as const,
+    dependencies: [
+      dep("old", { availableVersion: "1.1.0" }),
+      dep("fresh", { availableVersion: "1.2.0", latestVersion: "2.0.0" }),
+      dep("fresh-latest", { availableVersion: null, latestVersion: "3.0.0" }),
+      dep("held", { availableVersion: "1.1.0" }),
+    ],
+  };
+  // The age is known for the release an update finding describes, which is not always the one a command installs.
+  const young = new Map([
+    [".:fresh", "1.2.0"],
+    [".:fresh-latest", "3.0.0"],
+    [".:held", "1.1.0"],
+  ]);
+  const held = new Set([".:held"]);
+  const compatible = projectUpgradeCommands(project, "compatible", held, young);
+  assert.deepEqual(
+    compatible.commands.map((item) => item.command),
+    ["npm install old@1.1.0"],
+  );
+  assert.deepEqual(
+    [compatible.held, compatible.tooNew],
+    [1, 1],
+    "A held package is counted as held only",
+  );
+  const major = projectUpgradeCommands(project, "major", held, young);
+  assert.deepEqual(
+    major.commands.map((item) => item.command),
+    ["npm install fresh@2.0.0 old@1.1.0"],
+    "The latest release of fresh has no known age, so it is not held back",
+  );
+  assert.deepEqual([major.held, major.tooNew], [1, 1]);
+  assert.equal(
+    projectUpgradeCommands(project, "compatible").tooNew,
+    0,
+    "Nothing is young by default",
+  );
+});
+
+test("the held set of heldDependencies carries dependency ids, which are not names", () => {
+  const zod = dep("zod", { importer: "packages/app", availableVersion: "1.1.0" });
+  const update: Finding = {
+    id: "update-zod",
+    kind: "update",
+    subjectId: "project",
+    subjectLabel: "Project",
+    name: "zod",
+    packageName: "zod",
+    installedVersion: "1.0.0",
+    availableVersion: "1.1.0",
+    severity: "info",
+    source: "npm registry",
+    description: "A newer version satisfies the requested range.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+    ruleId: "snooze-1",
+  };
+  const project = {
+    packageManager: "npm" as const,
+    dependencies: [
+      { ...zod, id: "9f86d081884c7d659a2feaa0c55ad015" },
+      dep("fine", { availableVersion: "1.2.0" }),
+    ],
+  };
+  const held = heldDependencies(project, [update]);
+  assert.deepEqual([...held], ["9f86d081884c7d659a2feaa0c55ad015"]);
+  const plan = projectUpgradeCommands(project, "compatible", held);
+  assert.deepEqual(
+    plan.commands.map((item) => item.command),
+    ["npm install fine@1.2.0"],
+  );
+  assert.equal(plan.held, 1);
+});
+
+test("an empty Upgrade commands dialog never reads as no updates while a package was not checked", () => {
+  assert.equal(upgradeEmptyText(2, false), "No checked package has a command to copy.");
+  assert.equal(upgradeEmptyText(1, true), "No checked package has a command to copy.");
+  assert.equal(upgradeEmptyText(0, false), "No compatible update to copy.");
+  assert.equal(upgradeEmptyText(0, true), "No update to copy.");
 });

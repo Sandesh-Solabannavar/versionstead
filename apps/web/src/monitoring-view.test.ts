@@ -6,33 +6,46 @@ import type {
   Finding,
   GlobalToolSource,
   MonitoringSnapshot,
+  NotificationSummary,
   Project,
   ScanEvidence,
   ScanProgress,
 } from "@versionstead/contracts/monitoring";
 import {
   advisoryTone,
+  type AttentionFilter,
   attentionSearch,
   attentionGroups,
   backgroundSetup,
   backgroundSummary,
   bootHostBadge,
+  canIgnore,
   compareFindings,
+  deliveryStatus,
   dependencyFindings,
   dependencyNeedsAttention,
   dependencyUpgradeOption,
   evidenceStale,
+  failedTargetCount,
   filterInstallations,
   findingCounts,
   findingSummary,
+  findingTotal,
   findingsRetained,
   findingUpgradeCommands,
   firewallName,
   globalToolSourceState,
+  heldDependencies,
   hostLabel,
   installationCandidate,
+  latestScanNotice,
+  installationFindings,
+  installationUpdate,
+  isNewFinding,
+  isEffectiveDay,
   lifecycleNote,
   lifecycleRows,
+  localOnlyFilter,
   noun,
   pcUpdateState,
   pcUpdateHold,
@@ -42,9 +55,14 @@ import {
   projectNeedsAttention,
   relativeTime,
   restartAdvice,
+  ruleLabel,
+  runtimeNotices,
   scanDuration,
   scanStage,
   severityPresentation,
+  snoozeChoices,
+  supportStateLabel,
+  suppressedCount,
   uniqueRowLabels,
   workspaceLabel,
 } from "./monitoring-view.ts";
@@ -118,6 +136,8 @@ test("attention groups retain incomplete targets, source/version identities, and
     packages: 1,
     updates: 1,
     advisories: 1,
+    lifecycle: 0,
+    other: 0,
     incomplete: 1,
   });
   assert.equal(
@@ -138,7 +158,7 @@ test("attention groups retain incomplete targets, source/version identities, and
       ],
       "pc",
     ),
-    { packages: 2, updates: 2, advisories: 0, incomplete: 0 },
+    { packages: 2, updates: 2, advisories: 0, lifecycle: 0, other: 0, incomplete: 0 },
   );
 
   const current: Dependency = {
@@ -388,6 +408,12 @@ test("scan progress has real stage counts or indeterminate state, and notificati
     max: 42,
     count: "40/42 packages",
   });
+  assert.deepEqual(scanStage({ stage: "release-facts", completed: 2, total: 5 }), {
+    label: "Checking release age, license, and provenance",
+    value: 2,
+    max: 5,
+    count: "2/5 packages",
+  });
   for (const [completed, total] of [
     [null, null],
     [0, 0],
@@ -541,6 +567,13 @@ test("findings that a failed or unsupported scan kept from earlier scans read as
   };
   for (const [status, expected] of Object.entries(retained))
     assert.equal(findingsRetained(status as ScanEvidence["status"]), expected, status);
+});
+
+test("a dialog built from earlier evidence says when the latest scan failed or is unsupported", () => {
+  assert.equal(latestScanNotice("failed"), "The latest scan failed.");
+  assert.equal(latestScanNotice("unsupported"), "The latest scan is unsupported.");
+  for (const status of ["not-scanned", "scanning", "complete", "partial"] as const)
+    assert.equal(latestScanNotice(status), null, status);
 });
 
 test("attention groups list findings most severe first", () => {
@@ -1216,4 +1249,1129 @@ test("the older-build advice names the tray only in the desktop app, and the men
   }
   // A browser still gets a step it can follow.
   assert.match(restartAdvice("session", false, "win32"), /Restart the coordinator/);
+});
+
+test("lifecycle findings have their own count, filter, and support-state wording", () => {
+  const base: Finding = {
+    id: "node",
+    kind: "lifecycle",
+    subjectId: "project",
+    subjectLabel: "Project",
+    name: "Node.js 20",
+    packageName: null,
+    installedVersion: ">=20",
+    availableVersion: null,
+    severity: "high",
+    source: "endoflife.date",
+    description: "Node.js 20 reached end of life on 2026-04-30.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T12:00:00Z",
+    effectiveDate: "2026-04-30",
+  };
+  const soon: Finding = {
+    ...base,
+    id: "electron",
+    name: "Electron 42",
+    severity: "moderate",
+    effectiveDate: "2026-10-20",
+  };
+  const leaving: Finding = {
+    ...base,
+    id: "node-24",
+    name: "Node.js 24",
+    severity: "low",
+    effectiveDate: "2026-10-20",
+  };
+  const left: Finding = {
+    ...base,
+    id: "node-22",
+    name: "Node.js 22",
+    severity: "low",
+    effectiveDate: "2025-10-21",
+  };
+  const deprecated: Finding = {
+    ...base,
+    id: "request",
+    name: "request",
+    packageName: "request",
+    installedVersion: "2.88.2",
+    severity: "low",
+    source: "npm registry",
+    description: "Deprecated by its publisher: request has been deprecated.",
+  };
+  assert.deepEqual([base, soon, leaving, left, deprecated].map(findingSummary), [
+    "End of life",
+    "End of life soon",
+    "Leaving active support",
+    "Out of active support",
+    "Deprecated",
+  ]);
+  assert.equal(supportStateLabel(deprecated), "Deprecated");
+  assert.deepEqual(findingCounts([base, soon, deprecated], "pc"), {
+    packages: 1,
+    updates: 0,
+    advisories: 0,
+    lifecycle: 3,
+    other: 0,
+    incomplete: 0,
+  });
+  assert.deepEqual(attentionSearch({ filter: "lifecycle" }), { filter: "lifecycle" });
+  const dependency: Dependency = {
+    id: "dep",
+    name: "request",
+    packageName: "request",
+    requested: "^2.88.0",
+    resolved: "2.88.2",
+    origin: "registry",
+    role: "production",
+    importer: ".",
+    availableVersion: null,
+    latestVersion: null,
+    versionStatus: "checked",
+    advisoryStatus: "checked",
+    advisoryIds: [],
+  };
+  assert.deepEqual(
+    dependencyFindings(dependency, [base, deprecated]).map((f) => f.id),
+    ["request"],
+    "A runtime notice is not a dependency's finding",
+  );
+  assert.deepEqual(
+    dependencyFindings({ ...dependency, availableVersion: "2.88.3" }, [base, deprecated]).map(
+      (f) => f.id,
+    ),
+    ["request"],
+    "A pending update does not hide a deprecation",
+  );
+  const evidence: ScanEvidence = {
+    status: "complete",
+    lastAttempt: "2026-10-08T12:00:00Z",
+    lastSuccess: "2026-10-08T12:00:00Z",
+    coverage: [],
+    errors: [],
+  };
+  const project: Project = {
+    id: "project",
+    name: "Project",
+    path: "C:\\project",
+    mode: "maintained",
+    packageManager: "npm",
+    manifestPath: null,
+    lockfilePath: null,
+    evidence,
+    dependencies: [dependency],
+    createdAt: "2026-10-08T12:00:00Z",
+  };
+  const snapshot: MonitoringSnapshot = {
+    protocolVersion: 1,
+    runtime: {
+      startedAt: "2026-10-08T12:00:00Z",
+      mode: "interactive",
+      host: "session",
+      platform: "win32",
+      nextScanAt: null,
+    },
+    device: { id: "pc", label: "PC", platform: "win32" },
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+    inventory: { evidence, updateEvidence: evidence, installations: [] },
+    projects: [project],
+    findings: [deprecated, base],
+    history: [],
+    notifications: [],
+  };
+  assert.deepEqual(
+    attentionGroups(snapshot, "lifecycle").map((group) => group.findings.map((f) => f.id)),
+    [["node", "request"]],
+  );
+  assert.deepEqual(attentionGroups(snapshot, "updates"), []);
+});
+
+test("a deprecation belongs to its dependency but is never offered an upgrade command", () => {
+  const { dependency, project, update, pc } = upgradeFixture();
+  const deprecated: Finding = {
+    ...update,
+    id: "deprecated",
+    kind: "lifecycle",
+    availableVersion: null,
+    severity: "low",
+  };
+  // The dependency has a checked candidate, which would be its update finding's command.
+  assert.deepEqual(
+    dependencyFindings(dependency(), [update, deprecated]).map((finding) => finding.id),
+    ["update", "deprecated"],
+  );
+  assert.deepEqual(findingUpgradeCommands(deprecated, project([dependency()]), pc()), []);
+  assert.deepEqual(findingUpgradeCommands(update, project([dependency()]), pc()), [
+    { where: "root", command: "pnpm add tool@1.1.0", version: "1.1.0" },
+  ]);
+});
+
+test("a malformed effective date from a paired PC reads as undated instead of misleading or throwing", () => {
+  for (const day of ["2026-10-20", "2024-02-29", "0001-01-01", "9999-12-31"])
+    assert.equal(isEffectiveDay(day), true, day);
+  const malformed = [
+    "",
+    "soon",
+    "20261020",
+    "2026-1-5",
+    " 2026-10-20",
+    "2026-10-20\n",
+    "2026-10-20T00:00:00Z",
+    "2026-13-45",
+    "2026-00-10",
+    "2026-10-00",
+    // A real parser would roll these over into the next month; they are not days.
+    "2026-02-31",
+    "2026-02-29",
+    "2026-04-31",
+    "9".repeat(100_000),
+  ];
+  assert.equal(isEffectiveDay(undefined), false);
+  for (const value of malformed) assert.equal(isEffectiveDay(value), false, value.slice(0, 24));
+
+  const low = { severity: "low", packageName: null, lastSeenAt: "2026-10-08T12:00:00Z" } as const;
+  assert.equal(supportStateLabel(low), "Out of active support");
+  assert.equal(
+    supportStateLabel({ ...low, effectiveDate: "2026-10-20" }),
+    "Leaving active support",
+  );
+  assert.equal(supportStateLabel({ ...low, effectiveDate: "2026-10-08" }), "Out of active support");
+  // A day that cannot be read never makes a runtime look as if it is leaving support later.
+  for (const effectiveDate of [...malformed, "9999-99-99", "zzzz"])
+    assert.equal(
+      supportStateLabel({ ...low, effectiveDate }),
+      "Out of active support",
+      effectiveDate.slice(0, 24),
+    );
+  assert.equal(
+    supportStateLabel({ ...low, lastSeenAt: "not a time", effectiveDate: "2026-10-20" }),
+    "Out of active support",
+  );
+  // Severity, not the date, decides the end-of-life states, so a bad date cannot change them.
+  for (const effectiveDate of ["2026-10-20", "soon"]) {
+    assert.equal(supportStateLabel({ ...low, severity: "high", effectiveDate }), "End of life");
+    assert.equal(
+      supportStateLabel({ ...low, severity: "moderate", effectiveDate }),
+      "End of life soon",
+    );
+  }
+});
+
+test("a finding kind from a newer Versionstead is counted and named generically", () => {
+  const other: Finding = {
+    id: "drift",
+    kind: "other",
+    subjectId: "project",
+    subjectLabel: "Project",
+    name: "typescript",
+    packageName: "typescript",
+    installedVersion: "5.4.0",
+    availableVersion: null,
+    severity: "info",
+    source: "Version drift",
+    description: "Resolved at different versions across projects.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+  };
+  assert.equal(findingSummary(other), "Other finding");
+  assert.deepEqual(findingCounts([other], "pc"), {
+    packages: 1,
+    updates: 0,
+    advisories: 0,
+    lifecycle: 0,
+    other: 1,
+    incomplete: 0,
+  });
+  // Only a finding that names a package is a package observation.
+  assert.equal(findingCounts([{ ...other, packageName: null }], "pc").packages, 0);
+  assert.equal(findingCounts([{ ...other, packageName: null }], "pc").other, 1);
+
+  // It belongs to All findings and to no other filter.
+  const evidence: ScanEvidence = {
+    status: "complete",
+    lastAttempt: "2026-10-08T00:00:00Z",
+    lastSuccess: "2026-10-08T00:00:00Z",
+    coverage: [],
+    errors: [],
+  };
+  const snapshot: MonitoringSnapshot = {
+    protocolVersion: 1,
+    runtime: {
+      startedAt: evidence.lastAttempt!,
+      mode: "interactive",
+      host: "session",
+      platform: "win32",
+      nextScanAt: null,
+    },
+    device: { id: "pc", label: "PC", platform: "win32" },
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+    inventory: { evidence, installations: [] },
+    projects: [],
+    findings: [{ ...other, subjectId: "pc", subjectLabel: "PC" }],
+    history: [],
+    notifications: [],
+  };
+  assert.deepEqual(
+    attentionGroups(snapshot).map((group) => [group.id, group.counts.other]),
+    [["pc", 1]],
+  );
+  for (const filter of ["updates", "advisories", "lifecycle", "coverage"] as const)
+    assert.deepEqual(attentionGroups(snapshot, filter), [], filter);
+});
+
+test("a project's runtime notices are its lifecycle findings that name no package, most severe first", () => {
+  const finding = (
+    id: string,
+    kind: Finding["kind"],
+    name: string,
+    severity: Finding["severity"],
+    packageName: string | null = null,
+  ): Finding => ({
+    id,
+    kind,
+    subjectId: "project",
+    subjectLabel: "Project",
+    name,
+    packageName,
+    installedVersion: ">=20",
+    availableVersion: null,
+    severity,
+    source: "endoflife.date",
+    description: "",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+  });
+  const findings = [
+    finding("node-24", "lifecycle", "Node.js 24", "low"),
+    finding("request", "lifecycle", "request", "low", "request"),
+    finding("update", "update", "tool", "info", "tool"),
+    finding("drift", "other", "Registry policy", "high"),
+    finding("electron", "lifecycle", "Electron 42", "moderate"),
+    finding("node-20", "lifecycle", "Node.js 20", "high"),
+    finding("bun", "lifecycle", "Bun 1", "low"),
+    finding("gaps", "coverage", "Incomplete checks", "unknown"),
+  ];
+  // A deprecation belongs to its dependency, and a package-less finding of an unknown kind is no runtime line.
+  assert.deepEqual(
+    runtimeNotices(findings).map((notice) => notice.name),
+    ["Node.js 20", "Electron 42", "Bun 1", "Node.js 24"],
+  );
+  assert.deepEqual(runtimeNotices([]), []);
+  assert.deepEqual(
+    runtimeNotices(findings.filter((item) => item.id !== "node-20" && item.id !== "electron"))
+      .map((notice) => findingSummary(notice))
+      .sort(),
+    ["Out of active support", "Out of active support"],
+  );
+  assert.equal(findings[0]!.id, "node-24", "The project's own list is not reordered");
+});
+
+test("a global tool's findings match its name, package, installed version and manager source", () => {
+  const update: Finding = {
+    id: "update",
+    kind: "update",
+    subjectId: "pc",
+    subjectLabel: "PC",
+    name: "tsx",
+    packageName: "tsx",
+    installedVersion: "4.0.0",
+    availableVersion: "4.1.0",
+    severity: "info",
+    source: "npm global",
+    description: "",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+  };
+  const findings: Finding[] = [
+    update,
+    { ...update, id: "deprecated", kind: "lifecycle", availableVersion: null, severity: "low" },
+    { ...update, id: "bun", source: "bun global" },
+    { ...update, id: "older", installedVersion: "3.0.0" },
+    { ...update, id: "project", subjectId: "project" },
+  ];
+  const tool = {
+    name: "tsx",
+    packageId: "tsx",
+    version: "4.0.0",
+    source: "npm global",
+    availableVersion: "4.1.0",
+  };
+  assert.deepEqual(
+    installationFindings(findings, "pc", tool).map((finding) => finding.id),
+    ["update", "deprecated"],
+  );
+  // The other kinds and the other identities of the same tool are not this installation's.
+  const others: Finding[] = [
+    { ...update, id: "advisory", kind: "advisory" },
+    { ...update, id: "coverage", kind: "coverage" },
+    { ...update, id: "other", kind: "other" },
+    { ...update, id: "renamed", name: "tsx-alias" },
+    { ...update, id: "aliased", packageName: "@scope/tsx" },
+  ];
+  assert.deepEqual(installationFindings(others, "pc", tool), []);
+  // A tool with no package identity claims none of a package's findings.
+  assert.deepEqual(installationFindings(findings, "pc", { ...tool, packageId: undefined }), []);
+  assert.deepEqual(installationFindings([], "pc", tool), []);
+});
+
+test("a global tool's update is the finding for its current candidate, never a stale one", () => {
+  const update: Finding = {
+    id: "update",
+    kind: "update",
+    subjectId: "pc",
+    subjectLabel: "PC",
+    name: "tsx",
+    packageName: "tsx",
+    installedVersion: "4.0.0",
+    availableVersion: "4.1.0",
+    severity: "info",
+    source: "npm global",
+    description: "",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+    installScript: true,
+  };
+  const stale: Finding = {
+    ...update,
+    id: "stale",
+    availableVersion: "4.0.5",
+    installScript: false,
+  };
+  const deprecated: Finding = {
+    ...update,
+    id: "deprecated",
+    kind: "lifecycle",
+    availableVersion: null,
+    severity: "low",
+  };
+  const tool = {
+    name: "tsx",
+    packageId: "tsx",
+    version: "4.0.0",
+    source: "npm global",
+    availableVersion: "4.1.0" as string | null,
+  };
+  const ids = (list: readonly Finding[]) => list.map((finding) => finding.id);
+  // Whichever order they come in, the finding for the release that would be installed is its update.
+  assert.equal(installationUpdate([update, stale, deprecated], "pc", tool)?.id, "update");
+  assert.equal(installationUpdate([stale, deprecated, update], "pc", tool)?.id, "update");
+  // The candidate moved on or went away: the old finding is no one's update, so the row marks
+  // nothing and Update now has nothing to ask about.
+  const moved = { ...tool, availableVersion: "4.2.0" };
+  assert.equal(installationUpdate([update, stale], "pc", moved), undefined);
+  assert.equal(
+    installationUpdate([update, stale], "pc", { ...tool, availableVersion: null }),
+    undefined,
+  );
+  assert.equal(
+    installationUpdate([{ ...update, availableVersion: null }], "pc", {
+      ...tool,
+      availableVersion: null,
+    }),
+    undefined,
+    "No candidate on either side is not a match",
+  );
+  // Everything that lists the tool's findings applies the same match; its deprecation is its own,
+  // whatever the candidate.
+  assert.deepEqual(ids(installationFindings([update, stale, deprecated], "pc", tool)), [
+    "update",
+    "deprecated",
+  ]);
+  assert.deepEqual(ids(installationFindings([update, stale, deprecated], "pc", moved)), [
+    "deprecated",
+  ]);
+  // Another PC, manager, version, name or package is another tool's update.
+  for (const other of [
+    { subjectId: "project" },
+    { source: "bun global" },
+    { installedVersion: "3.0.0" },
+    { name: "tsx-alias" },
+    { packageName: "@scope/tsx" },
+    { kind: "advisory" as const },
+  ])
+    assert.equal(
+      installationUpdate([{ ...update, ...other }], "pc", tool),
+      undefined,
+      JSON.stringify(other),
+    );
+  assert.equal(installationUpdate([], "pc", tool), undefined);
+});
+
+test("a global tool that is both outdated and deprecated is one package, as in a project", () => {
+  const update: Finding = {
+    id: "tsx-update",
+    kind: "update",
+    subjectId: "pc",
+    subjectLabel: "PC",
+    name: "tsx",
+    packageName: "tsx",
+    installedVersion: "4.0.0",
+    availableVersion: "4.1.0",
+    severity: "info",
+    source: "npm global",
+    description: "",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+  };
+  const deprecated: Finding = {
+    ...update,
+    id: "tsx-deprecated",
+    kind: "lifecycle",
+    availableVersion: null,
+    severity: "low",
+    description: "Deprecated by its publisher: Use tsx 5.",
+  };
+  assert.deepEqual(findingCounts([update, deprecated], "pc"), {
+    packages: 1,
+    updates: 1,
+    advisories: 0,
+    lifecycle: 1,
+    other: 0,
+    incomplete: 0,
+  });
+  // A project's two findings on one package were already one package.
+  assert.equal(
+    findingCounts(
+      [
+        { ...update, subjectId: "project" },
+        { ...deprecated, subjectId: "project" },
+      ],
+      "pc",
+    ).packages,
+    1,
+  );
+  // Another version, manager, package or name is another tool.
+  for (const other of [
+    { installedVersion: "3.0.0" },
+    { source: "bun global" },
+    { name: "eslint", packageName: "eslint" },
+    { name: "tsx-old" },
+    { packageName: "@scope/tsx" },
+  ])
+    assert.equal(
+      findingCounts([update, deprecated, { ...update, id: "other", ...other }], "pc").packages,
+      2,
+      JSON.stringify(other),
+    );
+  // A runtime line's lifecycle notice names no package, so it is not one.
+  assert.equal(
+    findingCounts([update, { ...deprecated, id: "node", packageName: null }], "pc").packages,
+    1,
+  );
+});
+
+test("snoozed and ignored findings leave counts and badges, and a snoozed gap keeps its status", () => {
+  const evidence: ScanEvidence = {
+    status: "complete",
+    lastAttempt: "2026-10-08T12:00:00Z",
+    lastSuccess: "2026-10-08T12:00:00Z",
+    coverage: [],
+    errors: [],
+  };
+  const partial: ScanEvidence = {
+    ...evidence,
+    status: "partial",
+    errors: ["Known-advisory lookup failed."],
+  };
+  const project = (id: string, projectEvidence: ScanEvidence): Project => ({
+    id,
+    name: id,
+    path: `C:\\${id}`,
+    mode: "maintained",
+    packageManager: "npm",
+    manifestPath: null,
+    lockfilePath: null,
+    evidence: projectEvidence,
+    dependencies: [],
+    createdAt: "2026-10-08T12:00:00Z",
+  });
+  const base: Finding = {
+    id: "update",
+    kind: "update",
+    subjectId: "app",
+    subjectLabel: "app",
+    name: "left-pad",
+    packageName: "left-pad",
+    installedVersion: "1.0.0",
+    availableVersion: "1.3.0",
+    severity: "info",
+    source: "npm registry",
+    description: "A newer version satisfies the requested range.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T12:00:00Z",
+    lastSeenAt: "2026-10-08T12:00:00Z",
+  };
+  const update: Finding = { ...base, ruleId: "snooze" };
+  const advisory: Finding = {
+    ...base,
+    id: "advisory",
+    kind: "advisory",
+    severity: "high",
+    advisoryUrl: "https://osv.dev/vulnerability/GHSA-1",
+  };
+  const gap: Finding = {
+    ...base,
+    id: "gap",
+    kind: "coverage",
+    subjectId: "partial",
+    subjectLabel: "partial",
+    name: "Incomplete checks",
+    packageName: null,
+    installedVersion: null,
+    availableVersion: null,
+    severity: "unknown",
+    source: "Project collector",
+    description: "Known-advisory lookup failed.",
+    ruleId: "gap-snooze",
+  };
+  const snapshot: MonitoringSnapshot = {
+    protocolVersion: 1,
+    runtime: {
+      startedAt: "2026-10-08T12:00:00Z",
+      mode: "interactive",
+      host: "session",
+      platform: "win32",
+      nextScanAt: null,
+    },
+    device: { id: "pc", label: "PC", platform: "win32" },
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+    inventory: { evidence, updateEvidence: evidence, installations: [] },
+    projects: [project("app", evidence), project("partial", partial)],
+    findings: [update, advisory, gap],
+    history: [],
+    notifications: [],
+    findingRules: [
+      {
+        id: "snooze",
+        scope: { subjectId: "app", kind: "update", packageName: "left-pad" },
+        mode: "snooze",
+        until: "2026-11-07T12:00:00.000Z",
+        createdAt: "2026-10-08T12:00:00.000Z",
+      },
+      {
+        id: "gap-snooze",
+        scope: {
+          subjectId: "partial",
+          kind: "coverage",
+          packageName: "Incomplete checks",
+          detail: "digest",
+        },
+        mode: "snooze",
+        until: "2026-10-15T12:00:00.000Z",
+        createdAt: "2026-10-08T12:00:00.000Z",
+      },
+    ],
+  };
+  const groups = attentionGroups(snapshot);
+  assert.deepEqual(
+    groups.map((group) => [group.id, group.findings.map((f) => f.id)]),
+    [["app", ["advisory"]]],
+  );
+  assert.deepEqual(groups[0]!.counts, {
+    packages: 1,
+    updates: 0,
+    advisories: 1,
+    lifecycle: 0,
+    other: 0,
+    incomplete: 0,
+  });
+  assert.deepEqual(attentionGroups(snapshot, "updates"), [], "A hidden update leaves Updates");
+  assert.deepEqual(
+    attentionGroups(snapshot, "coverage"),
+    [],
+    "A snoozed gap leaves Incomplete checks",
+  );
+  const hidden = attentionGroups(snapshot, "suppressed");
+  assert.deepEqual(
+    hidden.map((group) => [group.id, group.findings.map((f) => f.id)]),
+    [
+      ["app", ["update"]],
+      ["partial", ["gap"]],
+    ],
+  );
+  assert.equal(hidden[1]!.evidence.status, "partial", "Snoozing never turns a gap into clean");
+  assert.deepEqual(
+    attentionGroups(snapshot, "suppressed", "LEFT-PAD").map((group) => group.id),
+    ["app"],
+    "Search narrows the hidden view like the others",
+  );
+  assert.equal(suppressedCount(snapshot), 2);
+  assert.equal(suppressedCount({ findings: [advisory] }), 0);
+  assert.deepEqual(attentionSearch({ filter: "suppressed" }), { filter: "suppressed" });
+
+  // The date reads in local time, so the expected label comes from the same formatter.
+  const day = new Intl.DateTimeFormat("en", { month: "short", day: "numeric" });
+  assert.equal(
+    ruleLabel(snapshot.findingRules![0]!),
+    `Snoozed until ${day.format(new Date("2026-11-07T12:00:00.000Z"))}`,
+  );
+  // It is the owner's local day even when UTC is already on another one, in any zone.
+  for (const hour of [0, 23])
+    assert.equal(
+      ruleLabel({ mode: "snooze", until: new Date(2026, 10, 7, hour, 30).toISOString() }),
+      "Snoozed until Nov 7",
+    );
+  assert.equal(
+    ruleLabel({ mode: "snooze", untilVersion: "1.3.0" }),
+    "Snoozed until a version newer than 1.3.0",
+  );
+  assert.equal(
+    ruleLabel({ mode: "ignore", reason: "Pinned for compatibility" }),
+    "Ignored: Pinned for compatibility",
+  );
+  assert.equal(ruleLabel({ mode: "ignore" }), "Ignored");
+  // A rule without a readable end never throws while the page renders.
+  assert.equal(ruleLabel({ mode: "snooze" }), "Snoozed");
+  assert.equal(ruleLabel({ mode: "snooze", until: "not a date" }), "Snoozed");
+});
+
+test("a snoozed gap on This PC leaves the incomplete count and keeps its failed status", () => {
+  const complete: ScanEvidence = {
+    status: "complete",
+    lastAttempt: "2026-10-08T12:00:00Z",
+    lastSuccess: "2026-10-08T12:00:00Z",
+    coverage: [],
+    errors: [],
+  };
+  const gap: Finding = {
+    id: "pc-gap",
+    kind: "coverage",
+    subjectId: "pc",
+    subjectLabel: "PC",
+    name: "Incomplete checks",
+    packageName: null,
+    installedVersion: null,
+    availableVersion: null,
+    severity: "unknown",
+    source: "Global tool collector",
+    description: "npm could not be run.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T12:00:00Z",
+    lastSeenAt: "2026-10-08T12:00:00Z",
+  };
+  const snapshot = (findings: Finding[]): MonitoringSnapshot => ({
+    protocolVersion: 1,
+    runtime: {
+      startedAt: "2026-10-08T12:00:00Z",
+      mode: "interactive",
+      host: "session",
+      platform: "win32",
+      nextScanAt: null,
+    },
+    device: { id: "pc", label: "PC", platform: "win32" },
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+    inventory: {
+      evidence: { ...complete, status: "failed", errors: ["npm could not be run."] },
+      updateEvidence: complete,
+      installations: [],
+    },
+    projects: [],
+    findings,
+    history: [],
+    notifications: [],
+  });
+  assert.equal(attentionGroups(snapshot([gap]), "coverage")[0]!.counts.incomplete, 1);
+  // Only a snoozed gap lifts the count: a snoozed update never hides that the target is incomplete.
+  const update: Finding = {
+    ...gap,
+    id: "pc-update",
+    kind: "update",
+    name: "tsx",
+    packageName: "tsx",
+    installedVersion: "4.0.0",
+    availableVersion: "4.1.0",
+    severity: "info",
+    source: "npm global",
+    description: "A newer version is available.",
+    ruleId: "update-snooze",
+  };
+  assert.equal(attentionGroups(snapshot([update]), "coverage")[0]!.counts.incomplete, 1);
+  const hidden = snapshot([{ ...gap, ruleId: "gap-snooze" }]);
+  assert.deepEqual(attentionGroups(hidden), []);
+  assert.deepEqual(attentionGroups(hidden, "coverage"), []);
+  const view = attentionGroups(hidden, "suppressed");
+  assert.deepEqual(
+    view.map((group) => [group.id, group.findings.map((f) => f.id)]),
+    [["pc", ["pc-gap"]]],
+  );
+  assert.equal(view[0]!.evidence.status, "failed", "Snoozing never turns a gap into clean");
+});
+
+test("snooze choices offer 7, 30 and 90 days, a newer version only for a SemVer update, and incomplete checks cannot be ignored", () => {
+  const update = { kind: "update", availableVersion: "1.3.0" } as const;
+  assert.deepEqual(
+    snoozeChoices(update).map((choice) => choice.label),
+    [
+      "Snooze 7 days",
+      "Snooze 30 days",
+      "Snooze 90 days",
+      "Snooze until a version newer than 1.3.0",
+    ],
+  );
+  assert.deepEqual(snoozeChoices(update)[0]!.body, { mode: "snooze", days: 7 });
+  assert.deepEqual(snoozeChoices(update)[3]!.body, { mode: "snooze", untilNewerVersion: true });
+  assert.deepEqual(
+    snoozeChoices(update)
+      .slice(0, 3)
+      .map((choice) => choice.body),
+    [
+      { mode: "snooze", days: 7 },
+      { mode: "snooze", days: 30 },
+      { mode: "snooze", days: 90 },
+    ],
+  );
+  // A prerelease is still SemVer, so the snooze can wait for something newer than it.
+  assert.equal(snoozeChoices({ kind: "update", availableVersion: "2.0.0-rc.1" }).length, 4);
+  // Without a SemVer candidate there is nothing to wait past.
+  assert.equal(snoozeChoices({ kind: "update", availableVersion: "latest" }).length, 3);
+  assert.equal(snoozeChoices({ kind: "update", availableVersion: "v1.3.0" }).length, 3);
+  assert.equal(snoozeChoices({ kind: "update", availableVersion: null }).length, 3);
+  // Only an update has a candidate to wait past; every other kind snoozes by days alone.
+  for (const kind of ["advisory", "lifecycle", "coverage", "other"] as const)
+    assert.equal(snoozeChoices({ kind, availableVersion: "1.2.0" }).length, 3, kind);
+  assert.equal(canIgnore({ kind: "coverage" }), false);
+  for (const kind of ["update", "advisory", "lifecycle", "other"] as const)
+    assert.equal(canIgnore({ kind }), true, kind);
+});
+
+test("a dependency whose update a snooze or ignore rule hides is held out of bulk commands", () => {
+  const zod: Dependency = {
+    id: "zod",
+    name: "zod",
+    packageName: "zod",
+    requested: "^3.22.0",
+    resolved: "3.22.0",
+    origin: "registry",
+    role: "production",
+    importer: ".",
+    availableVersion: "3.25.0",
+    latestVersion: null,
+    versionStatus: "checked",
+    advisoryStatus: "checked",
+    advisoryIds: [],
+  };
+  const lodash: Dependency = {
+    ...zod,
+    id: "lodash",
+    name: "lodash",
+    packageName: "lodash",
+    resolved: "4.17.20",
+    availableVersion: "4.17.21",
+  };
+  // Nothing was found for it, so nothing holds it.
+  const quiet: Dependency = { ...zod, id: "quiet", name: "quiet", packageName: "quiet" };
+  const update = (dependency: Dependency, ruleId?: string): Finding => ({
+    id: `update-${dependency.id}`,
+    kind: "update",
+    subjectId: "project",
+    subjectLabel: "Project",
+    name: dependency.name,
+    packageName: dependency.packageName,
+    installedVersion: dependency.resolved,
+    availableVersion: dependency.availableVersion,
+    severity: "info",
+    source: "npm registry",
+    description: "A newer version satisfies the requested range.",
+    advisoryUrl: null,
+    detectedAt: "2026-10-08T00:00:00Z",
+    lastSeenAt: "2026-10-08T00:00:00Z",
+    ...(ruleId === undefined ? {} : { ruleId }),
+  });
+  const project = { dependencies: [zod, lodash, quiet] };
+  assert.deepEqual(
+    [...heldDependencies(project, [update(zod, "snooze-1"), update(lodash)])],
+    ["zod"],
+  );
+  assert.deepEqual([...heldDependencies(project, [update(zod), update(lodash)])], []);
+  // Only a hidden update for the candidate the package has now holds it: a hidden advisory or
+  // deprecation notice leaves the update available, and so does a rule for another version.
+  assert.deepEqual(
+    [
+      ...heldDependencies(project, [
+        { ...update(zod, "ignore-1"), kind: "advisory" },
+        { ...update(lodash, "ignore-2"), kind: "lifecycle" },
+        { ...update(zod, "snooze-3"), availableVersion: "3.26.0" },
+      ]),
+    ],
+    [],
+  );
+});
+
+test("New since last scan compares detection with each target's previous success; Resolved lists resolved findings", () => {
+  const evidence = (previousSuccess?: string | null): ScanEvidence => ({
+    status: "complete",
+    lastAttempt: "2026-10-08T10:00:00Z",
+    lastSuccess: "2026-10-08T10:05:00Z",
+    ...(previousSuccess === undefined ? {} : { previousSuccess }),
+    coverage: [],
+    errors: [],
+  });
+  const project = (id: string, previousSuccess?: string | null): Project => ({
+    id,
+    name: id,
+    path: `C:\\${id}`,
+    mode: "maintained",
+    packageManager: "npm",
+    manifestPath: null,
+    lockfilePath: null,
+    evidence: evidence(previousSuccess),
+    dependencies: [],
+    createdAt: "2026-10-01T00:00:00Z",
+  });
+  const finding = (
+    subjectId: string,
+    id: string,
+    detectedAt: string,
+    extra: Partial<Finding> = {},
+  ): Finding => ({
+    id,
+    kind: "update",
+    subjectId,
+    subjectLabel: subjectId,
+    name: id,
+    packageName: id,
+    installedVersion: "1.0.0",
+    availableVersion: "1.1.0",
+    severity: "info",
+    source: "npm registry",
+    description: "A newer version satisfies the requested range.",
+    advisoryUrl: null,
+    detectedAt,
+    lastSeenAt: detectedAt,
+    ...extra,
+  });
+  const snapshot: MonitoringSnapshot = {
+    protocolVersion: 1,
+    runtime: {
+      startedAt: "2026-10-08T00:00:00Z",
+      mode: "interactive",
+      host: "session",
+      platform: "win32",
+      nextScanAt: null,
+    },
+    device: { id: "pc", label: "My PC", platform: "win32" },
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+    inventory: { evidence: evidence("2026-10-07T10:05:00Z"), installations: [] },
+    projects: [
+      project("compared", "2026-10-07T10:05:00Z"),
+      project("first", null),
+      project("older"),
+    ],
+    findings: [
+      finding("pc", "pc-new", "2026-10-08T10:01:00Z"),
+      finding("pc", "pc-old", "2026-10-01T09:00:00Z"),
+      finding("compared", "compared-new", "2026-10-08T10:02:00Z"),
+      finding("compared", "compared-snoozed", "2026-10-08T10:02:00Z", { ruleId: "rule-1" }),
+      finding("first", "first-any", "2026-10-01T09:00:00Z"),
+      finding("older", "older-unknown", "2026-10-08T10:03:00Z"),
+    ],
+    resolvedFindings: [
+      {
+        ...finding("compared", "compared-fixed", "2026-10-01T09:00:00Z", {
+          kind: "advisory",
+          severity: "high",
+        }),
+        resolvedAt: "2026-10-08T10:05:00Z",
+      },
+      {
+        ...finding("removed", "removed-fixed", "2026-10-01T09:00:00Z"),
+        resolvedAt: "2026-10-08T10:05:00Z",
+      },
+    ],
+    history: [],
+    notifications: [],
+  };
+  const ids = (filter: AttentionFilter, query = "") =>
+    attentionGroups(snapshot, filter, query).flatMap((group) => group.findings.map((f) => f.id));
+  // Null: the latest success was the first, so all is new. Absent: unknown, so nothing is claimed.
+  assert.deepEqual(ids("new"), ["pc-new", "compared-new", "first-any"]);
+  assert.deepEqual(ids("resolved"), ["compared-fixed"], "a removed target's history is not shown");
+  assert.deepEqual(ids("resolved", "nothing like this"), []);
+  assert.ok(!ids("all").includes("compared-fixed"), "resolved findings are not current findings");
+  assert.equal(isNewFinding({ detectedAt: "2026-10-08T10:02:00Z" }, undefined), false);
+  assert.equal(isNewFinding({ detectedAt: "2026-10-01T00:00:00Z" }, null), true);
+  // Detected at the previous success is not after it; a time that cannot be read claims nothing.
+  assert.equal(isNewFinding({ detectedAt: "2026-10-07T10:05:00Z" }, "2026-10-07T10:05:00Z"), false);
+  assert.equal(isNewFinding({ detectedAt: "2026-10-07T10:05:01Z" }, "2026-10-07T10:05:00Z"), true);
+  assert.equal(isNewFinding({ detectedAt: "not a time" }, "2026-10-07T10:05:00Z"), false);
+  assert.equal(isNewFinding({ detectedAt: "2026-10-08T10:02:00Z" }, "not a time"), false);
+  assert.equal(
+    findingTotal(
+      attentionGroups(snapshot, "new").flatMap((g) => g.findings),
+      "pc",
+    ),
+    3,
+  );
+  // A tab badge counts every kind: updates, advisories, lifecycle, unknown kinds and incomplete checks.
+  assert.equal(
+    findingTotal(
+      (["update", "advisory", "lifecycle", "other", "coverage"] as const).map((kind) =>
+        finding("compared", kind, "2026-10-08T10:02:00Z", { kind }),
+      ),
+      "pc",
+    ),
+    5,
+  );
+  assert.deepEqual(attentionSearch({ filter: "new" }), { filter: "new" });
+  assert.deepEqual(attentionSearch({ filter: "resolved" }), { filter: "resolved" });
+  assert.deepEqual(attentionSearch({ filter: "recent" }), {});
+  // This PC compares against its inventory's previous success even while its update checks are
+  // incomplete, and a target with nothing new or resolved stays out of both views however incomplete
+  // it is.
+  const incomplete = (status: ScanEvidence["status"]): ScanEvidence => ({
+    ...evidence(),
+    status,
+    errors: ["A check did not finish."],
+  });
+  const gaps: MonitoringSnapshot = {
+    ...snapshot,
+    inventory: { ...snapshot.inventory, updateEvidence: incomplete("partial") },
+    projects: [...snapshot.projects, { ...project("failing"), evidence: incomplete("failed") }],
+  };
+  const gapGroups = (filter: AttentionFilter) =>
+    attentionGroups(gaps, filter).map((group) => group.id);
+  assert.deepEqual(gapGroups("new"), ["pc", "compared", "first"]);
+  assert.deepEqual(gapGroups("resolved"), ["compared"]);
+});
+
+test("a connected PC's evidence fills neither Snoozed & ignored nor Resolved", () => {
+  assert.equal(localOnlyFilter("suppressed"), true);
+  assert.equal(localOnlyFilter("resolved"), true);
+  for (const filter of ["all", "new", "updates", "advisories", "lifecycle", "coverage"] as const)
+    assert.equal(localOnlyFilter(filter), false, filter);
+});
+
+test("Retry failed checks counts targets whose last attempt failed or left gaps, never unscanned ones", () => {
+  const evidence = (status: ScanEvidence["status"]): ScanEvidence => ({
+    status,
+    lastAttempt: null,
+    lastSuccess: null,
+    coverage: [],
+    errors: [],
+  });
+  const projects = (
+    ["failed", "partial", "complete", "not-scanned", "scanning", "unsupported"] as const
+  ).map((status) => ({ evidence: evidence(status) }));
+  assert.equal(failedTargetCount({ inventory: { evidence: evidence("complete") }, projects }), 2);
+  assert.equal(
+    failedTargetCount({
+      inventory: { evidence: evidence("complete"), updateEvidence: evidence("partial") },
+      projects: [],
+    }),
+    1,
+  );
+  assert.equal(
+    failedTargetCount({
+      inventory: { evidence: evidence("failed"), updateEvidence: evidence("failed") },
+      projects: [],
+    }),
+    1,
+    "This PC is one target",
+  );
+  assert.equal(
+    failedTargetCount({ inventory: { evidence: evidence("partial") }, projects }),
+    3,
+    "This PC and its projects add up",
+  );
+  assert.equal(
+    failedTargetCount({ inventory: { evidence: evidence("not-scanned") }, projects: [] }),
+    0,
+  );
+});
+
+test("the Background service page says what waits for delivery and why, counting only what can still notify", () => {
+  const base: Pick<MonitoringSnapshot, "notifications" | "settings"> = {
+    notifications: [
+      {
+        id: "event",
+        findingId: "finding",
+        title: "App: left-pad",
+        body: "A newer version satisfies the requested range.",
+        createdAt: "2026-10-08T12:00:00Z",
+        deliveredAt: null,
+      },
+    ],
+    settings: {
+      paused: false,
+      pcIntervalMinutes: 60,
+      projectIntervalMinutes: 60,
+      notifyNewFindings: true,
+    },
+  };
+  const summary: NotificationSummary = {
+    id: "summary",
+    updateCount: 2,
+    newUpdateCount: 1,
+    projectCount: 1,
+    pcCount: 0,
+    advisoryCount: 0,
+    newAdvisoryCount: 0,
+    title: "2 updates available",
+    body: "1 newly detected update.",
+    filter: "updates",
+  };
+  // A coordinator that reports no count: every undelivered event waits.
+  assert.deepEqual(deliveryStatus(base), {
+    text: "New findings are being combined into the next summary.",
+    pending: true,
+  });
+  // The coordinator's count leaves out events whose findings are hidden or outside Notify about.
+  assert.deepEqual(deliveryStatus({ ...base, notificationsWaiting: 0 }), {
+    text: "No new findings are waiting.",
+    pending: false,
+  });
+  assert.equal(
+    deliveryStatus({
+      ...base,
+      notificationsWaiting: 1,
+      settings: { ...base.settings, digestAt: "18:00" },
+    }).text,
+    "New findings are waiting for the daily digest at 18:00.",
+  );
+  assert.deepEqual(
+    deliveryStatus({ ...base, notificationsWaiting: 1, notificationSummary: summary }),
+    {
+      text: "2 updates and 0 advisory findings are ready to review.",
+      pending: true,
+    },
+  );
+  assert.equal(
+    deliveryStatus({
+      ...base,
+      notificationsWaiting: 1,
+      notificationSummary: { ...summary, quiet: true },
+    }).text,
+    "2 updates and 0 advisory findings are ready to review. The desktop notification waits until quiet hours end.",
+  );
 });

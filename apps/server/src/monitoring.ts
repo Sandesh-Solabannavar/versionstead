@@ -4,8 +4,12 @@ import { validateProjectChanges } from "@versionstead/contracts/project-settings
 import {
   decodeMonitoringProgress,
   decodeMonitoringSnapshot,
+  isHourMinute,
+  notificationScopes,
   type ActiveScan,
+  type CreateFindingRule,
   type Finding,
+  type FindingRule,
   type GlobalToolSource,
   type MonitoringProgress,
   type MonitoringSettings,
@@ -17,7 +21,10 @@ import {
   type ScanRecord,
   type ScanTarget,
 } from "@versionstead/contracts/monitoring";
-import { MonitoringStorage } from "./storage.ts";
+import { MonitoringStorage, type StoredMonitoring } from "./storage.ts";
+import { createRule, expiredRuleIds, matchingRule, ruleIndex, scopeKey } from "./finding-rules.ts";
+import { inQuietHours, latestDailyTime, notificationEligible } from "./notification-policy.ts";
+import { keepResolved, newlyResolved, resolvedDays } from "./resolved-findings.ts";
 import {
   identity,
   InputError,
@@ -33,7 +40,17 @@ import {
   lookupDependencies,
   type DependencyLookup,
   type LookupResult,
+  type PackageSignals,
 } from "./adapters/lookups.ts";
+import {
+  lifecycleLabels,
+  lifecycleVerdict,
+  loadLifecycle,
+  type DeclaredRuntime,
+  type LifecycleProduct,
+} from "./adapters/lifecycle.ts";
+import { lookupReleaseFacts } from "./adapters/release-facts.ts";
+import { pcRuntimes } from "./adapters/runtimes.ts";
 export { InputError } from "./adapters/projects.ts";
 
 type Mutable<T> = T extends readonly (infer U)[]
@@ -42,8 +59,12 @@ type Mutable<T> = T extends readonly (infer U)[]
     ? { -readonly [K in keyof T]: Mutable<T[K]> }
     : T;
 const timestamp = () => new Date().toISOString();
-const features = "settings-repositories-connections-v9" as const;
+export const features = "settings-repositories-connections-v10" as const;
 const evidenceNotSaved = "Evidence could not be saved; the previous saved evidence is retained.";
+const cancelledByOwner = "Cancelled by you";
+// What Retry failed checks rescans: a target whose last attempt failed or left gaps.
+const retryable = (evidence: ScanEvidence | undefined) =>
+  evidence?.status === "failed" || evidence?.status === "partial";
 const emptyEvidence = (): Mutable<ScanEvidence> => ({
   status: "not-scanned",
   lastAttempt: null,
@@ -51,6 +72,31 @@ const emptyEvidence = (): Mutable<ScanEvidence> => ({
   coverage: [],
   errors: [],
 });
+
+/**
+ * The update finding with the install-script and deprecated-candidate answers read in this scan. An
+ * answer this scan did not read (no metadata, or one the metadata could not give: null for the
+ * install script, undefined for the candidate) keeps the previous finding's, and one neither has is
+ * left out (shown as "Not checked"), never written as "none" or "not deprecated".
+ * ponytail: a kept answer has no age of its own, and only the incomplete-check error says that the
+ * read failed; record when each answer was read if the app should show how old it is.
+ */
+function withSignals(
+  update: Finding,
+  signals: PackageSignals | undefined,
+  previous: Finding | undefined,
+): Finding {
+  const installScript = signals?.installScript ?? previous?.installScript;
+  const candidateDeprecated =
+    signals?.candidateDeprecated === undefined
+      ? previous?.candidateDeprecated
+      : signals.candidateDeprecated;
+  return {
+    ...update,
+    ...(typeof installScript === "boolean" ? { installScript } : {}),
+    ...(candidateDeprecated !== undefined ? { candidateDeprecated } : {}),
+  };
+}
 
 export type MonitoringOptions = {
   dataDir: string;
@@ -61,6 +107,10 @@ export type MonitoringOptions = {
   dependencyLookup?: DependencyLookup;
   inventoryLookup?: typeof inspectInventory;
   nativeVersionLookup?: typeof checkNativeVersions | false;
+  /** Fetch for endoflife.date and deps.dev; absent disables both (tests), and bin.ts passes fetch. */
+  sourceFetch?: typeof fetch;
+  /** The coordinator clock for rules and notification timing; tests pass a controllable one. */
+  now?: () => number;
 };
 
 export class MonitoringCoordinator {
@@ -68,6 +118,7 @@ export class MonitoringCoordinator {
     inspectProject(project.path, signal);
   private automaticProjectAllowed = (_project: Project) => true;
   private readonly storage: MonitoringStorage;
+  private readonly now: () => number;
   private state: Mutable<MonitoringSnapshot>;
   private due: Record<string, number>;
   private notified: Set<string>;
@@ -79,22 +130,39 @@ export class MonitoringCoordinator {
   private closed = false;
   private readonly lookup: DependencyLookup | null;
   private readonly inventoryLookup: typeof inspectInventory;
+  private readonly sourceFetch: typeof fetch | null;
+  // When each endoflife.date product last failed; a failed product waits an hour.
+  private readonly lifecycleAttempts = new Map<LifecycleProduct, number>();
   private readonly shutdown = new AbortController();
   private progress: Mutable<ActiveScan> | null = null;
   // A random boot id keeps revisions of different instances on one database distinct.
   private readonly bootId = randomUUID();
   private changes = 0;
   private stable: { revision: string; json: string } | null = null;
-  private settledAt = Date.now();
+  private settledAt: number;
   private readonly summaries: {
     summary: NotificationSummary;
     notificationIds: string[];
     acknowledged: boolean;
   }[] = [];
+  // Summaries read outside quiet hours (id to the events each covered), so a receipt that arrives after
+  // a quiet-hours read has replaced the id still consumes exactly what was shown. The newest 20.
+  private readonly offered = new Map<string, string[]>();
 
   constructor(options: MonitoringOptions) {
+    this.now = options.now ?? Date.now;
+    this.settledAt = this.now();
     this.storage = new MonitoringStorage(options.dataDir);
-    const stored = this.storage.read();
+    let stored: StoredMonitoring | null;
+    try {
+      stored = this.storage.read();
+    } catch (error) {
+      // Nothing is left to close the database once the constructor throws, and Windows cannot delete
+      // an open one. ponytail: only a failed read() is covered, not the cooldown check or persist()
+      // below (bin.ts exits on those); wrap the whole constructor if a caller outlives one.
+      this.storage.close();
+      throw error;
+    }
     const platform = options.platform ?? process.platform;
     const nativeVersionLookup =
       options.nativeVersionLookup === false
@@ -129,6 +197,7 @@ export class MonitoringCoordinator {
       options.inventoryLookup ??
       ((scanPlatform, mode, signal, progress, previous) =>
         inspectInventory(scanPlatform, mode, signal, progress, previous, sources));
+    this.sourceFetch = options.sourceFetch ?? null;
     this.state = stored
       ? (structuredClone(stored.snapshot) as Mutable<MonitoringSnapshot>)
       : {
@@ -189,6 +258,21 @@ export class MonitoringCoordinator {
     this.state.inventory.managers ??= [];
     this.state.inventory.updateEvidence ??= emptyEvidence();
     this.state.notificationNextAt ??= null;
+    // ponytail: resolved history shares the meta row (500 findings: about 325 KiB typically, over
+    // 2 MiB at worst, as an advisory summary can run to 4,096 characters); give it its own rows if
+    // saves measurably slow
+    this.state.resolvedFindings = keepResolved(
+      this.state.resolvedFindings ?? [],
+      this.state.findings,
+      this.now(),
+    );
+    this.state.findingRules ??= [];
+    this.state.settings.notificationScope ??= "all";
+    this.state.settings.notifyWatchOnly ??= false;
+    this.state.settings.quietHours ??= null;
+    this.state.settings.digestAt ??= null;
+    this.state.settings.releaseCooldownDays ??= 3;
+    this.state.settings.useDepsDev ??= true;
     if (
       this.state.notificationNextAt !== null &&
       !Number.isFinite(Date.parse(this.state.notificationNextAt))
@@ -228,6 +312,8 @@ export class MonitoringCoordinator {
     return structuredClone({
       ...this.state,
       features,
+      findings: this.annotatedFindings(),
+      notificationsWaiting: this.waitingNotifications(),
       scanProgress: this.scanProgress(),
       notificationSummary: this.prepareNotificationSummary(),
     });
@@ -261,7 +347,14 @@ export class MonitoringCoordinator {
     if (this.stable?.revision !== revision)
       this.stable = {
         revision,
-        json: JSON.stringify(decodeMonitoringSnapshot({ ...this.state, features })),
+        json: JSON.stringify(
+          decodeMonitoringSnapshot({
+            ...this.state,
+            features,
+            findings: this.annotatedFindings(),
+            notificationsWaiting: this.waitingNotifications(),
+          }),
+        ),
       };
     const { scanProgress, notificationSummary } = this.progressSnapshot();
     return `${this.stable.json.slice(0, -1)},"scanProgress":${JSON.stringify(scanProgress)},"notificationSummary":${JSON.stringify(notificationSummary)}}`;
@@ -386,6 +479,9 @@ export class MonitoringCoordinator {
     this.state.projects = this.state.projects.filter((p) => p.id !== id);
     const removed = new Set(this.state.findings.filter((f) => f.subjectId === id).map((f) => f.id));
     this.state.findings = this.state.findings.filter((f) => f.subjectId !== id);
+    this.state.resolvedFindings = (this.state.resolvedFindings ?? []).filter(
+      (f) => f.subjectId !== id,
+    );
     this.state.notifications = this.state.notifications.filter((n) => !removed.has(n.findingId));
     this.queue.delete(id);
     delete this.due[id];
@@ -393,11 +489,25 @@ export class MonitoringCoordinator {
     this.persist();
   }
 
-  requestScan(input: { target: "pc" | "projects" | "all"; projectId?: string }): void {
+  requestScan(input: { target: "pc" | "projects" | "all" | "failed"; projectId?: string }): void {
     this.assertOpen();
-    if (!["pc", "projects", "all"].includes(input.target))
+    if (
+      !["pc", "projects", "all", "failed"].includes(input.target) ||
+      (input.target === "failed" && input.projectId !== undefined)
+    )
       throw new InputError("Invalid scan target.");
-    if (input.projectId) {
+    if (input.target === "failed") {
+      // Decided now, not when the page counted: a removed or recovered target is not rescanned. Nor
+      // is This PC while its scan finishes: its update checks already read final then. A project
+      // reads "scanning" for its whole scan, so it is never retryable meanwhile.
+      if (
+        this.active !== "pc" &&
+        (retryable(this.state.inventory.evidence) || retryable(this.state.inventory.updateEvidence))
+      )
+        this.enqueue("pc", true);
+      for (const project of this.state.projects)
+        if (retryable(project.evidence)) this.enqueue(project.id, true);
+    } else if (input.projectId) {
       this.project(input.projectId);
       this.enqueue(input.projectId, true);
     } else {
@@ -406,6 +516,16 @@ export class MonitoringCoordinator {
         for (const project of this.state.projects) this.enqueue(project.id, true);
     }
     this.runQueue();
+  }
+
+  /** Stops the running scan `scanId` before it writes evidence; its attempt records "Cancelled by you". */
+  cancelScan(scanId: string): void {
+    this.assertOpen();
+    if (this.progress?.scanId !== scanId)
+      throw new InputError("This scan already finished; its results are kept.");
+    if (this.progress.writing)
+      throw new InputError("This scan is saving its results and can no longer be cancelled.");
+    this.activeScan?.abort(cancelledByOwner);
   }
 
   changeSettings(input: Partial<MonitoringSettings>): MonitoringSettings {
@@ -419,11 +539,39 @@ export class MonitoringCoordinator {
       }
     }
     if (
+      input.releaseCooldownDays !== undefined &&
+      (!Number.isInteger(input.releaseCooldownDays) ||
+        input.releaseCooldownDays < 0 ||
+        input.releaseCooldownDays > 30)
+    )
+      throw new InputError("The release cooldown must be a whole number of days from 0 to 30.");
+    if (
       (input.paused !== undefined && typeof input.paused !== "boolean") ||
-      (input.notifyNewFindings !== undefined && typeof input.notifyNewFindings !== "boolean")
+      (input.notifyNewFindings !== undefined && typeof input.notifyNewFindings !== "boolean") ||
+      (input.useDepsDev !== undefined && typeof input.useDepsDev !== "boolean")
     )
       throw new InputError("Invalid monitoring settings.");
+    if (
+      (input.notificationScope !== undefined &&
+        !notificationScopes.includes(input.notificationScope)) ||
+      (input.notifyWatchOnly !== undefined && typeof input.notifyWatchOnly !== "boolean")
+    )
+      throw new InputError("Invalid monitoring settings.");
+    // The type is checked here too: a direct call must not store a value the next start refuses to read.
+    if (
+      input.quietHours !== undefined &&
+      input.quietHours !== null &&
+      (!isHourMinute(input.quietHours.start) ||
+        !isHourMinute(input.quietHours.end) ||
+        input.quietHours.start === input.quietHours.end)
+    )
+      throw new InputError("Quiet hours need different start and end times (HH:MM).");
+    if (input.digestAt !== undefined && input.digestAt !== null && !isHourMinute(input.digestAt))
+      throw new InputError("The digest time must be HH:MM.");
     this.state.settings = { ...this.state.settings, ...input };
+    // Keep a copy of the window, not the caller's object, and only its two times.
+    if (input.quietHours)
+      this.state.settings.quietHours = { start: input.quietHours.start, end: input.quietHours.end };
     if (input.paused === true)
       for (const [id, manual] of this.queue) if (!manual) this.queue.delete(id);
     // A changed interval applies from the last attempt; overdue work is coalesced once on resume.
@@ -471,20 +619,48 @@ export class MonitoringCoordinator {
   acknowledgeNotificationSummary(id: string): void {
     this.assertOpen();
     const frozen = this.summaries.find((s) => s.summary.id === id);
-    if (!frozen) throw new InputError("The notification summary is no longer available.");
-    if (frozen.acknowledged) return;
-    const ids = new Set(frozen.notificationIds);
-    const deliveredAt = timestamp();
+    // A summary read outside quiet hours and since replaced by a quiet-hours read is receipted by the
+    // events it covered, which is all the desktop showed.
+    const covered = frozen?.notificationIds ?? this.offered.get(id);
+    if (!covered) throw new InputError("The notification summary is no longer available.");
+    if (frozen?.acknowledged) return;
+    this.offered.delete(id);
+    const ids = new Set(covered);
+    const deliveredAt = new Date(this.now()).toISOString();
     let presented = 0;
     for (const event of this.state.notifications)
       if (event.deliveredAt === null && ids.has(event.id)) {
         event.deliveredAt = deliveredAt;
         presented += 1;
       }
-    if (presented) this.state.notificationNextAt = new Date(Date.now() + 5 * 60000).toISOString();
+    if (presented) this.state.notificationNextAt = new Date(this.now() + 5 * 60000).toISOString();
     this.pruneNotifications();
     this.persist();
-    frozen.acknowledged = true;
+    if (frozen) frozen.acknowledged = true;
+  }
+
+  /** Snoozes or ignores a finding's scope; a rule for the same scope is replaced. */
+  addFindingRule(request: CreateFindingRule): FindingRule {
+    this.assertOpen();
+    const finding = this.state.findings.find((item) => item.id === request.findingId);
+    if (!finding) throw new InputError("The finding no longer exists. Refresh and try again.");
+    const rule = createRule(request, finding, this.now(), randomUUID());
+    const key = scopeKey(rule.scope);
+    const others = (this.state.findingRules ?? []).filter((item) => scopeKey(item.scope) !== key);
+    if (others.length >= 500)
+      throw new InputError("At most 500 snooze and ignore rules are supported. Remove one first.");
+    this.state.findingRules = [...others, rule];
+    this.persist();
+    return structuredClone(rule);
+  }
+
+  removeFindingRule(id: string): void {
+    this.assertOpen();
+    const rules = this.state.findingRules ?? [];
+    if (!rules.some((rule) => rule.id === id))
+      throw new InputError("The snooze or ignore rule no longer exists.");
+    this.state.findingRules = rules.filter((rule) => rule.id !== id);
+    this.persist();
   }
 
   async close(): Promise<void> {
@@ -505,6 +681,17 @@ export class MonitoringCoordinator {
     const project = this.state.projects.find((p) => p.id === id);
     if (!project) throw new InputError("The selected project no longer exists.");
     return project;
+  }
+  /**
+   * The scan starts writing evidence here: an abort that came first (removal, Cancel, shutdown)
+   * stops it, and from now on Cancel is refused, so a scan never ends half-written.
+   */
+  private commit(signal: AbortSignal) {
+    if (signal.aborted)
+      throw new InputError(
+        "The scan stopped before it finished; previous successful evidence is retained.",
+      );
+    if (this.progress) this.progress = { ...this.progress, writing: true };
   }
   private nextDue(evidence: ScanEvidence, interval: number) {
     return evidence.lastAttempt ? Date.parse(evidence.lastAttempt) + interval * 60000 : Date.now();
@@ -532,6 +719,72 @@ export class MonitoringCoordinator {
     this.updateNextDue();
     this.storage.write({ snapshot: this.state, due: this.due, notified: [...this.notified] });
   }
+  /** Findings with the id of the snooze or ignore rule that hides each one now. */
+  private annotatedFindings(): Finding[] {
+    // ponytail: a date that passes is shown hidden in the cached JSON for up to one tick, until
+    // pruneRules advances the revision; compute the annotation per request if that ever matters.
+    const rules = this.state.findingRules ?? [];
+    if (!rules.length) return this.state.findings;
+    const index = ruleIndex(rules);
+    const now = this.now();
+    return this.state.findings.map((finding) => {
+      const rule = matchingRule(index, finding, now);
+      return rule ? { ...finding, ruleId: rule.id } : finding;
+    });
+  }
+  /** Removes rules that no longer apply; runs every tick, paused or not. */
+  private pruneRules() {
+    const rules = this.state.findingRules ?? [];
+    if (!rules.length) return;
+    const subjects = new Set([this.state.device.id, ...this.state.projects.map((p) => p.id)]);
+    const expired = expiredRuleIds(rules, this.state.findings, subjects, this.now());
+    if (!expired.size) return;
+    this.state.findingRules = rules.filter((rule) => !expired.has(rule.id));
+    try {
+      this.persist();
+    } catch {
+      // Matching already ignores these rules; a later durable write saves the removal.
+    }
+  }
+  /** Drops resolved findings older than 30 days; runs every tick, paused or not. */
+  private pruneResolved() {
+    const oldest = this.state.resolvedFindings?.at(-1);
+    if (!oldest || Date.parse(oldest.resolvedAt) >= this.now() - resolvedDays * 86_400_000) return;
+    this.state.resolvedFindings = keepResolved(
+      this.state.resolvedFindings!,
+      this.state.findings,
+      this.now(),
+    );
+    try {
+      this.persist();
+    } catch {
+      // Memory already dropped them; a later durable write saves the removal.
+    }
+  }
+  /** Whether a finding may notify now: its kind, its project's maintenance mode, "Notify about", and rules. */
+  private notificationFilter(): (finding: Finding) => boolean {
+    const index = ruleIndex(this.state.findingRules ?? []);
+    const now = this.now();
+    const modes = new Map(this.state.projects.map((project) => [project.id, project.mode]));
+    return (finding) =>
+      notificationEligible(
+        finding,
+        this.state.settings,
+        modes.get(finding.subjectId) ?? null,
+        matchingRule(index, finding, now) !== undefined,
+      );
+  }
+  /** Pending events whose findings may notify now, whatever the timing; the rest wait outside any summary. */
+  private waitingNotifications(): number {
+    // With "Notify about new findings" off nothing is summarized, so nothing waits.
+    if (!this.state.settings.notifyNewFindings) return 0;
+    const findings = new Map(this.state.findings.map((f) => [f.id, f]));
+    const eligible = this.notificationFilter();
+    return this.state.notifications.filter((n) => {
+      const finding = findings.get(n.findingId);
+      return n.deliveredAt === null && finding !== undefined && eligible(finding);
+    }).length;
+  }
   private scanProgress(): ScanProgress {
     return {
       active: this.progress,
@@ -550,7 +803,10 @@ export class MonitoringCoordinator {
     if (id !== this.active || manual) this.queue.set(id, manual || this.queue.get(id) === true);
   }
   private schedule() {
-    if (this.closed || this.state.settings.paused) return;
+    if (this.closed) return;
+    this.pruneRules();
+    this.pruneResolved();
+    if (this.state.settings.paused) return;
     for (const [id, due] of Object.entries(this.due))
       if (due <= Date.now() && this.scansAutomatically(id)) this.enqueue(id);
     this.runQueue();
@@ -579,7 +835,7 @@ export class MonitoringCoordinator {
         this.worker = null;
         this.active = null;
         this.progress = null;
-        this.settledAt = Date.now();
+        this.settledAt = this.now();
         // A request made while this worker was finishing would otherwise stay queued until
         // something else starts a worker.
         this.runQueue();
@@ -590,9 +846,14 @@ export class MonitoringCoordinator {
     const project = id === "pc" ? null : this.state.projects.find((p) => p.id === id);
     if (id !== "pc" && !project) return;
     const evidence = project?.evidence ?? this.state.inventory.evidence;
-    // Removing a project aborts its own scan, leaving shutdown and other scans untouched.
-    this.activeScan = new AbortController();
-    const signal = AbortSignal.any([this.shutdown.signal, this.activeScan.signal]);
+    // Removing a project or the owner's Cancel aborts this scan only, leaving shutdown and other
+    // scans untouched. Cancel lands only before commit, so the evidence the scan started from is
+    // everything it changed.
+    const controller = new AbortController();
+    this.activeScan = controller;
+    const signal = AbortSignal.any([this.shutdown.signal, controller.signal]);
+    const evidenceBefore = structuredClone(evidence);
+    const updatesBefore = project ? null : structuredClone(this.state.inventory.updateEvidence!);
     const attempt: Mutable<ScanRecord> = {
       id: randomUUID(),
       targetId: project?.id ?? this.state.device.id,
@@ -640,8 +901,11 @@ export class MonitoringCoordinator {
       saved = false;
     }
     let findings: Finding[] = [];
+    // The update findings of public npm registry packages: the only ones deps.dev is asked about.
+    const publicUpdates = new Set<string>();
     let freshUpdates = false;
     let freshAdvisories = false;
+    let freshLifecycle = false;
     let retainedFindingIds: Set<string> | null = null;
     let inventoryStatus: "complete" | "partial" | "failed" | null = null;
     try {
@@ -668,11 +932,7 @@ export class MonitoringCoordinator {
           inputs.errors.push(
             "Public-registry and advisory lookups are disabled; update and security status are unknown.",
           );
-        if (this.shutdown.signal.aborted)
-          throw new InputError(
-            "The scan stopped before it finished; previous successful evidence is retained.",
-          );
-        if (!this.state.projects.some((p) => p.id === id)) return;
+        this.commit(signal);
         project.packageManager = inputs.packageManager;
         project.manifestPath = inputs.manifestPath;
         project.lockfilePath = inputs.lockfilePath;
@@ -703,13 +963,17 @@ export class MonitoringCoordinator {
               if (
                 (finding.kind === "update" && checkedVersion) ||
                 (finding.kind === "advisory" && d.advisoryStatus === "checked") ||
+                (finding.kind === "lifecycle" &&
+                  lookedUp.signals?.get(d.id)?.deprecated !== undefined) ||
                 finding.kind === "coverage"
               )
                 continue;
               const keys =
                 finding.kind === "update"
                   ? [d.id]
-                  : old.advisoryIds.map((advisoryId) => `${d.id}/${advisoryId}`);
+                  : finding.kind === "lifecycle"
+                    ? [`${d.id}/deprecated`]
+                    : old.advisoryIds.map((advisoryId) => `${d.id}/${advisoryId}`);
               if (
                 keys.some(
                   (key) =>
@@ -745,26 +1009,51 @@ export class MonitoringCoordinator {
           lookedUp.dependencies
             .filter((d) => d.origin === "registry")
             .every((d) => d.advisoryStatus === "checked");
+        // Answers that could not be read this scan stay as the previous scan found them.
+        const priorUpdates = new Map(
+          this.state.findings
+            .filter((f) => f.subjectId === project.id && f.kind === "update")
+            .map((f) => [f.id, f]),
+        );
         for (const dep of lookedUp.dependencies) {
+          const signals = lookedUp.signals?.get(dep.id);
           const available = dep.availableVersion ?? dep.latestVersion;
-          if (available)
+          if (available) {
+            const update = this.finding(
+              project.id,
+              project.name,
+              "update",
+              dep.id,
+              dep.name,
+              dep.packageName,
+              dep.resolved,
+              available,
+              "info",
+              dep.versionSource ?? "npm registry",
+              dep.availableVersion
+                ? dep.versionSource?.includes(" outdated ")
+                  ? "A newer version is compatible with the package manager's configuration."
+                  : "A newer version satisfies the requested range."
+                : "A newer latest release requires reviewing the requested range.",
+              null,
+            );
+            findings.push(withSignals(update, signals, priorUpdates.get(update.id)));
+            if (dep.origin === "registry") publicUpdates.add(update.id);
+          }
+          if (signals?.deprecated)
             findings.push(
               this.finding(
                 project.id,
                 project.name,
-                "update",
-                dep.id,
+                "lifecycle",
+                `${dep.id}/deprecated`,
                 dep.name,
                 dep.packageName,
                 dep.resolved,
-                available,
-                "info",
-                dep.versionSource ?? "npm registry",
-                dep.availableVersion
-                  ? dep.versionSource?.includes(" outdated ")
-                    ? "A newer version is compatible with the package manager's configuration."
-                    : "A newer version satisfies the requested range."
-                  : "A newer latest release requires reviewing the requested range.",
+                null,
+                "low",
+                "npm registry",
+                `Deprecated by its publisher: ${signals.deprecated}`,
                 null,
               ),
             );
@@ -797,6 +1086,27 @@ export class MonitoringCoordinator {
             );
           }
         }
+        findings = await this.withReleaseFacts(findings, publicUpdates, attempt, signal);
+        const lifecycle = await this.lifecycleFindings(
+          project.id,
+          project.name,
+          inputs.runtimes ?? [],
+          signal,
+        );
+        findings.push(...lifecycle.findings);
+        attempt.coverage.push(...lifecycle.notes);
+        freshLifecycle = true;
+        // A check that could not finish (no data, or a runtime file unread) is unknown, not clean.
+        // ponytail: keeps all of the project's previous runtime findings until a complete check, even
+        // one for a line since removed; narrow it to the lines not checked if that proves noisy.
+        if (!lifecycle.complete || inputs.runtimeFileUnreadable)
+          for (const old of this.state.findings)
+            if (
+              old.subjectId === project.id &&
+              old.kind === "lifecycle" &&
+              old.packageName === null
+            )
+              retainedFindingIds.add(old.id);
       } else {
         const inventory = await this.inventoryLookup(
           this.state.runtime.platform as NodeJS.Platform,
@@ -805,10 +1115,7 @@ export class MonitoringCoordinator {
           (progress) => this.reportProgress(progress),
           this.state.inventory.managers,
         );
-        if (this.shutdown.signal.aborted)
-          throw new InputError(
-            "The scan stopped before it finished; previous successful evidence is retained.",
-          );
+        this.commit(signal);
         const previous = this.state.inventory.installations;
         inventoryStatus = inventory.inventoryChecks;
         const previousById = new Map(previous.map((i) => [i.id, i]));
@@ -864,7 +1171,30 @@ export class MonitoringCoordinator {
         freshUpdates = true;
         const previousFindings = new Map(this.state.findings.map((f) => [f.id, f]));
         for (const installation of this.state.inventory.installations) {
-          if (!installation.packageId || !installation.availableVersion) continue;
+          if (!installation.packageId) continue;
+          const signals = inventory.signals?.get(installation.id);
+          const deprecation = this.finding(
+            this.state.device.id,
+            this.state.device.label,
+            "lifecycle",
+            `${installation.id}/deprecated`,
+            installation.name,
+            installation.packageId,
+            installation.version,
+            null,
+            "low",
+            installation.source,
+            `Deprecated by its publisher: ${signals?.deprecated ?? ""}`,
+            null,
+          );
+          // A tool whose deprecation was not read (no metadata, or its version unlisted) keeps its
+          // previous notice; one that was read decides. A tool that is gone is no longer in this
+          // loop, so its notice goes with it.
+          const previousDeprecation = previousFindings.get(deprecation.id);
+          if (signals?.deprecated) findings.push(deprecation);
+          else if (signals?.deprecated === undefined && previousDeprecation)
+            findings.push(previousDeprecation);
+          if (!installation.availableVersion) continue;
           const finding = this.finding(
             this.state.device.id,
             this.state.device.label,
@@ -882,22 +1212,41 @@ export class MonitoringCoordinator {
             null,
           );
           const old = previousFindings.get(finding.id);
-          if (installation.updateStatus === "available") findings.push(finding);
-          else if (old) findings.push({ ...finding, lastSeenAt: old.lastSeenAt });
+          const update = withSignals(finding, signals, old);
+          // Only a public npm package is asked about, an update kept from an earlier scan included:
+          // a tool since linked from a checkout, or moved to a private scope, is not.
+          if (installation.origin === "registry") publicUpdates.add(update.id);
+          if (installation.updateStatus === "available") findings.push(update);
+          else if (old) findings.push({ ...update, lastSeenAt: old.lastSeenAt });
         }
         attempt.coverage = inventory.coverage;
         attempt.errors = inventory.errors;
+        findings = await this.withReleaseFacts(findings, publicUpdates, attempt, signal);
+        const runtimes = pcRuntimes(this.state.inventory.managers ?? []);
+        const lifecycle = await this.lifecycleFindings(
+          this.state.device.id,
+          this.state.device.label,
+          runtimes.runtimes,
+          signal,
+        );
+        findings.push(...lifecycle.findings);
+        attempt.coverage = [...attempt.coverage, ...runtimes.notes, ...lifecycle.notes];
+        // The previous runtime findings stay unless Node.js was captured, an installed Bun's version
+        // was read, and every product had data.
+        freshLifecycle = lifecycle.complete && runtimes.complete;
       }
       attempt.status = inventoryStatus ?? (attempt.errors.length ? "partial" : "complete");
       if (attempt.status === "complete" && attempt.errors.length) attempt.status = "partial";
       if (attempt.status === "complete" || attempt.status === "partial") {
-        evidence.lastSuccess = timestamp();
         evidence.coverage = [...attempt.coverage];
       }
     } catch (error) {
+      // A stopped scan can leave findings built so far; a failed one keeps only the previous ones.
+      findings = [];
       retainedFindingIds = null;
       freshUpdates = false;
       freshAdvisories = false;
+      freshLifecycle = false;
       attempt.status = error instanceof InputError ? error.status : "failed";
       attempt.errors = [
         error instanceof InputError
@@ -910,24 +1259,48 @@ export class MonitoringCoordinator {
       }
     } finally {
       this.reportProgress({ stage: "saving", completed: null, total: null });
-      // However the scan ended (early return, adapter abort error), a removal is its outcome.
-      if (project && !this.state.projects.some((p) => p.id === id)) {
+      // A removal is the outcome however the scan ended (its abort, an adapter's abort error).
+      const removed = !!project && !this.state.projects.some((p) => p.id === id);
+      const cancelled = !removed && controller.signal.reason === cancelledByOwner;
+      if (removed) {
         attempt.status = "failed";
         attempt.errors = ["The project was removed during this scan."];
+      } else if (cancelled) {
+        attempt.status = "failed";
+        attempt.cancelled = true;
+        attempt.coverage = [];
+        attempt.errors = [cancelledByOwner];
       }
       attempt.finishedAt = timestamp();
-      evidence.status = attempt.status;
-      evidence.errors = [...attempt.errors];
+      if (cancelled) {
+        Object.assign(evidence, evidenceBefore);
+        if (updatesBefore) Object.assign(this.state.inventory.updateEvidence!, updatesBefore);
+      } else {
+        evidence.status = attempt.status;
+        evidence.errors = [...attempt.errors];
+      }
       // Failed attempts never erase previous successful inventory, dependencies, or actionable findings.
       const subjectId = project?.id ?? this.state.device.id;
-      if (!project || this.state.projects.some((p) => p.id === id)) {
+      if (!removed && !cancelled) {
+        // A runtime line checked again replaces its previous finding; a kept one would repeat it
+        // with the other severity or version it had. A deprecation notice is not matched by name:
+        // two versions of one package share it, and each notice stands for its own version.
+        const rechecked = new Set(
+          findings.filter((f) => f.kind === "lifecycle").map((f) => f.name),
+        );
         const retained = this.state.findings.filter(
           (f) =>
             f.subjectId === subjectId &&
+            !(f.kind === "lifecycle" && f.packageName === null && rechecked.has(f.name)) &&
             (retainedFindingIds !== null
               ? retainedFindingIds.has(f.id)
               : (f.kind === "update" && !freshUpdates) ||
-                (f.kind === "advisory" && !freshAdvisories)),
+                (f.kind === "advisory" && !freshAdvisories) ||
+                // A runtime line follows the lifecycle check. A deprecation notice follows the
+                // update checks that read it: This PC's loop rebuilds it, so only a failed scan
+                // keeps it whole, and a tool that is gone never lingers.
+                (f.kind === "lifecycle" &&
+                  !(f.packageName === null ? freshLifecycle : freshUpdates))),
         );
         if (attempt.errors.length)
           findings.push(
@@ -946,7 +1319,32 @@ export class MonitoringCoordinator {
               null,
             ),
           );
-        this.mergeFindings(subjectId, [...retained, ...findings]);
+        // A package whose check did not run is unknown, never resolved: the lockfile does not
+        // resolve it, OSV or the registry failed for it, or (This PC) its update status is unknown.
+        // Findings carry over only under an unchanged id, so a changed one looks like a resolution.
+        // ponytail: an nvm root switch reads as the old root's tools gone, resolved though not
+        // updated; name the root in the entry if that misleads
+        const unresolved = new Set(
+          project
+            ? project.dependencies
+                .filter(
+                  (d) =>
+                    d.resolved === null ||
+                    d.advisoryStatus === "failed" ||
+                    d.versionStatus === "failed",
+                )
+                .map((d) => d.packageName)
+            : this.state.inventory.installations
+                .filter((i) => i.updateStatus === "unknown")
+                .map((i) => i.packageId ?? i.name),
+        );
+        this.mergeFindings(subjectId, [...retained, ...findings], unresolved);
+        // New since last scan compares detection times with the success before this one. Stamped after
+        // the incomplete-checks finding above, so nothing this scan found is detected later than it.
+        if (attempt.status === "complete" || attempt.status === "partial") {
+          evidence.previousSuccess = evidence.lastSuccess;
+          evidence.lastSuccess = timestamp();
+        }
       }
       try {
         this.persist();
@@ -955,14 +1353,17 @@ export class MonitoringCoordinator {
         if (!attempt.errors.includes(evidenceNotSaved))
           attempt.errors = [...attempt.errors, evidenceNotSaved];
         if (attempt.status === "complete") attempt.status = "partial";
-        evidence.status = attempt.status;
-        evidence.errors = [...attempt.errors];
-        if (!project) {
-          // PC update checks are unsaved too; a failed check stays failed.
-          const updates = this.state.inventory.updateEvidence!;
-          if (updates.status === "complete") updates.status = "partial";
-          if (!updates.errors.includes(evidenceNotSaved))
-            updates.errors = [...updates.errors, evidenceNotSaved];
+        // A cancelled scan changed no evidence: what it restored stays, not Failed, and out of Retry.
+        if (!cancelled) {
+          evidence.status = attempt.status;
+          evidence.errors = [...attempt.errors];
+          if (!project) {
+            // PC update checks are unsaved too; a failed check stays failed.
+            const updates = this.state.inventory.updateEvidence!;
+            if (updates.status === "complete") updates.status = "partial";
+            if (!updates.errors.includes(evidenceNotSaved))
+              updates.errors = [...updates.errors, evidenceNotSaved];
+          }
         }
       }
     }
@@ -999,25 +1400,153 @@ export class MonitoringCoordinator {
       lastSeenAt: timestamp(),
     };
   }
-  private mergeFindings(subjectId: string, findings: Finding[]) {
+
+  /**
+   * Lifecycle findings for runtime lines, and the notes that say what could not be checked, or, when
+   * every product had data, how many were. `complete` is false when a runtime's product has no data,
+   * so its lifecycle is unknown.
+   */
+  private async lifecycleFindings(
+    subjectId: string,
+    subjectLabel: string,
+    runtimes: readonly DeclaredRuntime[],
+    signal: AbortSignal,
+  ): Promise<{ findings: Finding[]; notes: string[]; complete: boolean }> {
+    if (!runtimes.length) return { findings: [], notes: [], complete: true };
+    const now = Date.now();
+    const loaded = await loadLifecycle(
+      runtimes.map((runtime) => runtime.product),
+      this.storage,
+      this.sourceFetch,
+      this.lifecycleAttempts,
+      now,
+      signal,
+    );
+    const findings: Finding[] = [];
+    const notes = [...loaded.notes];
+    for (const runtime of runtimes) {
+      const data = loaded.data.get(runtime.product);
+      const verdict = data ? lifecycleVerdict(runtime, data, now) : null;
+      if (verdict?.kind === "note") notes.push(verdict.text);
+      else if (verdict) {
+        const finding = this.finding(
+          subjectId,
+          subjectLabel,
+          "lifecycle",
+          `runtime/${runtime.product}/${runtime.cycle}`,
+          `${lifecycleLabels[runtime.product]} ${runtime.cycle}`,
+          null,
+          runtime.version,
+          null,
+          verdict.severity,
+          "endoflife.date",
+          verdict.description,
+          null,
+        );
+        findings.push(
+          verdict.effectiveDate ? { ...finding, effectiveDate: verdict.effectiveDate } : finding,
+        );
+      }
+    }
+    const complete = runtimes.every((runtime) => loaded.data.has(runtime.product));
+    if (complete) {
+      const products = new Set(runtimes.map((runtime) => runtime.product)).size;
+      notes.push(
+        `Runtime end of life checked against endoflife.date (${products} product${products === 1 ? "" : "s"}).`,
+      );
+    }
+    return { findings, notes, complete };
+  }
+
+  /**
+   * deps.dev facts for the update findings in `publicUpdates` while the owner allows the lookup.
+   * What deps.dev does not answer stays unknown: no fact is invented, and a gap, or a stop, is never
+   * an error.
+   */
+  private async withReleaseFacts(
+    findings: Finding[],
+    publicUpdates: ReadonlySet<string>,
+    attempt: Mutable<ScanRecord>,
+    signal: AbortSignal,
+  ): Promise<Finding[]> {
+    const key = (finding: Finding) =>
+      publicUpdates.has(finding.id) &&
+      finding.packageName !== null &&
+      finding.availableVersion !== null
+        ? `${finding.packageName}@${finding.availableVersion}`
+        : null;
+    const candidates = findings.flatMap((finding) =>
+      key(finding) ? [{ name: finding.packageName!, version: finding.availableVersion! }] : [],
+    );
+    if (!candidates.length) return findings;
+    // The notes go on a new list: on This PC `attempt.coverage` is the inventory result's own array.
+    if (this.state.settings.useDepsDev === false) {
+      attempt.coverage = [
+        ...attempt.coverage,
+        "deps.dev lookups are off; release age, license and provenance are unknown.",
+      ];
+      return findings;
+    }
+    const { facts, checked, total } = await lookupReleaseFacts(
+      candidates,
+      this.storage,
+      this.sourceFetch,
+      signal,
+      (completed, all) => this.reportProgress({ stage: "release-facts", completed, total: all }),
+    );
+    // A stop is not thrown from here: the scan's dependencies or inventory are already replaced, and a
+    // failed attempt would leave its findings, coverage and status out of step with them. The facts
+    // that arrived are used, the rest read unknown, and the count below says how many were checked.
+    attempt.coverage = [
+      ...attempt.coverage,
+      `Release age, license and provenance (deps.dev): ${checked}/${total} update candidates`,
+    ];
+    return findings.map((finding) => {
+      const name = key(finding);
+      const fact = name === null ? undefined : facts.get(name);
+      return fact
+        ? {
+            ...finding,
+            ...(fact.publishedAt ? { publishedAt: fact.publishedAt } : {}),
+            ...(fact.license ? { license: fact.license } : {}),
+            ...(fact.provenance ? { provenance: true as const } : {}),
+          }
+        : finding;
+    });
+  }
+
+  private mergeFindings(subjectId: string, findings: Finding[], unresolved?: ReadonlySet<string>) {
     const previous = new Map(this.state.findings.map((f) => [f.id, f]));
     const deduped = [...new Map(findings.map((f) => [f.id, f])).values()];
+    const resolved = newlyResolved(
+      this.state.findings.filter((f) => f.subjectId === subjectId),
+      deduped,
+      new Date(this.now()).toISOString(),
+      unresolved,
+    );
     this.state.findings = [
       ...this.state.findings.filter((f) => f.subjectId !== subjectId),
       ...deduped.map((f) => ({ ...f, detectedAt: previous.get(f.id)?.detectedAt ?? f.detectedAt })),
     ];
+    this.state.resolvedFindings = keepResolved(
+      [...resolved, ...(this.state.resolvedFindings ?? [])],
+      this.state.findings,
+      this.now(),
+    );
+    const eligible = this.notificationFilter();
     for (const finding of deduped) {
-      // Coverage failures are visible in the app; only new actionable package findings produce notifications.
+      // Coverage gaps are visible in the app; `eligible` lets only new updates and advisories notify.
       if (finding.kind === "coverage" || this.notified.has(finding.id)) continue;
-      // Recorded even while notifications are off, so enabling them later announces only newer findings.
+      // Recorded even when it does not notify (notifications off, a hidden, watch-only or
+      // out-of-scope finding, any lifecycle finding), so a later change announces only newer findings.
       this.notified.add(finding.id);
-      if (!this.state.settings.notifyNewFindings) continue;
+      if (!this.state.settings.notifyNewFindings || !eligible(finding)) continue;
       this.state.notifications.push({
         id: randomUUID(),
         findingId: finding.id,
         title: `${finding.subjectLabel}: ${finding.name}`,
         body: finding.description,
-        createdAt: timestamp(),
+        createdAt: new Date(this.now()).toISOString(),
         deliveredAt: null,
       });
     }
@@ -1043,34 +1572,52 @@ export class MonitoringCoordinator {
   }
 
   private prepareNotificationSummary(): NotificationSummary | null {
+    const now = this.now();
     if (
       !this.state.settings.notifyNewFindings ||
       this.worker ||
       this.queue.size ||
-      Date.now() - this.settledAt < 2000 ||
-      (this.state.notificationNextAt !== null &&
-        Date.parse(this.state.notificationNextAt!) > Date.now())
+      now - this.settledAt < 2000 ||
+      (this.state.notificationNextAt !== null && Date.parse(this.state.notificationNextAt!) > now)
     )
       return null;
     const findings = new Map(this.state.findings.map((f) => [f.id, f]));
-    let pending = this.state.notifications.filter(
-      (n) =>
+    const eligible = this.notificationFilter();
+    const digestAt = this.state.settings.digestAt ?? null;
+    // A daily digest presents what was new by its latest local time; later events wait for the next one.
+    const cutoff =
+      digestAt === null
+        ? Number.POSITIVE_INFINITY
+        : latestDailyTime(digestAt, new Date(now)).getTime();
+    let pending = this.state.notifications.filter((n) => {
+      const finding = findings.get(n.findingId);
+      return (
         n.deliveredAt === null &&
-        findings.get(n.findingId)?.kind !== "coverage" &&
-        findings.has(n.findingId),
-    );
+        finding !== undefined &&
+        // `!(a > b)`: an event whose time cannot be read is presented, not lost.
+        !(Date.parse(n.createdAt) > cutoff) &&
+        eligible(finding)
+      );
+    });
     if (!pending.length) return null;
     const pendingIds = new Set(pending.map((n) => n.id));
+    const quiet = inQuietHours(this.state.settings.quietHours ?? null, new Date(now));
     const frozen = this.summaries.find(
       (s) => !s.acknowledged && s.notificationIds.some((id) => pendingIds.has(id)),
     );
-    if (frozen) {
+    // A read outside quiet hours offers the summary for native delivery, and from then on it keeps its
+    // events, so the receipt covers what was shown. While quiet hours hold the native notification
+    // the summary has not been offered: it takes in the events found since, so the in-app toast
+    // follows them, and the first read after the window offers it with all of them.
+    const held = frozen !== undefined && !quiet && frozen.summary.quiet === false;
+    if (held) {
       const ids = new Set(frozen.notificationIds);
       pending = pending.filter((n) => ids.has(n.id));
     }
-    const notificationIds = frozen?.notificationIds ?? pending.map((n) => n.id).sort();
-    const id =
-      frozen?.summary.id ?? identity("notification-summary", JSON.stringify(notificationIds));
+    const notificationIds = held ? frozen.notificationIds : pending.map((n) => n.id).sort();
+    const id = held
+      ? frozen.summary.id
+      : identity("notification-summary", JSON.stringify(notificationIds));
     const key = (f: Finding) =>
       f.subjectId === this.state.device.id
         ? f.id
@@ -1084,8 +1631,10 @@ export class MonitoringCoordinator {
     const unique = (items: readonly Finding[], kind: "update" | "advisory") => [
       ...new Map(items.filter((f) => f.kind === kind).map((f) => [key(f), f])).values(),
     ];
-    const updates = unique(this.state.findings, "update");
-    const advisories = unique(this.state.findings, "advisory");
+    // Totals count what may notify: hidden, watch-only, and out-of-scope findings are left out.
+    const current = this.state.findings.filter(eligible);
+    const updates = unique(current, "update");
+    const advisories = unique(current, "advisory");
     const newFindings = pending.map((n) => findings.get(n.findingId)!);
     const newUpdates = unique(newFindings, "update");
     const newAdvisories = unique(newFindings, "advisory");
@@ -1120,11 +1669,19 @@ export class MonitoringCoordinator {
           : newUpdates.length
             ? "updates"
             : "advisories",
+      // Native notifications wait for quiet hours to end; the in-app summary does not.
+      quiet,
     };
-    if (frozen) frozen.summary = summary;
-    else {
+    if (frozen) {
+      frozen.summary = summary;
+      frozen.notificationIds = notificationIds;
+    } else {
       this.summaries.push({ summary, notificationIds, acknowledged: false });
       if (this.summaries.length > 2) this.summaries.shift();
+    }
+    if (!quiet) {
+      this.offered.set(id, notificationIds);
+      if (this.offered.size > 20) this.offered.delete(this.offered.keys().next().value!);
     }
     return summary;
   }

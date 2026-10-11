@@ -6,10 +6,13 @@ import { decodeStatus } from "@versionstead/contracts/status";
 import {
   AddProject,
   AcknowledgeNotificationSummary,
+  CancelScan,
   ChangeProject,
   ChangeSettings,
   ChangeGlobalToolSources,
+  CreateFindingRule,
   RequestScan,
+  decodeFindingRule,
   decodeMonitoringSnapshot,
   decodeMonitoringSettings,
   decodeProject,
@@ -342,6 +345,11 @@ export async function startServer(
           json({ accepted: true }, 202);
           return;
         }
+        if (path === "/api/scans/cancel" && request.method === "POST") {
+          coordinator.cancelScan(decode(CancelScan, await readJson(request)).scanId);
+          json({ accepted: true });
+          return;
+        }
         if (path === "/api/settings" && request.method === "PATCH") {
           const body = decode(ChangeSettings, await readJson(request));
           json(
@@ -357,6 +365,18 @@ export async function startServer(
                 ...(body.notifyNewFindings === undefined
                   ? {}
                   : { notifyNewFindings: body.notifyNewFindings }),
+                ...(body.releaseCooldownDays === undefined
+                  ? {}
+                  : { releaseCooldownDays: body.releaseCooldownDays }),
+                ...(body.useDepsDev === undefined ? {} : { useDepsDev: body.useDepsDev }),
+                ...(body.notificationScope === undefined
+                  ? {}
+                  : { notificationScope: body.notificationScope }),
+                ...(body.notifyWatchOnly === undefined
+                  ? {}
+                  : { notifyWatchOnly: body.notifyWatchOnly }),
+                ...(body.quietHours === undefined ? {} : { quietHours: body.quietHours }),
+                ...(body.digestAt === undefined ? {} : { digestAt: body.digestAt }),
               }),
             ),
           );
@@ -379,6 +399,19 @@ export async function startServer(
         if (notificationId && request.method === "POST") {
           decode(Schema.Struct({}), await readJson(request));
           coordinator.acknowledgeNotification(notificationId);
+          json({ accepted: true });
+          return;
+        }
+        if (path === "/api/findings/rules" && request.method === "POST") {
+          const body = decode(CreateFindingRule, await readJson(request));
+          json(decodeFindingRule(coordinator.addFindingRule(body)), 201);
+          return;
+        }
+        const ruleId = /^\/api\/findings\/rules\/([^/]+)$/.exec(path)?.[1];
+        if (ruleId && request.method === "DELETE") {
+          if (!/^[a-zA-Z0-9-]{1,100}$/.test(ruleId))
+            throw new HttpError(400, "Invalid rule identity");
+          coordinator.removeFindingRule(ruleId);
           json({ accepted: true });
           return;
         }

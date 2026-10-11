@@ -255,3 +255,20 @@ test("a chord saved while Shift still counted on a bare digit or symbol keeps fi
   assert.equal(clash.attention, "1");
   assert.equal(clash.pc, "");
 });
+
+test("the palette's default chord yields to a chord already saved for another command", () => {
+  assert.equal(defaultBindings.palette, "mod+k");
+  // Ctrl+K saved for Scan before the palette existed still scans; the palette is left unbound (the
+  // Keybindings page reads "currently Disabled"), not Scan.
+  const saved = readBindings({ scan: "mod+k" });
+  assert.equal(saved.scan, "mod+k");
+  assert.equal(saved.palette, "");
+  // It can be bound again: another chord is free, and Ctrl+K names the command that holds it.
+  assert.equal(bindingConflict(saved, "palette", "mod+alt+k"), undefined);
+  assert.equal(bindingConflict(saved, "palette", "mod+k"), "Scan selected sources");
+  // A chord chosen for the palette is kept, and with nothing in the way the default stands.
+  const moved = readBindings({ scan: "mod+k", palette: "mod+alt+k" });
+  assert.deepEqual([moved.scan, moved.palette], ["mod+k", "mod+alt+k"]);
+  assert.equal(readBindings({}).palette, "mod+k");
+  assert.equal(readBindings({ scan: "mod+shift+s" }).palette, "mod+k");
+});

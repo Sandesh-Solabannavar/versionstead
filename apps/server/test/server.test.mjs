@@ -109,6 +109,93 @@ test("private monitoring validates capabilities, origins, bodies, and durable mu
       403,
     );
     assert.equal((await call("/api/settings", "PATCH", { pcIntervalMinutes: 0 })).status, 400);
+    for (const body of [
+      { notificationScope: "everything" },
+      { notificationScope: null },
+      { notificationScope: 1 },
+      { notifyWatchOnly: "yes" },
+      { notifyWatchOnly: 1 },
+      { notifyWatchOnly: null },
+    ])
+      assert.equal((await call("/api/settings", "PATCH", body)).status, 400, JSON.stringify(body));
+    const scope = await call("/api/settings", "PATCH", {
+      notificationScope: "high-advisories",
+      notifyWatchOnly: true,
+    });
+    assert.equal(scope.status, 200);
+    const routed = await scope.json();
+    assert.deepEqual([routed.notificationScope, routed.notifyWatchOnly], ["high-advisories", true]);
+    assert.equal((await call("/api/settings", "PATCH", { notifyWatchOnly: false })).status, 200);
+    assert.deepEqual(
+      [
+        coordinator.snapshot().settings.notificationScope,
+        coordinator.snapshot().settings.notifyWatchOnly,
+      ],
+      ["high-advisories", false],
+      "A change names only what it changes",
+    );
+    for (const body of [
+      { quietHours: { start: "22:00", end: "22:00" } },
+      { quietHours: { start: "7:00", end: "22:00" } },
+      { quietHours: { start: "22:00" } },
+      { quietHours: { start: "22:00", end: "07:60" } },
+      { quietHours: "22:00-07:00" },
+      { digestAt: "24:00" },
+      { digestAt: "18:60" },
+      { digestAt: " 18:00" },
+      { digestAt: "18:00:00" },
+      { digestAt: "" },
+      { digestAt: 1800 },
+    ])
+      assert.equal((await call("/api/settings", "PATCH", body)).status, 400, JSON.stringify(body));
+    const timing = await call("/api/settings", "PATCH", {
+      quietHours: { start: "22:00", end: "07:00" },
+      digestAt: "18:00",
+    });
+    assert.equal(timing.status, 200);
+    const timed = await timing.json();
+    assert.deepEqual(
+      [timed.quietHours, timed.digestAt],
+      [{ start: "22:00", end: "07:00" }, "18:00"],
+    );
+    assert.equal((await call("/api/settings", "PATCH", { digestAt: null })).status, 200);
+    assert.deepEqual(
+      [coordinator.snapshot().settings.quietHours, coordinator.snapshot().settings.digestAt],
+      [{ start: "22:00", end: "07:00" }, null],
+      "A change names only what it changes, and null turns the digest off",
+    );
+    assert.equal((await call("/api/settings", "PATCH", { quietHours: null })).status, 200);
+    assert.equal(coordinator.snapshot().settings.quietHours, null);
+    for (const body of [
+      { releaseCooldownDays: 31 },
+      { releaseCooldownDays: -1 },
+      { releaseCooldownDays: 2.5 },
+      { releaseCooldownDays: "3" },
+      { releaseCooldownDays: null },
+      { useDepsDev: "no" },
+      { useDepsDev: 1 },
+      { useDepsDev: null },
+    ])
+      assert.equal((await call("/api/settings", "PATCH", body)).status, 400, JSON.stringify(body));
+    const release = await call("/api/settings", "PATCH", {
+      releaseCooldownDays: 7,
+      useDepsDev: false,
+    });
+    assert.equal(release.status, 200);
+    const saved = await release.json();
+    assert.deepEqual([saved.releaseCooldownDays, saved.useDepsDev], [7, false]);
+    const edges = await call("/api/settings", "PATCH", { releaseCooldownDays: 30 });
+    assert.equal(edges.status, 200);
+    assert.deepEqual(
+      [(await edges.json()).releaseCooldownDays, coordinator.snapshot().settings.useDepsDev],
+      [30, false],
+      "A change names only what it changes",
+    );
+    assert.equal(
+      (await call("/api/settings", "PATCH", { releaseCooldownDays: 0 })).status,
+      200,
+      "0 turns the cooldown off",
+    );
     assert.equal(
       (await call("/api/projects", "POST", { path: "relative", mode: "watch" })).status,
       400,
@@ -385,7 +472,7 @@ test("snapshot revisions drive ETag/304 responses while live progress has its ow
     const tag = initial.headers.get("etag");
     assert.match(tag, /^"[^"]+"$/, "The revision is one quoted entity tag");
     const body = await initial.json();
-    assert.equal(body.features, "settings-repositories-connections-v9");
+    assert.equal(body.features, "settings-repositories-connections-v10");
     assert.deepEqual(body, first.coordinator.snapshot(), "Cached and live parts form the snapshot");
     for (const [method, headers, status] of [
       ["GET", { "If-None-Match": tag }, 304],
@@ -1014,4 +1101,82 @@ test("static serving exposes built routes/assets, never arbitrary workspace path
     assert.ok(webRoot.startsWith(join(tmpdir(), "versionstead-test-")));
     await rm(webRoot, { recursive: true, force: true });
   }
+});
+
+test("POST /api/scans/cancel validates its request and refuses a scan that is not running", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-cancel-"));
+  const coordinator = new MonitoringCoordinator({ dataDir, lookup: false });
+  const token = randomBytes(32).toString("base64url");
+  const server = await startServer({ port: 0, monitoring: coordinator, authToken: token });
+  t.after(async () => {
+    await server.close();
+    await coordinator.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  const post = (path, body) =>
+    fetch(`${server.origin}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  assert.equal((await post("/api/scans/cancel", {})).status, 400);
+  assert.equal((await post("/api/scans/cancel", { scanId: "x".repeat(101) })).status, 400);
+  const late = await post("/api/scans/cancel", { scanId: "finished-scan" });
+  assert.equal(late.status, 400);
+  assert.match((await late.json()).error, /already finished/);
+  assert.equal((await post("/api/scans", { target: "failed" })).status, 202);
+  assert.equal((await post("/api/scans", { target: "failed", projectId: "any" })).status, 400);
+});
+
+test("POST /api/scans/cancel answers 200 accepted for the running scan and rejects an id over 100 characters", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "versionstead-cancel-run-"));
+  const projectDir = join(dataDir, "selected");
+  await mkdir(projectDir);
+  await writeFile(join(projectDir, "package.json"), JSON.stringify({ name: "fixture" }));
+  await writeFile(
+    join(projectDir, "package-lock.json"),
+    JSON.stringify({ lockfileVersion: 3, packages: { "": { name: "fixture" } } }),
+  );
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const coordinator = new MonitoringCoordinator({
+    dataDir,
+    // Held, and deaf to its signal: the Cancel takes effect when the scan reaches its commit.
+    dependencyLookup: async (dependencies) => {
+      await gate;
+      return { dependencies, advisories: new Map(), coverage: [], errors: [] };
+    },
+  });
+  coordinator.changeSettings({ paused: true });
+  const token = randomBytes(32).toString("base64url");
+  const server = await startServer({ port: 0, monitoring: coordinator, authToken: token });
+  t.after(async () => {
+    release();
+    await server.close();
+    await coordinator.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  const post = async (path, body) => {
+    const response = await fetch(`${server.origin}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return [response.status, await response.json()];
+  };
+  const project = await coordinator.addProject({ path: projectDir, mode: "maintained" });
+  coordinator.requestScan({ target: "projects", projectId: project.id });
+  const { scanId } = coordinator.snapshot().scanProgress.active;
+  assert.deepEqual(await post("/api/scans/cancel", { scanId }), [200, { accepted: true }]);
+  assert.deepEqual(await post("/api/scans/cancel", { scanId: "x".repeat(101) }), [
+    400,
+    { error: "Invalid request fields" },
+  ]);
+  release();
+  const deadline = Date.now() + 6000;
+  while (coordinator.snapshot().scanProgress.active && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(coordinator.snapshot().history[0].cancelled, true);
 });

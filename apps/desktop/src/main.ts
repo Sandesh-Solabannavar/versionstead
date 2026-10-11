@@ -29,6 +29,7 @@ import {
   StartupError,
   startupFailureMessage,
   stopMonitoringDetail,
+  summaryToShow,
   webRoot,
   type CoordinatorPoll,
   type CoordinatorRuntime,
@@ -44,11 +45,18 @@ import {
 } from "@versionstead/contracts/project-settings";
 import { ProjectActionRunner, projectActionShell } from "./project-actions.js";
 import {
+  decodeGlobalToolUpdateBatch,
+  decodeGlobalToolUpdateBatchRequest,
+  decodeGlobalToolUpdateBatchStatus,
   decodeGlobalToolUpdateRequest,
   decodeGlobalToolUpdateRun,
   decodeGlobalToolUpdateRuns,
 } from "@versionstead/contracts/global-tool-updates";
-import { GlobalToolUpdateRunner, globalToolUpdateDependencies } from "./global-tool-updates.js";
+import {
+  currentUpdateItems,
+  GlobalToolUpdateRunner,
+  globalToolUpdateDependencies,
+} from "./global-tool-updates.js";
 import {
   decodeLoginItemChange,
   decodeLoginItemState,
@@ -406,8 +414,12 @@ async function pollNotifications() {
     }
     for (const id of pendingReceipts) await acknowledgeSummary(connected.runtime, id);
     if (!connected.settings.notifyNewFindings) return;
-    const summary = connected.notificationSummary;
-    if (!summary || presented.has(summary.id) || notifications.has(summary.id)) return;
+    // Quiet hours hold the native notification until they end; the in-app summary is unaffected.
+    const summary = summaryToShow(
+      connected.notificationSummary,
+      (id) => presented.has(id) || notifications.has(id),
+    );
+    if (!summary) return;
     notifications.clear();
     const notification = new Notification({
       id: "versionstead-summary",
@@ -483,11 +495,18 @@ async function runSmoke() {
     const observer = new MutationObserver(check);
     observer.observe(document.body, { subtree: true, attributes: true, childList: true }); check();
   })`);
+  // The cooldown is off so that the opt-in live Update now click never meets its release-age question.
   const rendererWrite: unknown = await window.webContents
     .executeJavaScript(`fetch('/api/settings', {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false })
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ notifyNewFindings: false, releaseCooldownDays: 0 })
   }).then(response => response.ok)`);
   if (rendererWrite !== true) throw new Error("Authenticated renderer mutation failed");
+  // Asked without writing, so the owner's clipboard is never touched: writes allowed, reads denied.
+  const clipboard: unknown = await window.webContents.executeJavaScript(
+    "Promise.all([navigator.permissions.query({ name: 'clipboard-write' }), navigator.permissions.query({ name: 'clipboard-read' })]).then(([write, read]) => write.state + ' ' + read.state)",
+  );
+  if (clipboard !== "granted denied")
+    throw new Error(`Copy buttons may write plain text only: ${String(clipboard)}`);
   // The native protocol passes the renderer's revision tag through and the coordinator's 304 back.
   const revalidated: unknown = await window.webContents.executeJavaScript(`(async () => {
     for (let attempt = 0; attempt < 10; attempt++) {
@@ -572,6 +591,25 @@ async function runSmoke() {
       else setTimeout(check, 100);
     }; check();
   })`);
+  // Update all's IPC validates its input and reports no batch until one starts. A refusal counts
+  // only when the handler made it: a channel nobody handles must not pass for validation.
+  const updateAllBoundary: unknown = await window.webContents.executeJavaScript(
+    `(() => {
+      const refused = (request) => window.versionstead.updateAllGlobalTools(request)
+        .then(() => false, (error) => !String(error).includes('No handler registered'));
+      return Promise.all([
+        refused({ items: [] }),
+        refused({ items: [{ installationId: 'x', expectedVersion: '1.0.0', targetVersion: '2.0.0' }] }),
+        refused('not a request'),
+        window.versionstead.stopGlobalToolUpdates(),
+        window.versionstead.globalToolUpdateBatch(),
+      ]).then(([empty, malformed, wrongType, stopped, batch]) => empty && malformed && wrongType && stopped === null && batch === null);
+    })()`,
+  );
+  if (updateAllBoundary !== true)
+    throw new Error(
+      "Update all IPC must refuse malformed requests and report no batch before one starts",
+    );
   // A page load is not a route change: it names the page but leaves focus where it is.
   const loaded: unknown = await window.webContents.executeJavaScript(
     "document.title==='This PC · Versionstead' && document.activeElement?.id!=='content'",
@@ -667,23 +705,41 @@ async function runSmoke() {
   )
     throw new Error("Scan progress must be labeled and use bounded real counts");
   await expectOutline("This PC");
+  const updateAllStatus: unknown = await window.webContents.executeJavaScript(
+    'document.querySelectorAll(\'[data-testid="update-all-status"][role="status"]\').length',
+  );
+  if (updateAllStatus !== 1)
+    throw new Error("Update all must keep its status line in the page before any run");
+  const waitForPc = async (timeout = 30000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const connected = await readyCoordinator();
+      if (
+        connected &&
+        connected.snapshot.inventory.evidence.status !== "scanning" &&
+        !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
+      )
+        return connected;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("The PC scan did not finish");
+  };
+  const updateAllRows = async () => {
+    if (!window) throw new Error("Smoke window unavailable");
+    return (await window.webContents.executeJavaScript(`new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const check = () => {
+        const boxes = [...document.querySelectorAll('dialog[open] input[type="checkbox"]')];
+        if (boxes.length) resolve(boxes.map(box => ({ label: box.getAttribute('aria-label') ?? '', checked: box.checked })));
+        else if (Date.now() > deadline) reject(new Error('The Update all confirmation did not open'));
+        else setTimeout(check, 50);
+      }; check();
+    })`)) as { label: string; checked: boolean }[];
+  };
+  let nativeUpdateAll: "declined" | "no-updates" | "updated" = "no-updates";
   if (process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT) {
     // Only the smoke harness's two disposable roots may be updated by this test.
     const base = await realpath(process.env.VERSIONSTEAD_SMOKE_GLOBAL_ROOT);
-    const waitForPc = async () => {
-      const deadline = Date.now() + 30000;
-      while (Date.now() < deadline) {
-        const connected = await readyCoordinator();
-        if (
-          connected &&
-          connected.snapshot.inventory.evidence.status !== "scanning" &&
-          !connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
-        )
-          return connected;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-      throw new Error("Fixture PC scan did not finish");
-    };
     await waitForPc();
     for (const manager of ["npm", "bun"] as const) {
       const connected = await readyCoordinator();
@@ -702,36 +758,105 @@ async function runSmoke() {
         throw new Error("Unexpected live update fixture version");
       }
       await window.loadURL("versionstead://app/pc");
-      await clickButton("Update now semver", false);
-      await selectOption("Global package manager", manager === "npm" ? "npm" : "Bun");
-      await clickButton("Update now semver");
-      const deadline = Date.now() + 30000;
-      let succeeded = false;
-      while (Date.now() < deadline) {
-        const run = globalToolUpdateRunner
-          .read()
-          .find((r) => r.rootId === item.rootId && r.name === item.name);
-        if (run?.status === "failed")
-          throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
-        if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
-          succeeded = true;
-          break;
+      if (manager === "npm") {
+        await clickButton("Update now semver", false);
+        await selectOption("Global package manager", "npm");
+        await clickButton("Update now semver");
+        const deadline = Date.now() + 30000;
+        let succeeded = false;
+        while (Date.now() < deadline) {
+          const run = globalToolUpdateRunner
+            .read()
+            .find((r) => r.rootId === item.rootId && r.name === item.name);
+          if (run?.status === "failed")
+            throw new Error(`Live ${manager} fixture update failed: ${run.message}`);
+          if (run?.status === "succeeded" && !globalToolUpdateRunner.active) {
+            succeeded = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (!succeeded) throw new Error("Native Update now did not finish");
+      } else {
+        // Bun's fixture goes through Update all: it is the only update left in the disposable roots.
+        await clickButton("Update all (1)");
+        const rows = await updateAllRows();
+        if (rows.length !== 1 || !rows[0]!.checked || !rows[0]!.label.includes("semver"))
+          throw new Error("Update all must list exactly the disposable semver fixture, ticked");
+        await clickButton("Update 1 package");
+        const deadline = Date.now() + 60000;
+        let finished = false;
+        while (Date.now() < deadline) {
+          const batch = globalToolUpdateRunner.readBatch();
+          if (batch?.status === "finished") {
+            if (batch.items[0]?.status !== "succeeded")
+              throw new Error(
+                `Live bun Update all failed: ${batch.items[0]?.message ?? "no item"}`,
+              );
+            finished = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (!finished) throw new Error("Native Update all did not finish");
+        nativeUpdateAll = "updated";
       }
-      if (!succeeded) throw new Error("Native Update now did not finish");
       const refreshed = await waitForPc();
       const updated = refreshed.snapshot.inventory.installations.find(
         (i) => i.name === "semver" && i.manager === manager,
       );
       if (updated?.version !== item.availableVersion || updated.updateStatus !== "current")
         throw new Error("The update did not refresh installed PC evidence");
+      const request = JSON.stringify({
+        installationId: item.id,
+        expectedVersion: item.version,
+        targetVersion: item.availableVersion,
+      });
       const staleRejected: unknown = await window.webContents.executeJavaScript(
-        `window.versionstead.updateGlobalTool(${JSON.stringify({ installationId: item.id, expectedVersion: item.version, targetVersion: item.availableVersion })}).then(() => false, () => true)`,
+        `Promise.all([window.versionstead.updateGlobalTool(${request}).then(() => false, () => true), window.versionstead.updateAllGlobalTools({ items: [${request}] }).then(() => false, () => true)]).then(([single, all]) => single && all)`,
       );
       if (staleRejected !== true) throw new Error("A stale native update request was accepted");
       console.log(
-        `Desktop smoke: native ${manager} Update now installed and verified ${item.availableVersion} in a disposable root`,
+        `Desktop smoke: native ${manager} ${manager === "npm" ? "Update now" : "Update all"} installed and verified ${item.availableVersion} in a disposable root`,
+      );
+    }
+  } else {
+    // The owner's real tools: open Update all and decline it. Nothing may start.
+    const pc = (await waitForPc(60_000)).snapshot.inventory;
+    const checkFailed = pc.evidence.status === "failed" || pc.updateEvidence?.status === "failed";
+    const eligible = checkFailed
+      ? []
+      : pc.installations.filter(
+          (i) =>
+            i.updateStatus === "available" &&
+            i.origin === "registry" &&
+            i.availableVersion !== null &&
+            i.rootId &&
+            i.packageId &&
+            i.manager,
+        );
+    if (eligible.length > 0) {
+      await window.loadURL("versionstead://app/pc");
+      await clickButton(`Update all (${eligible.length})`);
+      if ((await updateAllRows()).length !== eligible.length)
+        throw new Error("Update all must list every verified update");
+      window.webContents.focus();
+      window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+      const declined: unknown = await window.webContents.executeJavaScript(
+        "new Promise(resolve => setTimeout(() => resolve(!document.querySelector('dialog[open]')), 300))",
+      );
+      if (
+        declined !== true ||
+        globalToolUpdateRunner.readBatch() !== null ||
+        globalToolUpdateRunner.active
+      )
+        throw new Error("Declining Update all must close it without starting any update");
+      nativeUpdateAll = "declined";
+    } else {
+      // "no-updates" must not pass for a check that failed: say which it was.
+      console.log(
+        `Desktop smoke: Update all not exercised (${checkFailed ? "the PC scan or its update check failed" : "no verified update on this PC"})`,
       );
     }
   }
@@ -747,6 +872,44 @@ async function runSmoke() {
     }; check();
   })`);
   if (notificationFilter !== true) throw new Error("Summary click route must filter updates");
+  // Export opens over Needs attention with its scope and format choices; the smoke cancels its download before anything is saved.
+  await clickButton("Export");
+  const exportDialog: unknown = await window.webContents
+    .executeJavaScript(`new Promise((resolve, reject) => {
+    const deadline = Date.now() + 5000;
+    const check = () => {
+      const dialog = document.querySelector('dialog[open]');
+      if (dialog?.querySelector('[aria-label="Include"]') && dialog.querySelector('[aria-label="Format"]') && [...dialog.querySelectorAll('button')].some(button => button.textContent.includes('Save file'))) resolve(true);
+      else if (Date.now() > deadline) reject(new Error('The export dialog did not open'));
+      else setTimeout(check, 50);
+    }; check();
+  })`);
+  if (exportDialog !== true)
+    throw new Error("Export must offer scope, format, Copy, and Save file");
+  await expectOutline("Export");
+  const exportStatus: unknown = await window.webContents.executeJavaScript(
+    "document.querySelectorAll('dialog[open] [role=\"status\"]').length",
+  );
+  if (exportStatus !== 1) throw new Error("Export must keep a status line for its copy result");
+  // Save file hands the export to the browser's download; cancel it at will-download, so no file is written.
+  const download = new Promise<{ name: string; mime: string }>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Save file started no download")), 5000);
+    session.defaultSession.once("will-download", (event, item) => {
+      event.preventDefault();
+      clearTimeout(timer);
+      resolve({ name: item.getFilename(), mime: item.getMimeType() });
+    });
+  });
+  await clickButton("Save file");
+  const saved = await download;
+  if (
+    !/^versionstead-this-pc-and-projects-[0-9]{4}-[0-9]{2}-[0-9]{2}[.]md$/.test(saved.name) ||
+    saved.mime !== "text/markdown"
+  )
+    throw new Error(`Save file must offer a Markdown file: ${saved.name} ${saved.mime}`);
+  window.webContents.focus();
+  window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+  window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
   await window.loadURL("versionstead://app/service");
   await clickButton("Pause schedules", false);
   await expectOutline("Background service");
@@ -903,6 +1066,8 @@ async function runSmoke() {
   const projects = (await readyCoordinator())?.snapshot.projects ?? [];
   let nativeGroupedProjects = false;
   let nativeEvidenceSheet = false;
+  let nativeUpgradeCommands = false;
+  let nativeVersionDrift = false;
   if (projects.length > 0) {
     await clickButton("All projects");
     const projectGroups: unknown = await window.webContents
@@ -983,7 +1148,7 @@ async function runSmoke() {
       const sheetFocus: unknown = await window.webContents
         .executeJavaScript(`new Promise(resolve => setTimeout(() => {
         const popup = document.querySelector('[data-slot="sheet-popup"][role="dialog"]');
-        resolve(Boolean(popup?.contains(document.activeElement)));
+        resolve(Boolean(popup?.querySelector('.dialog-body')?.contains(document.activeElement)));
       }, 250))`);
       if (sheetFocus !== true) throw new Error("Evidence Sheet must receive focus");
       await expectOutline("the evidence sheet");
@@ -1002,6 +1167,28 @@ async function runSmoke() {
       if (sheetClosed !== true) throw new Error("Evidence Sheet Escape must restore package focus");
       nativeEvidenceSheet = true;
     }
+    if (firstProject?.dependencies.length) {
+      await clickButton("Upgrade commands");
+      await waitSettings(
+        "document.querySelector('dialog[open] [aria-label=\"Include major updates\"]')",
+      );
+      await expectOutline("Upgrade commands");
+      // A copy is reported in the dialog itself: a toast sits outside a modal dialog, unannounced.
+      await waitSettings("document.querySelector('dialog[open] [role=\"status\"]')");
+      window.webContents.focus();
+      window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
+      window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
+      await waitSettings("!document.querySelector('dialog[open]')");
+      nativeUpgradeCommands = true;
+    }
+    await clickButton("Version drift");
+    const driftView: unknown = await window.webContents.executeJavaScript(
+      "new Promise(resolve => setTimeout(() => resolve(Boolean(document.querySelector('[aria-label=\"Version drift\"]') || document.body.textContent.includes('No version drift in collected evidence'))), 250))",
+    );
+    if (driftView !== true)
+      throw new Error("Version drift must show its table or say there is none");
+    await expectOutline("Version drift");
+    nativeVersionDrift = true;
     nativeGroupedProjects = true;
   }
   window.close();
@@ -1786,6 +1973,96 @@ async function runSmoke() {
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Escape" });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "Escape" });
   await waitSettings("!document.querySelector('[data-slot=\"sheet-popup\"]')");
+  // Cancel scan: a running PC scan offers it, and a cancelled attempt says so while This PC keeps the
+  // evidence it had. A scan that finishes or starts writing first is reported, not failed.
+  await window.loadURL("versionstead://app/pc");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  const evidenceBeforeCancel = JSON.stringify(
+    (await readyCoordinator())?.snapshot.inventory.evidence,
+  );
+  let nativeCancelScan: unknown = await window.webContents.executeJavaScript(`(async () => {
+    await fetch('/api/scans', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: 'pc' }) });
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const button = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === 'Cancel scan' && !item.disabled);
+      if (button) { button.click(); return 'clicked'; }
+      const progress = await (await fetch('/api/monitoring/progress')).json();
+      if (!progress.scanProgress.active && !progress.scanProgress.queued.length) return 'finished-first';
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return 'missing';
+  })()`);
+  if (nativeCancelScan === "missing") throw new Error("A running PC scan must offer Cancel scan");
+  for (const deadline = Date.now() + 30000; Date.now() < deadline;) {
+    const current = (await readyCoordinator())?.snapshot;
+    const attempt = current?.history.find((item) => item.kind === "pc");
+    if (attempt && attempt.status !== "scanning") {
+      if (attempt.cancelled === true) {
+        if (
+          attempt.errors[0] !== "Cancelled by you" ||
+          JSON.stringify(current?.inventory.evidence) !== evidenceBeforeCancel
+        )
+          throw new Error("A cancelled PC scan must say so and keep the previous evidence");
+        nativeCancelScan = "cancelled";
+      } else nativeCancelScan = "finished-first";
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (nativeCancelScan === "clicked") throw new Error("Cancel scan did not end the PC scan");
+  console.log(`Desktop smoke: Cancel scan ${String(nativeCancelScan)}`);
+  // The command palette: its shortcut opens a combobox over a listbox, Enter runs the active option,
+  // the shortcut does nothing over another dialog, and a project link opens that project.
+  const press = (keyCode: string, modifiers: ("control" | "meta")[] = []) => {
+    window?.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
+    if (keyCode === "Enter")
+      window?.webContents.sendInputEvent({ type: "char", keyCode, modifiers });
+    window?.webContents.sendInputEvent({ type: "keyUp", keyCode, modifiers });
+  };
+  const mod = process.platform === "darwin" ? "meta" : "control";
+  const activeOption =
+    "document.getElementById(document.activeElement?.getAttribute('aria-activedescendant'))";
+  await window.loadURL("versionstead://app/");
+  await waitSettings(
+    "document.querySelector('[data-testid=\"connection-state\"]')?.dataset.state==='online'",
+  );
+  await window.webContents.executeJavaScript("document.getElementById('content').focus()");
+  press("K", [mod]);
+  await waitSettings(
+    `document.activeElement?.getAttribute('role')==='combobox' && ${activeOption}?.getAttribute('aria-selected')==='true'`,
+  );
+  await window.webContents.insertText("this pc");
+  await waitSettings(`${activeOption}?.textContent.startsWith('This PC')`);
+  press("Enter");
+  await waitSettings("location.pathname==='/pc' && !document.querySelector('dialog[open]')");
+  press("K", [mod]);
+  await waitSettings("document.querySelector('dialog.command-palette[open]')");
+  await window.webContents.insertText("add project");
+  await waitSettings(`${activeOption}?.textContent.startsWith('Add project')`);
+  press("Enter");
+  await waitSettings(
+    "document.querySelector('dialog[open] input[aria-label=\"Search project sources\"]')",
+  );
+  press("K", [mod]);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const paletteOverDialog: unknown = await window.webContents.executeJavaScript(
+    "document.querySelectorAll('dialog[open]').length===1 && !document.querySelector('dialog.command-palette')",
+  );
+  if (paletteOverDialog !== true)
+    throw new Error("The command palette must not open over another dialog");
+  press("Escape");
+  await waitSettings("!document.querySelector('dialog[open]')");
+  // Closing a dialog an action opened returns focus to where the palette was opened.
+  await waitSettings("document.activeElement?.id==='content'");
+  const linked = (await readyCoordinator())?.snapshot.projects[0];
+  if (linked) {
+    await window.loadURL(`versionstead://app/projects?project=${encodeURIComponent(linked.id)}`);
+    await waitSettings(
+      `location.search==='' && document.querySelector('[data-project-id=${JSON.stringify(linked.id)}] [data-testid="project-disclosure"]')?.getAttribute('aria-expanded')==='true'`,
+    );
+  }
   // Exercise the shared title bar/settings shell in the real sandboxed renderer.
   await window.loadURL("versionstead://app/pc");
   await waitSettings(
@@ -2046,6 +2323,8 @@ async function runSmoke() {
       nativeProjectSettings: true,
       nativeProjectActions: true,
       nativeKeybindings: true,
+      nativePalette: true,
+      nativeCancelScan,
       nativeUpdatePanel: true,
       nativeTitleBar: true,
       nativeSettingsSearch: true,
@@ -2055,6 +2334,11 @@ async function runSmoke() {
       nativeToasts: true,
       nativeClosedAccordions: true,
       nativeLogo: true,
+      nativeUpdateAll,
+      nativeClipboard: true,
+      nativeExport: true,
+      nativeUpgradeCommands,
+      nativeVersionDrift,
     }),
   );
   app.quit();
@@ -2113,10 +2397,17 @@ if (!app.requestSingleInstanceLock()) {
       nativeTheme.themeSource = windowPreferences.theme;
       nativeTheme.on("updated", syncWindowAppearance);
       if (smoke) console.log("Desktop smoke: native ready");
-      session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
-        callback(false),
+      // Copy buttons write plain text from the app's own pages; every other permission stays denied.
+      const clipboardWrite = (permission: string, origin: string) =>
+        permission === "clipboard-sanitized-write" && trustedLocation(origin);
+      session.defaultSession.setPermissionRequestHandler(
+        (_webContents, permission, callback, details) =>
+          callback(clipboardWrite(permission, details.requestingUrl)),
       );
-      session.defaultSession.setPermissionCheckHandler(() => false);
+      session.defaultSession.setPermissionCheckHandler(
+        (_webContents, permission, requestingOrigin) =>
+          clipboardWrite(permission, requestingOrigin),
+      );
       ipcMain.handle("versionstead:select-project-directory", async (event) => {
         if (
           !window ||
@@ -2168,35 +2459,33 @@ if (!app.requestSingleInstanceLock()) {
           async (event, input: unknown) => {
             assertActionSender(event);
             const request = decodeGlobalToolUpdateRequest(input);
-            const connected = await readyCoordinator();
-            const inventory = connected?.snapshot.inventory;
-            const item = inventory?.installations.find(
-              (candidate) => candidate.id === request.installationId,
-            );
-            if (
-              !connected ||
-              !item ||
-              item.version !== request.expectedVersion ||
-              item.availableVersion !== request.targetVersion ||
-              item.updateStatus !== "available"
-            )
-              throw new Error("This update changed. Scan this PC and review the current version.");
-            if (
-              inventory?.evidence.status === "scanning" ||
-              connected.snapshot.scanProgress?.active?.kind === "pc" ||
-              connected.snapshot.scanProgress?.queued.some((target) => target.kind === "pc")
-            )
-              throw new Error("Wait for the PC scan to finish before updating.");
-            if (
-              inventory?.evidence.status === "failed" ||
-              inventory?.updateEvidence?.status === "failed"
-            )
-              throw new Error("Scan this PC successfully before updating a previous result.");
+            const item = currentUpdateItems((await readyCoordinator())?.snapshot ?? null, [
+              request,
+            ])[0]!;
             return operation === "command"
               ? (await globalToolUpdateDependencies.resolve(item)).command
               : decodeGlobalToolUpdateRun(globalToolUpdateRunner.start(item));
           },
         );
+      ipcMain.handle("versionstead:global-tool-update-all", async (event, input: unknown) => {
+        assertActionSender(event);
+        const { items } = decodeGlobalToolUpdateBatchRequest(input);
+        // Every package is checked against the current evidence before any of them starts.
+        return decodeGlobalToolUpdateBatch(
+          globalToolUpdateRunner.startAll(
+            currentUpdateItems((await readyCoordinator())?.snapshot ?? null, items),
+          ),
+        );
+      });
+      for (const operation of ["stop", "batch"] as const)
+        ipcMain.handle(`versionstead:global-tool-update-${operation}`, (event) => {
+          assertActionSender(event);
+          return decodeGlobalToolUpdateBatchStatus(
+            operation === "stop"
+              ? globalToolUpdateRunner.stopAll()
+              : globalToolUpdateRunner.readBatch(),
+          );
+        });
       ipcMain.handle("versionstead:global-tool-update-status", (event) => {
         assertActionSender(event);
         return decodeGlobalToolUpdateRuns(globalToolUpdateRunner.read());

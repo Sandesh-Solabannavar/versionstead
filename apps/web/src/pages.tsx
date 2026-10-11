@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useDeferredValue,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -9,8 +10,11 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import {
+  CalendarClock,
   ChevronDown,
   Clock3,
+  Copy,
+  FileDown,
   Folder,
   Laptop,
   Package as PackageIcon,
@@ -24,47 +28,78 @@ import {
   decodeProject,
   decodeMonitoringSettings,
   decodeAcceptedResponse,
+  decodeFindingRule,
   type Dependency,
   type Finding,
+  type FindingRule,
   type Project,
 } from "@versionstead/contracts/monitoring";
 import { useMonitoring } from "./monitoring";
 import { actionKeys } from "./monitoring-actions";
 import { useApplication } from "./application";
 import { latestEvidence } from "./computer-evidence";
+import {
+  choiceScope,
+  copyableText,
+  exportFindings,
+  plainText,
+  scopeChoice,
+  type ExportFile,
+  type ExportFormat,
+  type ExportScope,
+} from "./exports";
 import { AddProjectDialog } from "./add-project";
 import { ProjectBadge } from "./project-icons";
 import { ProjectCommands } from "./project-settings";
+import { MenuItem } from "./components/ui/menu";
 import { Switch } from "./components/ui/switch";
 import {
   GlobalToolUpdateButton,
   GlobalToolUpdateDetails,
+  UpdateAllButton,
+  UpdateAllProgress,
   useGlobalToolUpdates,
 } from "./global-tool-updates";
-import { versionCandidate } from "./versions";
-import { npmPackageUrl } from "./upgrade-commands";
+import { parseSemver, versionCandidate } from "./versions";
+import { npmPackageUrl, upgradeEmptyText } from "./upgrade-commands";
+import { copyAllText, projectUpgradePlan } from "./upgrade-plan";
+import { behindFirst, usageAction, versionDrift, type DriftRow } from "./version-drift";
 import {
   advisoryTone,
   compareFindings,
+  deliveryStatus,
   dependencyUpgradeOption,
+  failedTargetCount,
   filterInstallations,
   findingSummary,
   findingsRetained,
   findingUpgradeCommands,
   globalToolSourceState,
   installationCandidate,
+  installationFindings,
+  installationUpdate,
+  isEffectiveDay,
+  latestScanNotice,
   lifecycleNote,
   lifecycleRows,
   noun,
+  pcUpdateHold,
   pcUpdateState,
   plural,
   attentionGroups,
   backgroundSetup,
+  canIgnore,
   findingCounts,
+  findingTotal,
+  localOnlyFilter,
   projectNeedsAttention,
   dependencyNeedsAttention,
   dependencyFindings,
   restartAdvice,
+  ruleLabel,
+  runtimeNotices,
+  snoozeChoices,
+  suppressedCount,
   workspaceLabel,
   uniqueRowLabels,
   type InventoryFilter,
@@ -78,6 +113,7 @@ import {
   CollapsibleTrigger,
   CommandBlock,
   CopyMenuItem,
+  copyText,
   Dialog,
   EmptyState,
   Evidence,
@@ -85,7 +121,10 @@ import {
   FindingBadge,
   LinkMenuItem,
   PageHeading,
+  ReleaseAgeBadge,
+  ReleaseFacts,
   RowActions,
+  useFocusPageOnUnmount,
   safeExternalUrl,
   ScanProgress,
   StaleBadge,
@@ -99,6 +138,8 @@ import {
   timestamp,
   UpdateKindBadge,
   useFailure,
+  useNow,
+  useStatusLine,
 } from "./ui";
 
 const maintenanceItems = [
@@ -216,8 +257,10 @@ function PagedTable<T>({
           className="mt-3"
           onClick={() => {
             flushSync(() => setLimit(limit + pageSize));
-            // Continue at the first revealed row instead of after the table.
-            body.current?.rows[limit]?.querySelector("button")?.focus();
+            // Continue at the first revealed row instead of after the table: at its button, or at the
+            // row itself (tabIndex -1) when it has none.
+            const row = body.current?.rows[limit];
+            (row?.querySelector("button") ?? row)?.focus();
           }}
         >
           Show {Math.min(pageSize, remaining)} more ({remaining} remaining)
@@ -258,6 +301,11 @@ function FindingCounts({ counts }: { counts: ReturnType<typeof findingCounts> })
         <ShieldAlert size={16} aria-hidden="true" />
         <strong>{counts.advisories}</strong>
         <span>{noun(counts.advisories, "advisory finding", "advisory findings")}</span>
+      </div>
+      <div>
+        <CalendarClock size={15} aria-hidden="true" />
+        <strong>{counts.lifecycle}</strong>
+        <span>{noun(counts.lifecycle, "lifecycle finding", "lifecycle findings")}</span>
       </div>
       <div>
         <Clock3 size={15} aria-hidden="true" />
@@ -307,15 +355,26 @@ function PackageMenuItems({
   );
 }
 
-function FindingMenuItems({ finding, project }: { finding: Finding; project: Project | null }) {
+function FindingMenuItems({
+  finding,
+  project,
+  ignore,
+}: {
+  finding: Finding;
+  project: Project | null;
+  ignore: (finding: Finding) => void;
+}) {
   const { snapshot } = useMonitoring();
   return (
-    <PackageMenuItems
-      packageName={finding.packageName ?? finding.name}
-      upgrades={snapshot ? findingUpgradeCommands(finding, project, snapshot) : []}
-      advisoryUrl={finding.advisoryUrl}
-      project={project}
-    />
+    <>
+      <PackageMenuItems
+        packageName={finding.packageName ?? finding.name}
+        upgrades={snapshot ? findingUpgradeCommands(finding, project, snapshot) : []}
+        advisoryUrl={finding.advisoryUrl}
+        project={project}
+      />
+      <RuleMenuItems finding={finding} ignore={ignore} />
+    </>
   );
 }
 
@@ -333,6 +392,156 @@ function DependencyMenuItems({
       upgrades={upgrade ? [upgrade] : []}
       project={project}
     />
+  );
+}
+
+/** Snooze, ignore, or bring back a finding; the coordinator derives the rule's scope from the finding. */
+function RuleMenuItems({
+  finding,
+  ignore,
+}: {
+  finding: Finding;
+  ignore: (finding: Finding) => void;
+}) {
+  const { snapshot, connection, pending, mutate } = useMonitoring();
+  const key = actionKeys.findingRule(finding.id);
+  const busy = connection !== "connected" || pending.has(key);
+  const ruleId = finding.ruleId;
+  if (ruleId !== undefined) {
+    const rule = snapshot?.findingRules?.find((item) => item.id === ruleId);
+    return (
+      <MenuItem
+        disabled={busy}
+        onClick={() => {
+          void mutate(
+            `/api/findings/rules/${encodeURIComponent(ruleId)}`,
+            {},
+            decodeAcceptedResponse,
+            "The finding is back in Needs attention.",
+            "DELETE",
+            { key },
+          );
+        }}
+      >
+        {rule?.mode === "ignore" ? "Stop ignoring" : "Unsnooze"}
+      </MenuItem>
+    );
+  }
+  return (
+    <>
+      {snoozeChoices(finding).map((choice) => (
+        <MenuItem
+          key={choice.label}
+          disabled={busy}
+          onClick={() => {
+            void mutate(
+              "/api/findings/rules",
+              { findingId: finding.id, ...choice.body },
+              decodeFindingRule,
+              "Finding snoozed. It is listed under Snoozed & ignored.",
+              "POST",
+              { key },
+            );
+          }}
+        >
+          {choice.label}
+        </MenuItem>
+      ))}
+      {canIgnore(finding) && (
+        <MenuItem disabled={busy} onClick={() => ignore(finding)}>
+          Ignore…
+        </MenuItem>
+      )}
+    </>
+  );
+}
+
+/** Asks why a finding is ignored; the reason stays listed with the rule. */
+function IgnoreFindingDialog({ finding, close }: { finding: Finding; close: () => void }) {
+  const { connection, pending, mutate } = useMonitoring();
+  const [error, fail, clearError] = useFailure();
+  const [reason, setReason] = useState("");
+  const key = actionKeys.findingRule(finding.id);
+  const saving = pending.has(key);
+  // The coordinator keeps a reason without control, zero-width and bidirectional characters, so the
+  // length that counts is the cleaned one.
+  const trimmed = plainText(reason);
+  return (
+    <Dialog
+      title={`Ignore ${finding.name}?`}
+      description={`${findingSummary(finding)} in ${finding.subjectLabel}. It leaves Needs attention, counts, and notifications until you stop ignoring it. Find it under Snoozed & ignored.`}
+      onClose={close}
+      dismissible={!saving}
+    >
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (trimmed.length < 3) return;
+          clearError();
+          void mutate(
+            "/api/findings/rules",
+            { findingId: finding.id, mode: "ignore", reason: trimmed },
+            decodeFindingRule,
+            "Finding ignored. It is listed under Snoozed & ignored.",
+            "POST",
+            { key, onError: fail },
+          ).then((result) => {
+            if (result) close();
+          });
+        }}
+      >
+        <label className="field">
+          <span>Reason (3 to 200 characters)</span>
+          <Input
+            value={reason}
+            maxLength={200}
+            minLength={3}
+            required
+            autoComplete="off"
+            onChange={(event) => setReason(event.target.value)}
+          />
+        </label>
+        {error && (
+          <p className="error-text" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="form-actions">
+          <Button disabled={saving} onClick={close}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            type="submit"
+            disabled={connection !== "connected" || saving || trimmed.length < 3}
+          >
+            Ignore finding
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+/** A package's deprecation, install-script, and release-age markers, from its own findings. */
+function PackageSignals({
+  findings,
+  cooldownDays,
+}: {
+  findings: readonly Finding[];
+  cooldownDays: number;
+}) {
+  const deprecations = findings.filter(
+    (finding) => finding.kind === "lifecycle" && finding.packageName !== null,
+  );
+  const update = findings.find((finding) => finding.kind === "update");
+  return (
+    <>
+      {/* Toned by severity, as its finding is in Needs attention. */}
+      {deprecations.length > 0 && <Badge tone={advisoryTone(deprecations)}>Deprecated</Badge>}
+      {update?.installScript === true && <Badge tone="warning">Adds an install script</Badge>}
+      {update && <ReleaseAgeBadge publishedAt={update.publishedAt} cooldownDays={cooldownDays} />}
+    </>
   );
 }
 
@@ -359,6 +568,9 @@ declare global {
       updateGlobalTool: (input: unknown) => Promise<unknown>;
       globalToolUpdateCommand: (input: unknown) => Promise<unknown>;
       globalToolUpdateStatus: () => Promise<unknown>;
+      updateAllGlobalTools: (input: unknown) => Promise<unknown>;
+      stopGlobalToolUpdates: () => Promise<unknown>;
+      globalToolUpdateBatch: () => Promise<unknown>;
     };
   }
 }
@@ -425,8 +637,216 @@ function ScanButton({
   );
 }
 
+/** Stops the running scan before it writes evidence; the coordinator keeps the evidence it had. */
+function CancelScanButton() {
+  const { snapshot } = useMonitoring();
+  const active = snapshot?.scanProgress?.active;
+  return active && !active.writing ? (
+    <CancelButton scanId={active.scanId} label={active.targetLabel} />
+  ) : null;
+}
+
+// Mounted only while the scan can be cancelled, so keyboard focus on it goes to the page when the
+// scan ends or starts writing.
+function CancelButton({ scanId, label }: { scanId: string; label: string }) {
+  const { connection, pending, mutate } = useMonitoring();
+  const button = useRef<HTMLButtonElement>(null);
+  useFocusPageOnUnmount(button);
+  return (
+    <Button
+      ref={button}
+      variant="outline"
+      size="compact"
+      aria-label={`Cancel scan: ${label}`}
+      disabled={connection !== "connected" || pending.has(actionKeys.cancelScan)}
+      onClick={(event) => {
+        const clicked = event.currentTarget;
+        void mutate(
+          "/api/scans/cancel",
+          { scanId },
+          decodeAcceptedResponse,
+          "Scan cancelled. The previous evidence is kept.",
+          "POST",
+          { key: actionKeys.cancelScan },
+        ).then((result) => {
+          // The button goes with the scan, so keyboard focus moves into the page (as Dismiss does),
+          // unless the owner has already moved on to another control.
+          const focused = document.activeElement;
+          if (result && (!focused || focused === document.body || focused === clicked))
+            document.getElementById("content")?.focus({ preventScroll: true });
+        });
+      }}
+    >
+      Cancel scan
+    </Button>
+  );
+}
+
+/** Rescans every target whose last attempt failed or left gaps. */
+function RetryFailedButton() {
+  const { snapshot, connection, pending, mutate } = useMonitoring();
+  const count = snapshot ? failedTargetCount(snapshot) : 0;
+  const key = actionKeys.scan("failed");
+  if (count === 0) return null;
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={connection !== "connected" || pending.has(key)}
+      onClick={() => {
+        // The coordinator decides which targets to rescan when the request arrives, so this says
+        // what was asked, not what was queued; the scan progress shows what runs.
+        void mutate(
+          "/api/scans",
+          { target: "failed" },
+          decodeAcceptedResponse,
+          "Retry requested. Targets that are already scanning or have recovered are skipped.",
+          "POST",
+          { key },
+        );
+      }}
+    >
+      <RefreshCw size={13} aria-hidden="true" />
+      Retry failed checks ({count})
+    </Button>
+  );
+}
+
+/** Hands a generated file to the browser's download; the desktop asks where to save it. */
+function saveFile(file: ExportFile) {
+  const url = URL.createObjectURL(new Blob([file.text], { type: file.mime }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = file.filename;
+  link.click();
+  // ponytail: the object URL lives a minute after the click; revoke on download completion if memory matters.
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+const exportFormats = [
+  { value: "markdown", label: "Markdown, for an issue or pull request" },
+  { value: "csv", label: "CSV, for a spreadsheet" },
+  { value: "json", label: "JSON" },
+];
+
+/** Findings with every target's scan times, coverage, and incomplete checks, built here from the current snapshot. */
+export function ExportDialog({
+  initialScope,
+  close,
+}: {
+  initialScope: ExportScope;
+  close: () => void;
+}) {
+  const { snapshot, connection } = useMonitoring();
+  const [scope, setScope] = useState<string>(scopeChoice(initialScope));
+  const [format, setFormat] = useState<ExportFormat>("markdown");
+  const [status, say] = useStatusLine();
+  const build = () =>
+    snapshot
+      ? exportFindings(snapshot, choiceScope(scope), format, new Date().toISOString())
+      : null;
+  // Folders can share a name; the list numbers the ones that do ("twin (1 of 2)").
+  const projectLabels = uniqueRowLabels(
+    snapshot?.projects ?? [],
+    (project) => project.name,
+    (project) => project.id,
+  );
+  return (
+    <Dialog
+      title="Export findings"
+      description="Built in this window from the evidence it holds, with each target's scan times, coverage, and incomplete checks. Snoozed and ignored findings are included and marked. Local folder paths, global tool locations, and this PC's name are left out; project and package names are not, so read it before you share it."
+      onClose={close}
+    >
+      <div className="grid gap-3">
+        <label className="filter-control">
+          <span>Include</span>
+          <SelectControl
+            label="Include"
+            value={scope}
+            items={[
+              // A paired computer's evidence is not in this snapshot, so "all" is not "everything".
+              { value: "all", label: "This PC and all projects" },
+              { value: "pc", label: "This PC" },
+              ...(snapshot?.projects ?? []).map((project) => ({
+                value: `project:${project.id}`,
+                label: projectLabels.get(project.id) ?? project.name,
+              })),
+            ]}
+            onChange={(value) => {
+              setScope(value);
+              say("");
+            }}
+          />
+        </label>
+        <label className="filter-control">
+          <span>Format</span>
+          <SelectControl
+            label="Format"
+            value={format}
+            items={exportFormats}
+            onChange={(value) => {
+              setFormat(value as ExportFormat);
+              say("");
+            }}
+          />
+        </label>
+      </div>
+      {connection !== "connected" && (
+        <p className="muted small">
+          The coordinator is not connected, so this holds the last evidence received; each target's
+          scan times show how old it is.
+        </p>
+      )}
+      {status}
+      <div className="form-actions">
+        <Button onClick={close}>Close</Button>
+        <Button
+          aria-label="Copy export"
+          disabled={!snapshot}
+          onClick={() => {
+            const file = build();
+            if (file) void copyText(copyableText(file), "Export copied.", say);
+          }}
+        >
+          <Copy size={13} aria-hidden="true" />
+          Copy
+        </Button>
+        <Button
+          variant="primary"
+          disabled={!snapshot}
+          onClick={() => {
+            const file = build();
+            if (!file) return;
+            saveFile(file);
+            close();
+          }}
+        >
+          <FileDown size={13} aria-hidden="true" />
+          Save file…
+        </Button>
+      </div>
+    </Dialog>
+  );
+}
+
+/** Opens Export at a starting scope; the dialog can switch to This PC, a project, or everything. */
+export function ExportButton({ initialScope }: { initialScope: ExportScope }) {
+  const { snapshot } = useMonitoring();
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button size="sm" disabled={!snapshot} onClick={() => setOpen(true)}>
+        <FileDown size={13} aria-hidden="true" />
+        Export
+      </Button>
+      {open && <ExportDialog initialScope={initialScope} close={() => setOpen(false)} />}
+    </>
+  );
+}
+
 function FindingDetails({ finding, close }: { finding: Finding; close: () => void }) {
   const { snapshot } = useMonitoring();
+  const cooldownDays = snapshot?.settings.releaseCooldownDays ?? 3;
   const project = snapshot?.projects.find((item) => item.id === finding.subjectId);
   const evidence =
     project?.evidence ??
@@ -434,26 +854,52 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
       ? (snapshot?.inventory.updateEvidence ?? snapshot?.inventory.evidence)
       : snapshot?.inventory.evidence);
   const url = safeExternalUrl(finding.advisoryUrl);
+  const lifecycle = finding.kind === "lifecycle";
+  const runtime = lifecycle && finding.packageName === null;
   return (
     <Dialog title="Finding evidence" onClose={close} drawer>
-      <FindingBadge finding={finding} />
+      <FindingBadge finding={finding} cooldownDays={cooldownDays} />
       <h3 className="detail-title">{finding.name}</h3>
       <p>{finding.description}</p>
       <dl className="details-list">
         <dt>Affected target</dt>
         <dd>{finding.subjectLabel}</dd>
-        <dt>Observed version</dt>
+        <dt>{runtime ? "Declared or installed version" : "Observed version"}</dt>
         <dd className="mono">{finding.installedVersion ?? "Unknown"}</dd>
-        <dt>
-          {finding.kind === "advisory" ? "Provider-listed fixed boundary" : "Candidate version"}
-        </dt>
-        <dd className="mono">{finding.availableVersion ?? "Not established"}</dd>
+        {runtime ? (
+          <>
+            <dt>Effective date</dt>
+            <dd>
+              {/* A day, not a moment: a local-time tooltip would show the evening before west of UTC. */}
+              {isEffectiveDay(finding.effectiveDate) ? (
+                <time dateTime={finding.effectiveDate}>{finding.effectiveDate}</time>
+              ) : (
+                "No date announced"
+              )}
+            </dd>
+          </>
+        ) : (
+          // npm publishes no date for a deprecation, so there is nothing to show for one.
+          !lifecycle && (
+            <>
+              <dt>
+                {finding.kind === "advisory"
+                  ? "Provider-listed fixed boundary"
+                  : "Candidate version"}
+              </dt>
+              <dd className="mono">{finding.availableVersion ?? "Not established"}</dd>
+            </>
+          )
+        )}
         <dt>Source</dt>
         <dd>{finding.source}</dd>
         <dt>First detected</dt>
         <dd>{timestamp(finding.detectedAt)}</dd>
         <dt>Last seen</dt>
         <dd>{timestamp(finding.lastSeenAt)}</dd>
+        {finding.kind === "update" && (
+          <ReleaseFacts finding={finding} cooldownDays={cooldownDays} />
+        )}
       </dl>
       {evidence && (
         <Evidence
@@ -472,9 +918,15 @@ function FindingDetails({ finding, close }: { finding: Finding; close: () => voi
       <section className="detail-section">
         <h3>What you can do next</h3>
         <p className="muted">
-          {finding.kind === "coverage"
-            ? "Review the missing input or access limitation, then request a new read-only scan. Previous evidence remains visible."
-            : "Review the source evidence before choosing an update. Versionstead does not install software or change project files during monitoring."}
+          {finding.kind === "other"
+            ? "A newer Versionstead reported this kind of finding. Review its description and source, or update this app to see it in full."
+            : finding.kind === "coverage"
+              ? "Review the missing input or access limitation, then request a new read-only scan. Previous evidence remains visible."
+              : runtime
+                ? "Plan a move to a release line with longer support. Versionstead does not change runtimes or project files."
+                : lifecycle
+                  ? "Read the publisher's message and plan a replacement or a supported version. Versionstead does not change project files."
+                  : "Review the source evidence before choosing an update. Versionstead does not install software or change project files during monitoring."}
         </p>
         {url && (
           <a className="text-link" href={url} target="_blank" rel="noreferrer">
@@ -499,13 +951,19 @@ const FindingsTable = memo(
     findings,
     project,
     retained,
+    cooldownDays,
+    rules,
     select,
+    ignore,
   }: {
     label: string;
     findings: readonly Finding[];
     project: Project | null;
     retained: boolean;
+    cooldownDays: number;
+    rules: ReadonlyMap<string, FindingRule>;
     select: (findingId: string) => void;
+    ignore: (finding: Finding) => void;
   }) {
     const names = useMemo(
       () =>
@@ -555,16 +1013,22 @@ const FindingsTable = memo(
                 ) : (
                   <> → {finding.availableVersion}</>
                 ))}
+              {finding.kind === "lifecycle" && isEffectiveDay(finding.effectiveDate) && (
+                <span className="table-subtext">Effective {finding.effectiveDate}</span>
+              )}
               {retained && <span className="table-subtext">Previous, unverified</span>}
             </td>
             <td>
-              <FindingBadge finding={finding} />
+              <FindingBadge finding={finding} cooldownDays={cooldownDays} />
+              {finding.ruleId !== undefined && rules.get(finding.ruleId) && (
+                <span className="table-subtext">{ruleLabel(rules.get(finding.ruleId)!)}</span>
+              )}
             </td>
             <td className="muted">{finding.source}</td>
             <td className="muted">{timestamp(finding.lastSeenAt)}</td>
             <td>
               <RowActions label={`Actions for ${names.get(finding.id)}`}>
-                <FindingMenuItems finding={finding} project={project} />
+                <FindingMenuItems finding={finding} project={project} ignore={ignore} />
               </RowActions>
             </td>
           </tr>
@@ -576,9 +1040,56 @@ const FindingsTable = memo(
     previous.label === next.label &&
     previous.project === next.project &&
     previous.retained === next.retained &&
+    previous.cooldownDays === next.cooldownDays &&
+    previous.rules === next.rules &&
     previous.select === next.select &&
+    previous.ignore === next.ignore &&
     sameFindings(previous.findings, next.findings),
 );
+
+/** Findings a later successful check stopped reporting, with when; read-only. */
+function ResolvedTable({
+  label,
+  findings,
+  resolvedAt,
+}: {
+  label: string;
+  findings: readonly Finding[];
+  resolvedAt: ReadonlyMap<string, string>;
+}) {
+  return (
+    <PagedTable
+      label={label}
+      head={
+        <tr>
+          <th scope="col">Affected package</th>
+          <th scope="col">Version evidence</th>
+          <th scope="col">Reported as</th>
+          <th scope="col">Resolved</th>
+        </tr>
+      }
+      rows={findings}
+      renderRow={(finding) => (
+        <tr key={finding.id} tabIndex={-1}>
+          <td>
+            {finding.name}
+            {finding.packageName && finding.packageName !== finding.name && (
+              <span className="table-subtext mono">{finding.packageName}</span>
+            )}
+          </td>
+          <td className="mono">
+            {finding.installedVersion ?? "Unknown"}
+            {finding.kind === "update" && finding.availableVersion && (
+              <> → {finding.availableVersion}</>
+            )}
+          </td>
+          <td>{findingSummary(finding)}</td>
+          <td className="muted">{timestamp(resolvedAt.get(finding.id) ?? null)}</td>
+        </tr>
+      )}
+    />
+  );
+}
 
 export function Attention() {
   const { snapshot, connection, pending } = useMonitoring();
@@ -588,13 +1099,37 @@ export function Attention() {
   const [query, setQuery] = useState("");
   const search = useDeferredValue(query);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [ignoring, setIgnoring] = useState<Finding | null>(null);
   const [adding, setAdding] = useState(false);
   const findings = snapshot?.findings ?? [];
+  const cooldownDays = snapshot?.settings.releaseCooldownDays ?? 3;
   const allGroups = useMemo(() => (snapshot ? attentionGroups(snapshot) : []), [snapshot]);
+  // These tabs count what they list, from the same views.
+  const changes = useMemo(() => {
+    if (!snapshot) return { new: 0, resolved: 0 };
+    const total = (view: "new" | "resolved") =>
+      findingTotal(
+        attentionGroups(snapshot, view).flatMap((group) => group.findings),
+        snapshot.device.id,
+      );
+    return { new: total("new"), resolved: total("resolved") };
+  }, [snapshot]);
+  const resolvedAt = useMemo(
+    () =>
+      new Map(
+        (snapshot?.resolvedFindings ?? []).map((finding) => [finding.id, finding.resolvedAt]),
+      ),
+    [snapshot?.resolvedFindings],
+  );
   const groups = useMemo(
     () => (snapshot ? attentionGroups(snapshot, filter, search) : []),
     [snapshot, filter, search],
   );
+  // A rule and a resolved history live on the PC that made them, so Snoozed & ignored and Resolved
+  // list only this PC's own findings: a connected PC's evidence carries neither, and its row would
+  // read "0 targets need attention" for data that was never shared.
+  // ponytail: a connected PC's hidden and resolved findings are reviewed on that PC; list them here
+  // only if rules or resolved history are ever shared between PCs.
   const remoteGroups = useMemo(
     () =>
       new Map(
@@ -602,23 +1137,42 @@ export function Attention() {
           const evidence = computerEvidence.get(computer.id);
           return [
             computer.id,
-            evidence ? attentionGroups(evidence.snapshot, filter, search) : [],
+            evidence && !localOnlyFilter(filter)
+              ? attentionGroups(evidence.snapshot, filter, search)
+              : [],
           ] as const;
         }),
       ),
     [application, computerEvidence, filter, search],
   );
   const expansion = useGroupExpansion();
+  const rules = useMemo(
+    () => new Map((snapshot?.findingRules ?? []).map((rule) => [rule.id, rule])),
+    [snapshot?.findingRules],
+  );
+  const hidden = snapshot ? suppressedCount(snapshot) : 0;
   const selected = findings.find((finding) => finding.id === selectedId);
   const counts = allGroups.reduce(
     (total, group) => ({
       packages: total.packages + group.counts.packages,
       updates: total.updates + group.counts.updates,
       advisories: total.advisories + group.counts.advisories,
+      lifecycle: total.lifecycle + group.counts.lifecycle,
+      other: total.other + group.counts.other,
       incomplete: total.incomplete + group.counts.incomplete,
     }),
-    { packages: 0, updates: 0, advisories: 0, incomplete: 0 },
+    { packages: 0, updates: 0, advisories: 0, lifecycle: 0, other: 0, incomplete: 0 },
   );
+  const tabCounts = {
+    all: counts.updates + counts.advisories + counts.lifecycle + counts.other + counts.incomplete,
+    new: changes.new,
+    updates: counts.updates,
+    advisories: counts.advisories,
+    lifecycle: counts.lifecycle,
+    coverage: counts.incomplete,
+    suppressed: hidden,
+    resolved: changes.resolved,
+  };
   const collected =
     !!snapshot &&
     (snapshot.inventory.evidence.lastAttempt !== null ||
@@ -627,11 +1181,22 @@ export function Attention() {
     <>
       <PageHeading
         title="Needs attention"
-        description="Review updates, advisories, and incomplete checks, grouped by your PC and selected projects."
-        actions={<ScanButton target="all" />}
+        description="Review updates, advisories, lifecycle findings, and incomplete checks, grouped by your PC and selected projects."
+        actions={
+          <>
+            <ExportButton initialScope={{ kind: "all" }} />
+            <RetryFailedButton />
+            <ScanButton target="all" />
+          </>
+        }
       />
-      <ScanProgress snapshot={snapshot} connected={connection === "connected"} />
+      <ScanProgress
+        snapshot={snapshot}
+        connected={connection === "connected"}
+        cancel={<CancelScanButton />}
+      />
       {application &&
+        !localOnlyFilter(filter) &&
         application.computers.some(
           (computer) =>
             computer.error ||
@@ -712,7 +1277,18 @@ export function Attention() {
           <FindingCounts counts={counts} />
           <div className="monitoring-toolbar">
             <div className="tabs" role="group" aria-label="Filter findings">
-              {(["all", "updates", "advisories", "coverage"] as const).map((item) => (
+              {(
+                [
+                  "all",
+                  "new",
+                  "updates",
+                  "advisories",
+                  "lifecycle",
+                  "coverage",
+                  "suppressed",
+                  "resolved",
+                ] as const
+              ).map((item) => (
                 <Button
                   key={item}
                   variant={filter === item ? "secondary" : "ghost"}
@@ -725,20 +1301,16 @@ export function Attention() {
                   {
                     {
                       all: "All findings",
+                      new: "New since last scan",
                       updates: "Updates",
                       advisories: "Advisories",
+                      lifecycle: "Lifecycle",
                       coverage: "Incomplete checks",
+                      suppressed: "Snoozed & ignored",
+                      resolved: "Resolved",
                     }[item]
                   }
-                  <Badge>
-                    {item === "all"
-                      ? counts.updates + counts.advisories + counts.incomplete
-                      : item === "updates"
-                        ? counts.updates
-                        : item === "advisories"
-                          ? counts.advisories
-                          : counts.incomplete}
-                  </Badge>
+                  <Badge>{tabCounts[item]}</Badge>
                 </Button>
               ))}
             </div>
@@ -760,15 +1332,37 @@ export function Attention() {
           {groups.length === 0 ? (
             <EmptyState
               title={
-                filter === "all" && !search.trim()
-                  ? "No recorded findings"
-                  : "No findings match this view"
+                filter === "new" && !search.trim()
+                  ? "Nothing new since each target's previous scan"
+                  : filter === "resolved" && !search.trim()
+                    ? "No resolved findings recorded"
+                    : filter === "all" && !search.trim()
+                      ? "No recorded findings"
+                      : "No findings match this view"
               }
             >
               <p>
                 Change your filters to inspect other evidence. Missing or unsupported checks cannot
                 establish safety.
               </p>
+              {filter === "new" && (
+                <p>
+                  New means first detected after the target's previous successful scan. Targets last
+                  scanned by an older version start comparing at their next successful scan.
+                </p>
+              )}
+              {filter === "resolved" && (
+                <p>
+                  A finding is listed for 30 days after a successful check stops reporting it.
+                  Resolutions from before this version, and on connected PCs, are not listed.
+                </p>
+              )}
+              {filter !== "suppressed" && filter !== "resolved" && hidden > 0 && (
+                <p>
+                  {plural(hidden, "snoozed or ignored finding")} {hidden === 1 ? "is" : "are"}{" "}
+                  hidden; review {hidden === 1 ? "it" : "them"} under Snoozed &amp; ignored.
+                </p>
+              )}
             </EmptyState>
           ) : (
             <div className="target-groups">
@@ -812,23 +1406,48 @@ export function Attention() {
                             </span>
                           </span>
                           <span className="target-group-badges">
-                            {group.counts.updates > 0 && (
-                              <Badge tone="info">
-                                {plural(
-                                  group.counts.updates,
-                                  "update available",
-                                  "updates available",
-                                )}
+                            {filter === "resolved" ? (
+                              // These findings are gone: live counts would read as open problems.
+                              <Badge>{plural(packageFindings.length, "resolved finding")}</Badge>
+                            ) : filter === "suppressed" ? (
+                              // A rule hides these: live counts would read as open problems.
+                              <Badge>
+                                {plural(group.findings.length, "snoozed or ignored finding")}
                               </Badge>
-                            )}
-                            {group.counts.advisories > 0 && (
-                              <Badge
-                                tone={advisoryTone(
-                                  packageFindings.filter((finding) => finding.kind === "advisory"),
+                            ) : (
+                              <>
+                                {group.counts.updates > 0 && (
+                                  <Badge tone="info">
+                                    {plural(
+                                      group.counts.updates,
+                                      "update available",
+                                      "updates available",
+                                    )}
+                                  </Badge>
                                 )}
-                              >
-                                {plural(group.counts.advisories, "advisory", "advisories")}
-                              </Badge>
+                                {group.counts.advisories > 0 && (
+                                  <Badge
+                                    tone={advisoryTone(
+                                      packageFindings.filter(
+                                        (finding) => finding.kind === "advisory",
+                                      ),
+                                    )}
+                                  >
+                                    {plural(group.counts.advisories, "advisory", "advisories")}
+                                  </Badge>
+                                )}
+                                {group.counts.lifecycle > 0 && (
+                                  <Badge
+                                    tone={advisoryTone(
+                                      packageFindings.filter(
+                                        (finding) => finding.kind === "lifecycle",
+                                      ),
+                                    )}
+                                  >
+                                    {plural(group.counts.lifecycle, "lifecycle finding")}
+                                  </Badge>
+                                )}
+                              </>
                             )}
                             <EvidenceBadge status={group.evidence.status} />
                             <StaleBadge
@@ -876,13 +1495,23 @@ export function Attention() {
                             {coverageFindings.map((finding) => (
                               <div key={finding.id}>
                                 <p>{finding.description}</p>
-                                <Button
-                                  variant="ghost"
-                                  size="compact"
-                                  onClick={() => setSelectedId(finding.id)}
-                                >
-                                  View scan details
-                                </Button>
+                                {finding.ruleId !== undefined && rules.get(finding.ruleId) && (
+                                  <p>{ruleLabel(rules.get(finding.ruleId)!)}</p>
+                                )}
+                                <div className="action-row">
+                                  <Button
+                                    variant="ghost"
+                                    size="compact"
+                                    onClick={() => setSelectedId(finding.id)}
+                                  >
+                                    View scan details
+                                  </Button>
+                                  <RowActions
+                                    label={`Snooze options for ${group.kind === "pc" ? "this PC" : group.label} incomplete checks`}
+                                  >
+                                    <RuleMenuItems finding={finding} ignore={setIgnoring} />
+                                  </RowActions>
+                                </div>
                               </div>
                             ))}
                           </section>
@@ -896,14 +1525,24 @@ export function Attention() {
                             </ul>
                           </section>
                         ) : null}
-                        {packageFindings.length > 0 ? (
+                        {packageFindings.length > 0 && filter === "resolved" ? (
+                          <ResolvedTable
+                            key={search}
+                            label={group.label + " resolved findings"}
+                            findings={packageFindings}
+                            resolvedAt={resolvedAt}
+                          />
+                        ) : packageFindings.length > 0 ? (
                           <FindingsTable
                             key={`${filter}:${search}`}
                             label={group.label + " findings"}
                             findings={packageFindings}
                             project={group.project}
                             retained={findingsRetained(group.evidence.status)}
+                            cooldownDays={cooldownDays}
+                            rules={rules}
                             select={setSelectedId}
+                            ignore={setIgnoring}
                           />
                         ) : coverageFindings.length === 0 && group.evidence.errors.length === 0 ? (
                           <EmptyState
@@ -950,6 +1589,7 @@ export function Attention() {
         </>
       )}
       {selected && <FindingDetails finding={selected} close={() => setSelectedId(null)} />}
+      {ignoring && <IgnoreFindingDialog finding={ignoring} close={() => setIgnoring(null)} />}
       {adding && <AddProjectDialog close={() => setAdding(false)} added={() => {}} />}
     </>
   );
@@ -962,8 +1602,26 @@ export function ThisPc() {
   const [source, setSource] = useState("all");
   const [filter, setFilter] = useState<InventoryFilter>("updates");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // A link to one installation (the command palette) opens its evidence sheet once, then the address
+  // goes back to plain /pc.
+  const { item: requestedItem } = useSearch({ from: "/pc" });
+  const navigate = useNavigate({ from: "/pc" });
+  const [openedItem, setOpenedItem] = useState<string | undefined>(undefined);
+  if (requestedItem !== openedItem) {
+    setOpenedItem(requestedItem);
+    if (requestedItem) setSelectedId(requestedItem);
+  }
+  useEffect(() => {
+    if (requestedItem) void navigate({ search: {}, replace: true, resetScroll: false });
+  }, [requestedItem, navigate]);
   const installations = snapshot?.inventory.installations ?? [];
+  const findings = snapshot?.findings ?? noFindings;
+  const cooldownDays = snapshot?.settings.releaseCooldownDays ?? 3;
+  const deviceId = snapshot?.device.id ?? "";
   const selected = installations.find((item) => item.id === selectedId);
+  const selectedFindings = selected ? installationFindings(findings, deviceId, selected) : [];
+  const selectedUpdate = selected ? installationUpdate(findings, deviceId, selected) : undefined;
+  const selectedDeprecation = selectedFindings.find((finding) => finding.kind === "lifecycle");
   const managers = snapshot?.inventory.managers ?? [];
   const visible = filterInstallations(installations, filter, source, search);
   const unscanned = snapshot?.inventory.evidence.lastAttempt === null && installations.length === 0;
@@ -978,14 +1636,26 @@ export function ThisPc() {
       <PageHeading
         title="This PC"
         description="Globally installed npm and Bun tools, their installed versions, and available upgrades."
-        actions={<ScanButton target="pc" />}
+        actions={
+          <>
+            <UpdateAllButton updater={updater} />
+            <ExportButton initialScope={{ kind: "pc" }} />
+            <ScanButton target="pc" />
+          </>
+        }
       />
-      <ScanProgress snapshot={snapshot} connected={connection === "connected"} kind="pc" />
+      <ScanProgress
+        snapshot={snapshot}
+        connected={connection === "connected"}
+        kind="pc"
+        cancel={<CancelScanButton />}
+      />
       {updater.error && (
         <p role="alert" className="error-text small mb-4">
           {updater.error}
         </p>
       )}
+      <UpdateAllProgress updater={updater} />
       {updater.runs.length > 0 && (
         <div className="panel panel-body mb-4" aria-label="Global tool updates" aria-live="polite">
           {updater.runs.map((run) => (
@@ -1179,23 +1849,29 @@ export function ThisPc() {
                       <span className="table-subtext">{item.channel}</span>
                     </td>
                     <td>
-                      {item.updateStatus !== "unknown" && (
-                        <div className="package-checks">
-                          <Badge tone={item.updateStatus === "available" ? "info" : "neutral"}>
-                            {previous
-                              ? "Previous result"
-                              : item.updateStatus === "available"
-                                ? "Update available"
-                                : "Current at source"}
-                          </Badge>
-                          {item.updateStatus === "available" && !previous && (
-                            <UpdateKindBadge
-                              installed={item.version}
-                              candidate={item.availableVersion}
-                            />
-                          )}
-                        </div>
-                      )}
+                      <div className="package-checks">
+                        {item.updateStatus !== "unknown" && (
+                          <>
+                            <Badge tone={item.updateStatus === "available" ? "info" : "neutral"}>
+                              {previous
+                                ? "Previous result"
+                                : item.updateStatus === "available"
+                                  ? "Update available"
+                                  : "Current at source"}
+                            </Badge>
+                            {item.updateStatus === "available" && !previous && (
+                              <UpdateKindBadge
+                                installed={item.version}
+                                candidate={item.availableVersion}
+                              />
+                            )}
+                          </>
+                        )}
+                        <PackageSignals
+                          findings={installationFindings(findings, deviceId, item)}
+                          cooldownDays={cooldownDays}
+                        />
+                      </div>
                     </td>
                     <td>
                       <GlobalToolUpdateButton item={item} updater={updater} />
@@ -1267,6 +1943,15 @@ export function ThisPc() {
             <dd>{selected.scope}</dd>
             <dt>Channel</dt>
             <dd>{selected.channel}</dd>
+            {selectedUpdate && (
+              <ReleaseFacts finding={selectedUpdate} cooldownDays={cooldownDays} />
+            )}
+            {selectedDeprecation && (
+              <>
+                <dt>Installed version deprecation</dt>
+                <dd>{selectedDeprecation.description}</dd>
+              </>
+            )}
           </dl>
           {snapshot && <Evidence level={3} evidence={snapshot.inventory.evidence} />}
           {snapshot?.inventory.updateEvidence && (
@@ -1296,6 +1981,7 @@ function DependencyDetails({
   close: () => void;
 }) {
   const { snapshot } = useMonitoring();
+  const cooldownDays = snapshot?.settings.releaseCooldownDays ?? 3;
   const related = dependencyFindings(
     dependency,
     snapshot?.findings.filter((finding) => finding.subjectId === project.id) ?? [],
@@ -1367,7 +2053,7 @@ function DependencyDetails({
             const url = safeExternalUrl(finding.advisoryUrl);
             return (
               <article className="dependency-finding" key={finding.id}>
-                <FindingBadge finding={finding} />
+                <FindingBadge finding={finding} cooldownDays={cooldownDays} />
                 <p>{finding.description}</p>
                 <dl className="details-list">
                   <dt>Source</dt>
@@ -1379,6 +2065,9 @@ function DependencyDetails({
                       <dt>Provider-listed fixed boundary</dt>
                       <dd className="mono">{finding.availableVersion ?? "Not established"}</dd>
                     </>
+                  )}
+                  {finding.kind === "update" && (
+                    <ReleaseFacts finding={finding} cooldownDays={cooldownDays} />
                   )}
                 </dl>
                 {url && (
@@ -1411,6 +2100,7 @@ const ProjectDependencies = memo(function ProjectDependencies({
   findings,
   search,
   showAll,
+  cooldownDays,
   setShowAll,
   clearSearch,
   select,
@@ -1419,6 +2109,7 @@ const ProjectDependencies = memo(function ProjectDependencies({
   findings: readonly Finding[];
   search: string;
   showAll: boolean;
+  cooldownDays: number;
   setShowAll: (projectId: string, showAll: boolean) => void;
   clearSearch: () => void;
   select: (projectId: string, dependencyId: string) => void;
@@ -1566,6 +2257,10 @@ const ProjectDependencies = memo(function ProjectDependencies({
                         ? "No known matches"
                         : lookupLabels[item.advisoryStatus]}
                   </Badge>
+                  <PackageSignals
+                    findings={dependencyFindings(item, findings)}
+                    cooldownDays={cooldownDays}
+                  />
                 </div>
               </td>
               <td>
@@ -1635,13 +2330,291 @@ function RemoveProjectDialog({
   );
 }
 
+/** Copyable commands for a project's available updates, one per workspace and dependency type. Copy only. */
+function UpgradeCommandsDialog({
+  project,
+  findings,
+  cooldownDays,
+  close,
+}: {
+  project: Project;
+  findings: readonly Finding[];
+  cooldownDays: number;
+  close: () => void;
+}) {
+  const [major, setMajor] = useState(false);
+  const [status, say] = useStatusLine();
+  const now = useNow();
+  const plan = useMemo(
+    () => projectUpgradePlan(project, findings, major, cooldownDays, now),
+    [project, findings, major, cooldownDays, now],
+  );
+  const scanNotice = latestScanNotice(project.evidence.status);
+  return (
+    <Dialog
+      title={`Upgrade commands for ${project.name}`}
+      description="Copy only. Versionstead never runs installs in project folders."
+      onClose={close}
+    >
+      <div className="flex items-center gap-2">
+        <Switch
+          aria-label="Include major updates"
+          checked={major}
+          onCheckedChange={(checked) => {
+            setMajor(checked);
+            say("");
+          }}
+        />
+        <span className="small">Include major updates</span>
+      </div>
+      <p className="muted small">
+        {major
+          ? "Each package moves to its latest release, including major versions."
+          : "Compatible updates only: no package changes its major version."}
+      </p>
+      <p className="muted small">
+        Based on the last successful scan, {timestamp(project.evidence.lastSuccess)}.
+        {scanNotice && <span className="error-text"> {scanNotice}</span>}
+      </p>
+      {plan.commands.length > 0 ? (
+        <>
+          <ul className="mt-3 grid gap-2">
+            {plan.commands.map((item) => (
+              <li key={item.command} className="grid gap-1">
+                <span className="small">
+                  {item.where} · {plural(item.packages, "package")}
+                </span>
+                <CommandBlock
+                  command={item.command}
+                  label={`Copy upgrade command for ${item.where}`}
+                  say={say}
+                />
+              </li>
+            ))}
+          </ul>
+          <p className="muted small">
+            Run from {project.repository ? "your clone of" : "the folder"}{" "}
+            <span className="mono">{project.repository?.url ?? project.path}</span>.
+          </p>
+        </>
+      ) : (
+        <p className="muted">{upgradeEmptyText(plan.unchecked, major)}</p>
+      )}
+      {plan.unchecked > 0 && (
+        <p className="muted small">
+          {plural(plan.unchecked, "package")} could not be checked, so no command is offered for{" "}
+          {plan.unchecked === 1 ? "it" : "them"}.
+        </p>
+      )}
+      {plan.unsupported > 0 && (
+        <p className="muted small">
+          {plural(plan.unsupported, "package")} {plan.unsupported === 1 ? "has" : "have"} no safe
+          command (an alias, a workspace path that cannot be quoted, or a package manager
+          Versionstead has no command for); the row menu still copies the package name.
+        </p>
+      )}
+      {plan.held > 0 && (
+        <p className="muted small">
+          {plural(plan.held, "snoozed or ignored package")} {plan.held === 1 ? "is" : "are"} left
+          out.
+        </p>
+      )}
+      {plan.tooNew > 0 && (
+        <p className="muted small">
+          {plural(plan.tooNew, "package")} released within the release cooldown{" "}
+          {plan.tooNew === 1 ? "is" : "are"} left out until{" "}
+          {plan.tooNew === 1 ? "it is" : "they are"} old enough (Settings › General); the Projects
+          table says when.
+        </p>
+      )}
+      {plan.commands.length > 0 && (
+        <p className="muted small">
+          The release cooldown holds back only releases with a known date. A release with no known
+          date{major ? ", or a latest release newer than the compatible update," : ""} is included.
+        </p>
+      )}
+      {status}
+      <div className="form-actions">
+        <Button onClick={close}>Close</Button>
+        <Button
+          variant="primary"
+          disabled={plan.commands.length === 0}
+          onClick={() => {
+            void copyText(
+              copyAllText(plan),
+              plan.commands.length === 1 ? "Upgrade command copied." : "Upgrade commands copied.",
+              say,
+            );
+          }}
+        >
+          <Copy size={13} aria-hidden="true" />
+          Copy all
+        </Button>
+      </div>
+    </Dialog>
+  );
+}
+
+/** Packages in use at several versions; the package name opens its version matrix. */
+function VersionDriftTable({
+  rows,
+  search,
+  select,
+}: {
+  rows: readonly DriftRow[];
+  search: string;
+  select: (key: string) => void;
+}) {
+  const visible = useMemo(
+    () =>
+      rows.filter((row) =>
+        `${row.packageName} ${row.usages.map((usage) => `${usage.subjectLabel} ${usage.name}`).join(" ")}`
+          .toLowerCase()
+          .includes(search),
+      ),
+    [rows, search],
+  );
+  if (!visible.length)
+    return rows.length > 0 ? (
+      <EmptyState title="No drifting packages match this search">
+        <p>
+          Search matches package names, aliases, and the projects that use them. Clear the search to
+          see all {plural(rows.length, "drifting package")}.
+        </p>
+      </EmptyState>
+    ) : (
+      <EmptyState title="No version drift in collected evidence">
+        <p>
+          Every direct registry dependency resolves to one version across selected projects, and npm
+          and Bun copies of each global tool match. Only SemVer versions from collected evidence are
+          compared; failed or unscanned projects, and a PC scan that failed or never ran, contribute
+          their last collected versions or none.
+        </p>
+      </EmptyState>
+    );
+  return (
+    <PagedTable
+      key={search}
+      label="Version drift"
+      head={
+        <tr>
+          <th scope="col">Package</th>
+          <th scope="col">Align to</th>
+          <th scope="col">Versions in use</th>
+          <th scope="col">Behind</th>
+        </tr>
+      }
+      rows={visible}
+      renderRow={(row) => (
+        <tr key={row.key}>
+          <td>
+            <div className="package-label">
+              <PackageIcon size={14} aria-hidden="true" />
+              <button className="item-label" onClick={() => select(row.key)}>
+                {row.packageName}
+              </button>
+            </div>
+            <span className="table-subtext">
+              {row.scope === "global"
+                ? `This PC · ${[...new Set(row.usages.map((usage) => usage.where))].join(" and ")}`
+                : plural(new Set(row.usages.map((usage) => usage.subjectId)).size, "project")}
+            </span>
+          </td>
+          <td className="mono">{row.target}</td>
+          <td className="mono">{row.versions.join(" · ")}</td>
+          <td>
+            {plural(row.usages.filter((usage) => usage.behind).length, "copy", "copies")} behind
+          </td>
+        </tr>
+      )}
+    />
+  );
+}
+
+/** Every copy of one package, its version, and the command that moves it to the version the row aligns to. */
+function VersionDriftDetails({ row, close }: { row: DriftRow; close: () => void }) {
+  const { snapshot, connection } = useMonitoring();
+  const hold = pcUpdateHold(connection === "connected", snapshot);
+  const basis =
+    parseSemver(row.target)?.pre.length === 0
+      ? "the newest stable version in use"
+      : "the newest prerelease in use, since no stable version is in use";
+  return (
+    <Dialog title="Version drift" onClose={close} drawer>
+      <h3 className="detail-title">{row.packageName}</h3>
+      <p>
+        Copies align to <span className="mono">{row.target}</span>: {basis}.
+      </p>
+      <p>
+        Each command moves one older copy to it; run a project command in that project's folder. A
+        copy at or newer than it is left as it is. Versionstead never runs these commands.
+      </p>
+      <p className="muted small">
+        Versions come from each target's latest collected evidence; a target that failed or was
+        never scanned may be out of date.
+        {row.scope === "global" && snapshot?.inventory.evidence.status === "partial" && (
+          <>
+            {" "}
+            This PC's last scan was partial: a global location it could not read keeps the copies
+            from an earlier scan, so a copy listed here may be out of date.
+          </>
+        )}
+      </p>
+      {/* A list, not a table: the sheet is too narrow for four columns beside a command. */}
+      <ul aria-label={`${row.packageName} copies`} className="mt-4 grid gap-3">
+        {behindFirst(row.usages).map((usage, index) => {
+          const action = usageAction(row, usage, hold);
+          return (
+            // The project root and a workspace folder named "root" read alike, and copies identical
+            // in everything shown can only be told apart by their position.
+            <li
+              key={`${usage.subjectId}:${usage.where}:${usage.name}:${usage.version}:${usage.command ?? ""}:${index}`}
+              className="grid gap-1.5 border-b border-border pb-3 last:border-b-0 last:pb-0"
+            >
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <strong>{usage.subjectLabel}</strong>
+                <span className="mono small">{usage.where}</span>
+              </div>
+              {usage.name !== row.packageName && (
+                <span className="muted small mono">Alias: {usage.name}</span>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="mono">{usage.version}</span>
+                {usage.behind && (
+                  <UpdateKindBadge installed={usage.version} candidate={row.target} />
+                )}
+              </div>
+              {action === "unchanged" ? (
+                <span className="muted small">No change needed</span>
+              ) : action === "none" ? (
+                <span className="small">
+                  No safe command (an alias, a source that is not the registry, or a workspace path
+                  that cannot be quoted)
+                </span>
+              ) : action === "held" ? (
+                <span className="small">{hold} before copying a command.</span>
+              ) : (
+                <CommandBlock
+                  command={usage.command!}
+                  label={`Copy align command for ${usage.subjectLabel} ${usage.where}`}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </Dialog>
+  );
+}
+
 export function Projects() {
   const { snapshot, connection, pending, mutate } = useMonitoring();
-  const [filter, setFilter] = useState<"attention" | "all">("attention");
+  const [filter, setFilter] = useState<"attention" | "all" | "drift">("attention");
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [adding, setAdding] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const [upgradingId, setUpgradingId] = useState<string | null>(null);
   const canAdd = connection === "connected" && !pending.has(actionKeys.addProject);
   const [selectedDependency, setSelectedDependency] = useState<{
     projectId: string;
@@ -1650,6 +2623,11 @@ export function Projects() {
   const [allDependencies, setAllDependencies] = useState<Record<string, boolean>>({});
   const projects = snapshot?.projects ?? [];
   const findings = snapshot?.findings ?? noFindings;
+  const cooldownDays = snapshot?.settings.releaseCooldownDays ?? 3;
+  const rules = useMemo(
+    () => new Map((snapshot?.findingRules ?? []).map((rule) => [rule.id, rule])),
+    [snapshot?.findingRules],
+  );
   const attentionProjects = projects.filter((project) =>
     projectNeedsAttention(project, findings, snapshot?.scanProgress),
   );
@@ -1673,7 +2651,51 @@ export function Projects() {
     () => (snapshot ? attentionGroups(snapshot).filter((group) => group.kind === "project") : []),
     [snapshot],
   );
+  const drift = useMemo(() => (snapshot ? versionDrift(snapshot) : []), [snapshot]);
+  const [driftKey, setDriftKey] = useState<string | null>(null);
+  const driftRow = drift.find((row) => row.key === driftKey);
   const expansion = useGroupExpansion();
+  // A link to a project or one of its dependencies (the command palette, Add project from it) lists
+  // every project, opens that one and the dependency's evidence sheet once, then leaves the address.
+  const { project: requestedProject, dependency: requestedDependency } = useSearch({
+    from: "/projects",
+  });
+  const navigate = useNavigate({ from: "/projects" });
+  const request = requestedProject ? `${requestedProject}/${requestedDependency ?? ""}` : undefined;
+  const [appliedRequest, setAppliedRequest] = useState<string | undefined>(undefined);
+  if (request !== appliedRequest) {
+    setAppliedRequest(request);
+    if (requestedProject) {
+      setFilter("all");
+      setQuery("");
+      expansion.setOpen(requestedProject, true);
+      if (requestedDependency)
+        setSelectedDependency({ projectId: requestedProject, dependencyId: requestedDependency });
+    }
+  }
+  useEffect(() => {
+    if (!requestedProject) return;
+    // After the route's own focus move, so the project keeps focus (a sheet takes its own). A timer,
+    // not an animation frame: a hidden window runs none. The list can still be the previous search's,
+    // or not loaded yet, so look again for a second. ponytail: after that the project stays expanded
+    // but unfocused; wait for the list itself if a slow workspace ever misses.
+    let attempts = 0;
+    let timer = 0;
+    const focusProject = () => {
+      const trigger = document.querySelector<HTMLElement>(
+        `[data-project-id="${CSS.escape(requestedProject)}"] [data-testid="project-disclosure"]`,
+      );
+      if (!trigger && ++attempts < 20) {
+        timer = window.setTimeout(focusProject, 50);
+        return;
+      }
+      trigger?.scrollIntoView({ block: "nearest" });
+      if (!requestedDependency) trigger?.focus({ preventScroll: true });
+      void navigate({ search: {}, replace: true, resetScroll: false });
+    };
+    timer = window.setTimeout(focusProject);
+    return () => window.clearTimeout(timer);
+  }, [requestedProject, requestedDependency, navigate]);
   const setShowAll = useCallback(
     (projectId: string, showAll: boolean) =>
       setAllDependencies((previous) => ({ ...previous, [projectId]: showAll })),
@@ -1685,6 +2707,7 @@ export function Projects() {
     [],
   );
   const removing = projects.find((project) => project.id === removingId);
+  const upgrading = projects.find((project) => project.id === upgradingId);
   const selectedProject = projects.find((project) => project.id === selectedDependency?.projectId);
   const dependency = selectedProject?.dependencies.find(
     (item) => item.id === selectedDependency?.dependencyId,
@@ -1692,7 +2715,9 @@ export function Projects() {
   const projectIds = new Set(projects.map((project) => project.id));
   const counts = {
     ...findingCounts(
-      findings.filter((finding) => projectIds.has(finding.subjectId)),
+      findings.filter(
+        (finding) => projectIds.has(finding.subjectId) && finding.ruleId === undefined,
+      ),
       snapshot?.device.id ?? "",
     ),
     incomplete: projectGroups.reduce((total, group) => total + group.counts.incomplete, 0),
@@ -1704,6 +2729,7 @@ export function Projects() {
         description="Selected folders and repositories, dependencies needing review, and the evidence behind every check."
         actions={
           <div className="action-row">
+            <ExportButton initialScope={{ kind: "all" }} />
             <ScanButton target="projects" label="Scan projects" />
             <Button variant="primary" size="sm" disabled={!canAdd} onClick={() => setAdding(true)}>
               <Plus size={14} aria-hidden="true" />
@@ -1712,7 +2738,12 @@ export function Projects() {
           </div>
         }
       />
-      <ScanProgress snapshot={snapshot} connected={connection === "connected"} kind="project" />
+      <ScanProgress
+        snapshot={snapshot}
+        connected={connection === "connected"}
+        kind="project"
+        cancel={<CancelScanButton />}
+      />
       {!snapshot ? (
         <EmptyState title="Waiting for your coordinator">
           <p>Connect to read your selected folders and saved project evidence.</p>
@@ -1753,6 +2784,14 @@ export function Projects() {
               >
                 All projects<Badge>{projects.length}</Badge>
               </Button>
+              <Button
+                variant={filter === "drift" ? "secondary" : "ghost"}
+                size="sm"
+                aria-pressed={filter === "drift"}
+                onClick={() => setFilter("drift")}
+              >
+                Version drift<Badge>{drift.length}</Badge>
+              </Button>
             </div>
             <label className="monitoring-search">
               <Search size={14} aria-hidden="true" />
@@ -1765,14 +2804,28 @@ export function Projects() {
               />
             </label>
           </div>
-          <div className="monitoring-summary">
-            <span>
-              {visibleProjects.length} of {plural(projects.length, "selected project")} shown ·
-              Complete projects with no recorded findings remain available in All projects.
-            </span>
-            <ExpandCollapseAll ids={visibleProjects.map((item) => item.id)} expansion={expansion} />
-          </div>
-          {visibleProjects.length === 0 ? (
+          {filter !== "drift" && (
+            <div className="monitoring-summary">
+              <span>
+                {visibleProjects.length} of {plural(projects.length, "selected project")} shown ·
+                Complete projects with no recorded findings remain available in All projects.
+              </span>
+              <ExpandCollapseAll
+                ids={visibleProjects.map((item) => item.id)}
+                expansion={expansion}
+              />
+            </div>
+          )}
+          {filter === "drift" ? (
+            <>
+              <p className="monitoring-summary">
+                Packages resolved at different versions across selected projects, and npm and Bun
+                copies of the same global tool. Computed from collected evidence; this view creates
+                no notifications.
+              </p>
+              <VersionDriftTable rows={drift} search={search} select={setDriftKey} />
+            </>
+          ) : visibleProjects.length === 0 ? (
             <EmptyState
               title={
                 query.trim()
@@ -1800,6 +2853,7 @@ export function Projects() {
               {visibleProjects.map((project) => {
                 const projectFindings = findingsByProject.get(project.id) ?? noFindings;
                 const projectCounts = findingCounts(projectFindings, snapshot.device.id);
+                const notices = runtimeNotices(projectFindings);
                 const queued = snapshot.scanProgress?.queued.some(
                   (target) => target.targetId === project.id,
                 );
@@ -1849,6 +2903,15 @@ export function Projects() {
                                 )}
                               >
                                 {plural(projectCounts.advisories, "advisory", "advisories")}
+                              </Badge>
+                            )}
+                            {projectCounts.lifecycle > 0 && (
+                              <Badge
+                                tone={advisoryTone(
+                                  projectFindings.filter((finding) => finding.kind === "lifecycle"),
+                                )}
+                              >
+                                {plural(projectCounts.lifecycle, "lifecycle finding")}
                               </Badge>
                             )}
                             <EvidenceBadge status={project.evidence.status} />
@@ -1918,6 +2981,16 @@ export function Projects() {
                             >
                               Remove
                             </Button>
+                            {project.dependencies.length > 0 && (
+                              <Button
+                                variant="ghost"
+                                size="compact"
+                                aria-label={`Upgrade commands: ${project.name}`}
+                                onClick={() => setUpgradingId(project.id)}
+                              >
+                                Upgrade commands
+                              </Button>
+                            )}
                             <ProjectCommands project={project} />
                           </div>
                         </div>
@@ -1929,6 +3002,35 @@ export function Projects() {
                                 <li key={message}>{message}</li>
                               ))}
                             </ul>
+                          </section>
+                        )}
+                        {notices.length > 0 && (
+                          <section className="notice">
+                            <h3>Runtime support</h3>
+                            <ul>
+                              {notices.map((notice) => (
+                                <li key={notice.id}>
+                                  {notice.name}: {findingSummary(notice)}
+                                  {notice.ruleId !== undefined &&
+                                    rules.get(notice.ruleId) &&
+                                    ` (${ruleLabel(rules.get(notice.ruleId)!)})`}
+                                </li>
+                              ))}
+                            </ul>
+                            <div className="mt-2">
+                              <Link
+                                className="text-link"
+                                to="/"
+                                search={{
+                                  filter: notices.some((notice) => notice.ruleId === undefined)
+                                    ? "lifecycle"
+                                    : "suppressed",
+                                }}
+                                aria-label={`Review in Needs attention: ${project.name}`}
+                              >
+                                Review in Needs attention
+                              </Link>
+                            </div>
                           </section>
                         )}
                         {project.dependencies.length === 0 ? (
@@ -1959,6 +3061,7 @@ export function Projects() {
                             findings={projectFindings}
                             search={search}
                             showAll={allDependencies[project.id] === true}
+                            cooldownDays={cooldownDays}
                             setShowAll={setShowAll}
                             clearSearch={clearSearch}
                             select={selectDependency}
@@ -2034,6 +3137,15 @@ export function Projects() {
           }}
         />
       )}
+      {upgrading && (
+        <UpgradeCommandsDialog
+          project={upgrading}
+          findings={findingsByProject.get(upgrading.id) ?? noFindings}
+          cooldownDays={cooldownDays}
+          close={() => setUpgradingId(null)}
+        />
+      )}
+      {driftRow && <VersionDriftDetails row={driftRow} close={() => setDriftKey(null)} />}
       {dependency && selectedProject && (
         <DependencyDetails
           dependency={dependency}
@@ -2073,8 +3185,7 @@ export function Service() {
     );
   const settings = snapshot.settings;
   const connected = connection === "connected";
-  const undelivered = snapshot.notifications.filter((item) => !item.deliveredAt);
-  const summary = snapshot.notificationSummary;
+  const delivery = deliveryStatus(snapshot);
   // Each setting waits only for its own save, so changing one never holds back another.
   const changeSetting = (field: string, value: boolean | number, message: string) => {
     void mutate("/api/settings", { [field]: value }, decodeMonitoringSettings, message, "PATCH", {
@@ -2110,7 +3221,7 @@ export function Service() {
           </>
         }
       />
-      <ScanProgress snapshot={snapshot} connected={connected} />
+      <ScanProgress snapshot={snapshot} connected={connected} cancel={<CancelScanButton />} />
       <section className="service-status">
         <span className={`status-dot ${connected ? "" : "unknown"}`} aria-hidden="true" />
         <div>
@@ -2209,8 +3320,10 @@ export function Service() {
                 <h3>Notify with a summary</h3>
                 <p>
                   New updates and advisories are grouped into one count-based notification after
-                  scanning. Unchanged rescans stay quiet; closely spaced discoveries are combined
-                  during a five-minute cooldown.
+                  scanning, or into one daily digest when Settings › General sets Notification
+                  delivery to a digest. Unchanged rescans stay quiet; closely spaced discoveries are
+                  combined during a five-minute cooldown. Quiet hours hold only the native
+                  notification.
                 </p>
               </div>
               <Switch
@@ -2225,19 +3338,13 @@ export function Service() {
             <div className="setting-row">
               <div>
                 <h3>Waiting for delivery</h3>
-                <p>
-                  {summary
-                    ? `${plural(summary.updateCount, "update")} and ${plural(summary.advisoryCount, "advisory finding")} are ready to review.`
-                    : undelivered.length
-                      ? "New findings are being combined into the next summary."
-                      : "No new findings are waiting."}
-                </p>
+                <p>{delivery.text}</p>
                 {snapshot.notificationNextAt && (
                   <p>Next eligible summary: {timestamp(snapshot.notificationNextAt)}</p>
                 )}
               </div>
-              <Badge tone={undelivered.length ? "info" : "neutral"}>
-                {undelivered.length ? "1 summary pending" : "None pending"}
+              <Badge tone={delivery.pending ? "info" : "neutral"}>
+                {delivery.pending ? "1 summary pending" : "None pending"}
               </Badge>
             </div>
             <p className="settings-note">
@@ -2280,12 +3387,23 @@ export function Service() {
                     </span>
                   </td>
                   <td>
-                    <EvidenceBadge status={scan.status} />
+                    {scan.cancelled ? (
+                      <Badge>Cancelled</Badge>
+                    ) : (
+                      <EvidenceBadge status={scan.status} />
+                    )}
                   </td>
                   <td className="wrap-cell">
                     {scan.coverage.join(" · ") || "No coverage recorded"}
-                    {scan.errors.map((error) => (
-                      <span className="table-subtext error-text" key={error}>
+                    {scan.errors.map((error, index) => (
+                      <span
+                        className={
+                          scan.cancelled && index === 0
+                            ? "table-subtext"
+                            : "table-subtext error-text"
+                        }
+                        key={error}
+                      >
                         {error}
                       </span>
                     ))}

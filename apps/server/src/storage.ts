@@ -13,6 +13,17 @@ export type StoredMonitoring = {
   due: Record<string, number>;
   notified: string[];
 };
+
+/** Cached public-source documents (endoflife.date products, deps.dev release facts), kept beside the snapshot. */
+export type SourceStore = {
+  /** The copy and when it was fetched; null when there is none or it cannot be read back. */
+  readSource(key: string): { value: unknown; fetchedAt: string } | null;
+  /** `fetchedAt` is an ISO 8601 UTC time (`toISOString()`), which pruning sorts as text. */
+  writeSource(key: string, value: unknown, fetchedAt: string): void;
+  /** Keeps the newest `keep` entries whose key starts with `prefix`. */
+  pruneSources(prefix: string, keep: number): void;
+};
+
 // The JSON of each stored row: everything but projects and findings, each project, and the
 // findings of each subject.
 type Rows = { meta: string; projects: Map<string, string>; findings: Map<string, string> };
@@ -65,8 +76,9 @@ function rows({
   };
 }
 
-export class MonitoringStorage {
+export class MonitoringStorage implements SourceStore {
   private readonly database: DatabaseSync;
+  private sourceTableReady = false;
   // What each row holds, so a write replaces only the rows whose JSON changed.
   private written: Rows | null = null;
 
@@ -162,6 +174,48 @@ export class MonitoringStorage {
     const next = rows(state);
     this.transaction(() => this.save(next));
     this.written = next;
+  }
+
+  // ponytail: public-source documents share one key/value table created on first use; it is not part
+  // of the snapshot, so writing it never advances the revision. Split it when a source needs queries.
+  private sources() {
+    if (!this.sourceTableReady) {
+      this.database.exec(
+        "CREATE TABLE IF NOT EXISTS source_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, fetched_at TEXT NOT NULL)",
+      );
+      this.sourceTableReady = true;
+    }
+    return this.database;
+  }
+
+  readSource(key: string) {
+    const row = this.sources()
+      .prepare("SELECT value, fetched_at FROM source_cache WHERE key=?")
+      .get(key);
+    // A copy that cannot be read back is no copy; its source is asked again. That includes a fetch
+    // time that does not parse, which could never compare as old and so would read as fresh.
+    if (!row || Number.isNaN(Date.parse(String(row.fetched_at)))) return null;
+    try {
+      return { value: JSON.parse(String(row.value)) as unknown, fetchedAt: String(row.fetched_at) };
+    } catch {
+      return null;
+    }
+  }
+
+  writeSource(key: string, value: unknown, fetchedAt: string) {
+    this.sources()
+      .prepare(
+        "INSERT INTO source_cache(key,value,fetched_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,fetched_at=excluded.fetched_at",
+      )
+      .run(key, JSON.stringify(value), fetchedAt);
+  }
+
+  pruneSources(prefix: string, keep: number) {
+    this.sources()
+      .prepare(
+        "DELETE FROM source_cache WHERE substr(key,1,length(?1))=?1 AND key NOT IN (SELECT key FROM source_cache WHERE substr(key,1,length(?1))=?1 ORDER BY fetched_at DESC, key DESC LIMIT ?2)",
+      )
+      .run(prefix, keep);
   }
 
   close() {

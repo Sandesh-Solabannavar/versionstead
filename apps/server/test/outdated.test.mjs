@@ -502,9 +502,10 @@ test("native versions replace only verified direct lookups while OSV still check
           },
         ],
       });
-    registry.push(url);
+    const name = decodeURIComponent(new URL(url).pathname.slice(1));
+    registry.push(name);
     return Response.json({
-      name: "second",
+      name,
       versions: { "1.0.0": {}, "1.3.0": {} },
       "dist-tags": { latest: "1.3.0" },
     });
@@ -519,7 +520,9 @@ test("native versions replace only verified direct lookups while OSV still check
     queries.map((q) => q.version),
     ["1.0.0", "1.0.0", "3.0.0"],
   );
-  assert.equal(registry.length, 1);
+  // Every direct name is read for its deprecation and install-script flags; only the name the
+  // package manager did not answer supplies versions.
+  assert.deepEqual(registry.sort(), ["example", "second"]);
   assert.equal(result.dependencies[0].availableVersion, "1.9.0");
   assert.equal(result.dependencies[0].versionSource, "npm outdated 11.7.0");
   assert.equal(result.dependencies[1].versionSource, "npm registry");

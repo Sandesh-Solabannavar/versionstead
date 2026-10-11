@@ -7,6 +7,8 @@ import { isAlias, isScalar, parseDocument, visit } from "yaml";
 import semver from "semver";
 import { parseTree, getNodeValue, type ParseError } from "jsonc-parser";
 import { decodeBunConfiguration } from "./bun-config.ts";
+import type { DeclaredRuntime } from "./lifecycle.ts";
+import { declaredRuntimes } from "./runtimes.ts";
 import type { Dependency, Project } from "@versionstead/contracts/monitoring";
 
 export const identity = (...parts: string[]) =>
@@ -215,6 +217,10 @@ export type ProjectInputs = {
   coverage: string[];
   errors: string[];
   inputFingerprint: string;
+  /** Runtime lines the project declares, for lifecycle checks. */
+  runtimes?: DeclaredRuntime[];
+  /** A .nvmrc or .node-version could not be read, so `runtimes` may lack a line it declares. */
+  runtimeFileUnreadable?: boolean;
 };
 
 function parseJson(text: string) {
@@ -837,6 +843,23 @@ export async function inspectProjectFiles(
     }
     return dep;
   });
+  // Runtime declarations are optional inputs: an unreadable one is a note, never a failed scan.
+  const runtimeFile = async (name: ".nvmrc" | ".node-version") => {
+    try {
+      return await read(name, 4 * 1024);
+    } catch {
+      inputs.runtimeFileUnreadable = true;
+      inputs.coverage.push(
+        `${name} could not be read safely; its Node.js end of life was not checked.`,
+      );
+      return null;
+    }
+  };
+  const nvmrc = await runtimeFile(".nvmrc");
+  const nodeVersion = await runtimeFile(".node-version");
+  const declared = declaredRuntimes(manifest, { nvmrc, nodeVersion }, inputs.dependencies);
+  inputs.runtimes = declared.runtimes;
+  inputs.coverage.push(...declared.notes);
   const internal = inputs.dependencies.filter(
     (d) => d.origin === "workspace" || d.origin === "local",
   );
@@ -864,6 +887,8 @@ export async function inspectProjectFiles(
         manifestText,
         npm ?? pnpm ?? bun,
         npmrc,
+        nvmrc,
+        nodeVersion,
         inputs.inputFingerprint,
         inputs.dependencies.map((dep) => [
           dep.id,

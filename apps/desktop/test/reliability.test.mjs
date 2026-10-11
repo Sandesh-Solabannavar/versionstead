@@ -147,16 +147,16 @@ test("the desktop proxy waits for slow work and only a failed connection detache
   assert.equal(await forwardRequest(fetch, `${stoppedOrigin}/api/status`, {}, idle), null);
 });
 
-test("the project command bridge is exposed on every desktop platform", async () => {
+test("the project command bridge is exposed on every desktop platform, and Update all uses its own channels", async () => {
   const source = await readFile(new URL("../dist/preload.cjs", import.meta.url), "utf8");
-  const bridge = (platform) => {
+  const bridge = (platform, ipcRenderer = {}) => {
     let api;
     runInNewContext(source, {
       exports: {},
       process: { platform },
       require: () => ({
         contextBridge: { exposeInMainWorld: (_name, value) => (api = value) },
-        ipcRenderer: {},
+        ipcRenderer,
       }),
     });
     return api;
@@ -176,6 +176,37 @@ test("the project command bridge is exposed on every desktop platform", async ()
     for (const name of actions)
       assert.equal(typeof api[name], "function", `${platform} exposes ${name}`);
   }
+  // The page sees exactly these members: a channel added to the bridge has to be named here.
+  assert.deepEqual(Object.keys(bridge("win32")).sort(), [
+    "globalToolUpdateBatch",
+    "globalToolUpdateCommand",
+    "globalToolUpdateStatus",
+    "loginItem",
+    "onNotificationSummary",
+    "platform",
+    "projectActionShell",
+    "projectActionStatus",
+    "runProjectAction",
+    "selectProjectDirectory",
+    "setLoginItem",
+    "setWindowTheme",
+    "stopGlobalToolUpdates",
+    "stopProjectAction",
+    "updateAllGlobalTools",
+    "updateGlobalTool",
+  ]);
+  // Update all asks the main process through its own three channels and passes the request on as is.
+  const calls = [];
+  const updater = bridge("win32", { invoke: async (...call) => calls.push(call) });
+  const request = { items: [] };
+  await updater.updateAllGlobalTools(request);
+  await updater.stopGlobalToolUpdates();
+  await updater.globalToolUpdateBatch();
+  assert.deepEqual(calls, [
+    ["versionstead:global-tool-update-all", request],
+    ["versionstead:global-tool-update-stop"],
+    ["versionstead:global-tool-update-batch"],
+  ]);
 });
 
 test("startup failures show only messages written for the owner", () => {

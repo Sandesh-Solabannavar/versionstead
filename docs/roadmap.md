@@ -68,7 +68,15 @@ Acceptance:
 
 ## 4 — Cross-platform daily use
 
-Status: macOS/Linux connection credentials (OS keychain), paired-PC hosting, custom commands, a background host (LaunchAgent, systemd user service) and open-at-login are implemented with the automated checks listed in the [README platform table](../README.md#platform-support); Homebrew and Linux package-manager adapters, packaging, digests and hardware acceptance remain open.
+Status: macOS/Linux connection credentials (OS keychain), paired-PC hosting, custom commands, a background host (LaunchAgent, systemd user service) and open-at-login are implemented with the automated checks listed in the [README platform table](../README.md#platform-support); Homebrew and Linux package-manager adapters, packaging and hardware acceptance remain open.
+
+Status: runtime support timelines from endoflife.date (each with its source and check date), deprecated packages, install-script changes, release age with a cooldown, and license/provenance from deps.dev are implemented; see [Architecture](architecture.md).
+
+Noise control is implemented: expiring snooze and reasoned ignore rules, notification scope and watch-only routing, quiet hours, and a daily digest, with deterministic injected-clock and time-zone tests.
+
+Acting on findings is implemented: Update all for This PC's global tools (desktop only, confirmed first, one package at a time), copy-only upgrade commands for each project, Markdown, CSV, and JSON exports, and a Version drift tab with a version matrix and align commands. The command and export builders and the Update all runner have unit tests. Windows hardware ran the commands, exports, and drift view in an isolated check and Update all with one Bun package; macOS and Linux hardware have not run them. See the [README platform table](../README.md#platform-support) and [Development](development.md#wave-4-verification-act-on-findings-october-11-2026).
+
+Everyday use from the keyboard is implemented: a command palette (Ctrl+K) over pages, settings, projects, packages, and actions; Cancel scan and Retry failed checks; and Needs attention's New since last scan and Resolved views, backed by a 30-day, 500-entry history. Windows hardware ran each of them in an isolated check, except typing with an input method editor, which no platform has tried; macOS and Linux hardware have not run them. See the [README platform table](../README.md#platform-support) and [Development](development.md#wave-4-verification-everyday-desktop-october-11-2026).
 
 Scope: macOS/Homebrew and Linux package-manager adapters, tested desktop packaging, digests, snoozes, and lifecycle signals.
 
@@ -85,7 +93,7 @@ Acceptance:
 
 - Renovate-assisted upgrade PRs with explicit authorization and reviewable changes.
 - Source analysis and secret scanning as separate capabilities with independent coverage.
-- Archived/deprecated package signals, version drift, and release notes.
-- Always-on coordinator deployment and optional export/SBOM formats.
+- Archived package signals and release notes.
+- Always-on coordinator deployment and SBOM export formats.
 
 Automatic software upgrades, arbitrary remote commands, and executing untrusted project builds are outside the initial scope.

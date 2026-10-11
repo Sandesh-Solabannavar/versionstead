@@ -22,7 +22,7 @@ import {
   MonitoringSnapshot,
   type Project,
 } from "@versionstead/contracts/monitoring";
-import type { MonitoringCoordinator } from "./monitoring.ts";
+import { features, type MonitoringCoordinator } from "./monitoring.ts";
 import { InputError, inspectProject, object } from "./adapters/projects.ts";
 import { discoverTools, inspectGit, runTool } from "./adapters/development-tools.ts";
 import { providerAccount, listRepositories, inspectRepository } from "./adapters/repositories.ts";
@@ -959,6 +959,7 @@ export class ApplicationService {
           ...(await this.transport(computer)),
           token: await this.secret(`computer:${id}`),
           nonce,
+          features,
           signal: this.shutdown.signal,
         }),
       );

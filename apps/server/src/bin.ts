@@ -67,7 +67,12 @@ if (values.help) {
       throw new Error("Invalid development origin");
     dataDir = values["data-dir"] ? resolve(values["data-dir"]) : resolveDataDir();
     release = acquireCoordinatorLock(dataDir);
-    coordinator = new MonitoringCoordinator({ dataDir, mode: values.mode, host: values.host });
+    coordinator = new MonitoringCoordinator({
+      dataDir,
+      mode: values.mode,
+      host: values.host,
+      sourceFetch: fetch,
+    });
     const token = randomBytes(32).toString("base64url");
     server = await startServer({
       port,

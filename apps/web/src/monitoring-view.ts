@@ -2,6 +2,7 @@ import type {
   ActiveScan,
   Dependency,
   Finding,
+  FindingRule,
   GlobalToolSource,
   Installation,
   MonitoringSnapshot,
@@ -10,10 +11,18 @@ import type {
   ScanProgress,
 } from "@versionstead/contracts/monitoring";
 import { dependencyUpgradeCommand, globalUpgradeCommand } from "./upgrade-commands.ts";
-import { versionAtLeast } from "./versions.ts";
+import { parseSemver, versionAtLeast } from "./versions.ts";
 
 export type InventoryFilter = "updates" | "all" | "current" | "unverified";
-export type AttentionFilter = "all" | "updates" | "advisories" | "coverage";
+export type AttentionFilter =
+  | "all"
+  | "new"
+  | "updates"
+  | "advisories"
+  | "lifecycle"
+  | "coverage"
+  | "suppressed"
+  | "resolved";
 
 const minute = 60_000;
 // Always numeric: "auto" would say "yesterday" or "last month", wrong by a calendar unit for spans
@@ -73,13 +82,45 @@ export const compareFindings = (
   b: Pick<Finding, "severity" | "name">,
 ) => severities[a.severity].rank - severities[b.severity].rank || a.name.localeCompare(b.name);
 
-/** What a finding says in a few words: its severity for an advisory, else its kind. */
-export function findingSummary(finding: Pick<Finding, "kind" | "severity">): string {
+/**
+ * Whether a lifecycle finding's date is a real YYYY-MM-DD day. A paired PC's value is not trusted,
+ * so anything else reads as undated: neither shown nor compared.
+ */
+export function isEffectiveDay(value: string | undefined): value is string {
+  if (value === undefined || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const time = Date.parse(value);
+  // Date.parse rolls 2026-02-31 over into March, so a real day must come back unchanged.
+  return !Number.isNaN(time) && new Date(time).toISOString().startsWith(value);
+}
+
+/** A lifecycle finding's support state: a deprecated package, or where a runtime line stands. */
+export function supportStateLabel(
+  finding: Pick<Finding, "severity" | "packageName" | "lastSeenAt" | "effectiveDate">,
+): string {
+  if (finding.packageName !== null) return "Deprecated";
+  if (finding.severity === "high") return "End of life";
+  if (finding.severity === "moderate") return "End of life soon";
+  // Low is out of active support, or leaving it on a later day than the scan that saw it. A date
+  // that cannot be read does not say which, so it reads as already out.
+  return isEffectiveDay(finding.effectiveDate) &&
+    Date.parse(finding.effectiveDate) > Date.parse(finding.lastSeenAt)
+    ? "Leaving active support"
+    : "Out of active support";
+}
+
+/** What a finding says in a few words: severity for an advisory, support state for a lifecycle finding, a generic name for a kind this build does not know, else its kind. */
+export function findingSummary(
+  finding: Pick<Finding, "kind" | "severity" | "packageName" | "lastSeenAt" | "effectiveDate">,
+): string {
   return finding.kind === "advisory"
     ? severities[finding.severity].label
     : finding.kind === "coverage"
       ? "Incomplete check"
-      : "Update available";
+      : finding.kind === "lifecycle"
+        ? supportStateLabel(finding)
+        : finding.kind === "other"
+          ? "Other finding"
+          : "Update available";
 }
 
 /**
@@ -351,6 +392,8 @@ export const plural = (count: number, one: string, many?: string) =>
 export function findingCounts(findings: readonly Finding[], deviceId: string) {
   const updates = new Set<string>();
   const advisories = new Set<string>();
+  const lifecycle = new Set<string>();
+  const other = new Set<string>();
   const packages = new Set<string>();
   const incomplete = new Set<string>();
   for (const finding of findings) {
@@ -358,17 +401,27 @@ export function findingCounts(findings: readonly Finding[], deviceId: string) {
       incomplete.add(finding.id);
       continue;
     }
-    // Global findings retain installation/root identity in their IDs. Project
-    // summary counts combine repeated importers; dependency rows retain them.
+    // Project summary counts combine repeated importers; dependency rows retain them. A global
+    // tool's findings (its update, its deprecation) share its manager, name, package and installed
+    // version, so they are one package; their IDs, which keep installation/root identity, still
+    // keep each finding apart below.
+    // ponytail: the same tool in two roots of one manager counts as one package; needs a root on the finding.
     const packageKey =
       finding.subjectId === deviceId
-        ? finding.id
+        ? JSON.stringify([
+            finding.source,
+            finding.name,
+            finding.packageName,
+            finding.installedVersion,
+          ])
         : JSON.stringify([
             finding.subjectId,
             finding.packageName ?? finding.name,
             finding.installedVersion,
           ]);
-    packages.add(packageKey);
+    // A runtime line's lifecycle notice, or a kind from a newer version without a package, is not about a package.
+    if ((finding.kind !== "lifecycle" && finding.kind !== "other") || finding.packageName !== null)
+      packages.add(packageKey);
     const findingKey =
       finding.subjectId === deviceId
         ? finding.id
@@ -376,16 +429,44 @@ export function findingCounts(findings: readonly Finding[], deviceId: string) {
             packageKey,
             finding.source,
             finding.availableVersion,
-            finding.kind === "advisory" ? (finding.advisoryUrl ?? finding.id) : "update",
+            finding.kind === "advisory" ? (finding.advisoryUrl ?? finding.id) : finding.kind,
           ]);
-    (finding.kind === "update" ? updates : advisories).add(findingKey);
+    (finding.kind === "update"
+      ? updates
+      : finding.kind === "advisory"
+        ? advisories
+        : finding.kind === "lifecycle"
+          ? lifecycle
+          : other
+    ).add(findingKey);
   }
   return {
     packages: packages.size,
     updates: updates.size,
     advisories: advisories.size,
+    lifecycle: lifecycle.size,
+    other: other.size,
     incomplete: incomplete.size,
   };
+}
+
+/** A tab's badge for the findings it lists: unique package findings plus incomplete checks. */
+export function findingTotal(findings: readonly Finding[], deviceId: string): number {
+  const counts = findingCounts(findings, deviceId);
+  return counts.updates + counts.advisories + counts.lifecycle + counts.other + counts.incomplete;
+}
+
+/**
+ * Whether a finding appeared after its target's previous successful scan. Null means the latest
+ * success was the first, so everything is new; undefined (evidence saved before this version) is
+ * unknown, so nothing is claimed as new until the next success.
+ */
+export function isNewFinding(
+  finding: Pick<Finding, "detectedAt">,
+  previousSuccess: string | null | undefined,
+): boolean {
+  if (previousSuccess === undefined) return false;
+  return previousSuccess === null || Date.parse(finding.detectedAt) > Date.parse(previousSuccess);
 }
 
 export function dependencyFindings(
@@ -400,8 +481,75 @@ export function dependencyFindings(
       finding.name === dependency.name &&
       finding.installedVersion === dependency.resolved &&
       (finding.kind === "advisory" ||
+        finding.kind === "lifecycle" ||
         finding.availableVersion === (dependency.availableVersion ?? dependency.latestVersion)),
   );
+}
+
+/** Dependencies whose update a snooze or ignore rule hides, so bulk commands leave them out. */
+export function heldDependencies(
+  project: Pick<Project, "dependencies">,
+  findings: readonly Finding[],
+): Set<string> {
+  // Few findings are hidden by a rule, so only those are matched against each dependency.
+  const hidden = findings.filter(
+    (finding) => finding.kind === "update" && finding.ruleId !== undefined,
+  );
+  return new Set(
+    project.dependencies
+      .filter((dependency) => dependencyFindings(dependency, hidden).length > 0)
+      .map((dependency) => dependency.id),
+  );
+}
+
+type GlobalTool = Pick<
+  Installation,
+  "name" | "packageId" | "version" | "source" | "availableVersion"
+>;
+
+/**
+ * A global tool's own findings on this PC: its deprecation notice and its update to the candidate it
+ * has now. A finding for another candidate is stale, so a row or sheet never marks it and Update now
+ * never asks about it.
+ */
+export function installationFindings(
+  findings: readonly Finding[],
+  deviceId: string,
+  installation: GlobalTool,
+): Finding[] {
+  return findings.filter(
+    (finding) =>
+      finding.subjectId === deviceId &&
+      (finding.kind === "lifecycle" ||
+        (finding.kind === "update" &&
+          installation.availableVersion !== null &&
+          finding.availableVersion === installation.availableVersion)) &&
+      finding.name === installation.name &&
+      finding.packageName === (installation.packageId ?? null) &&
+      finding.installedVersion === installation.version &&
+      finding.source === installation.source,
+  );
+}
+
+/** The update finding for the release this global tool would be updated to, if there is one. */
+export function installationUpdate(
+  findings: readonly Finding[],
+  deviceId: string,
+  installation: GlobalTool,
+): Finding | undefined {
+  return installationFindings(findings, deviceId, installation).find(
+    (finding) => finding.kind === "update",
+  );
+}
+
+/**
+ * A project's runtime notices, most severe first: lifecycle findings about a runtime line, which
+ * name no package and so have no dependency row to appear on.
+ */
+export function runtimeNotices(findings: readonly Finding[]): Finding[] {
+  return findings
+    .filter((finding) => finding.kind === "lifecycle" && finding.packageName === null)
+    .sort(compareFindings);
 }
 
 export type UpgradeOption = { where: string; command: string; version: string };
@@ -531,6 +679,13 @@ export function findingsRetained(status: ScanEvidence["status"]): boolean {
   return status === "failed" || status === "unsupported";
 }
 
+/** What a dialog built from earlier evidence adds when the latest scan did not confirm it; null when it did. */
+export function latestScanNotice(status: ScanEvidence["status"]): string | null {
+  return findingsRetained(status)
+    ? `The latest scan ${status === "failed" ? "failed" : "is unsupported"}.`
+    : null;
+}
+
 export function projectNeedsAttention(
   project: Project,
   findings: readonly Finding[],
@@ -544,6 +699,18 @@ export function projectNeedsAttention(
     scanProgress?.active?.targetId === project.id ||
     (scanProgress?.queued.some((target) => target.targetId === project.id) ?? false)
   );
+}
+
+const retryable = (evidence: ScanEvidence | undefined) =>
+  evidence?.status === "failed" || evidence?.status === "partial";
+
+/** Targets whose last attempt failed or left gaps: what Retry failed checks rescans (the coordinator applies the same rule). */
+export function failedTargetCount(snapshot: {
+  inventory: Pick<MonitoringSnapshot["inventory"], "evidence" | "updateEvidence">;
+  projects: readonly Pick<Project, "evidence">[];
+}): number {
+  const pc = retryable(snapshot.inventory.evidence) || retryable(snapshot.inventory.updateEvidence);
+  return (pc ? 1 : 0) + snapshot.projects.filter((project) => retryable(project.evidence)).length;
 }
 
 export type AttentionGroup = {
@@ -565,6 +732,19 @@ export function attentionGroups(
 ): AttentionGroup[] {
   const search = query.trim().toLowerCase();
   const kind = filter === "updates" ? "update" : filter === "advisories" ? "advisory" : filter;
+  // New and Resolved show every kind; Resolved lists the coordinator's resolved findings instead.
+  const everyKind =
+    kind === "all" || kind === "suppressed" || kind === "new" || kind === "resolved";
+  const source: readonly Finding[] =
+    filter === "resolved" ? (snapshot.resolvedFindings ?? []) : snapshot.findings;
+  // Snoozed and ignored findings appear only in their own view. A snoozed incomplete check takes its
+  // target out of the incomplete count, while the target's evidence keeps its Partial or Failed status.
+  const hiddenView = filter === "suppressed";
+  const snoozedGaps = new Set(
+    snapshot.findings
+      .filter((finding) => finding.kind === "coverage" && finding.ruleId !== undefined)
+      .map((finding) => finding.subjectId),
+  );
   const pcEvidence = snapshot.inventory.evidence;
   const updateEvidence = snapshot.inventory.updateEvidence;
   const targets = [
@@ -580,7 +760,10 @@ export function attentionGroups(
           ? updateEvidence
           : pcEvidence,
       incomplete:
-        incompleteEvidence(pcEvidence) || (!!updateEvidence && incompleteEvidence(updateEvidence)),
+        !snoozedGaps.has(snapshot.device.id) &&
+        (incompleteEvidence(pcEvidence) ||
+          (!!updateEvidence && incompleteEvidence(updateEvidence))),
+      newSince: pcEvidence.previousSuccess,
     },
     ...snapshot.projects.map((project) => ({
       id: project.id,
@@ -589,22 +772,26 @@ export function attentionGroups(
       project,
       evidence: project.evidence,
       incomplete:
-        incompleteEvidence(project.evidence) ||
-        project.dependencies.some(
-          (dependency) =>
-            dependency.versionStatus === "failed" || dependency.advisoryStatus === "failed",
-        ),
+        !snoozedGaps.has(project.id) &&
+        (incompleteEvidence(project.evidence) ||
+          project.dependencies.some(
+            (dependency) =>
+              dependency.versionStatus === "failed" || dependency.advisoryStatus === "failed",
+          )),
+      newSince: project.evidence.previousSuccess,
     })),
   ];
   return targets.flatMap((target) => {
     const matchesTarget = `${target.label} ${target.project?.path ?? ""}`
       .toLowerCase()
       .includes(search);
-    const findings = snapshot.findings
+    const findings = source
       .filter(
         (finding) =>
           finding.subjectId === target.id &&
-          (kind === "all" || finding.kind === kind) &&
+          (finding.ruleId !== undefined) === hiddenView &&
+          (everyKind || finding.kind === kind) &&
+          (filter !== "new" || isNewFinding(finding, target.newSince)) &&
           (matchesTarget ||
             `${finding.name} ${finding.packageName ?? ""} ${finding.source} ${finding.description}`
               .toLowerCase()
@@ -650,15 +837,95 @@ export function attentionGroups(
   });
 }
 
+/** Views only this PC can fill: a connected PC's evidence carries neither its snooze and ignore rules nor its resolved history. */
+export const localOnlyFilter = (filter: AttentionFilter) =>
+  filter === "suppressed" || filter === "resolved";
+
+const attentionFilters: readonly AttentionFilter[] = [
+  "all",
+  "new",
+  "updates",
+  "advisories",
+  "lifecycle",
+  "coverage",
+  "suppressed",
+  "resolved",
+];
 export function attentionSearch(search: Record<string, unknown>): { filter?: AttentionFilter } {
-  const filter = search.filter;
-  return filter === "updates" ||
-    filter === "advisories" ||
-    filter === "coverage" ||
-    filter === "all"
-    ? { filter }
-    : {};
+  const filter = attentionFilters.find((item) => item === search.filter);
+  return filter ? { filter } : {};
 }
+
+const ruleDate = new Intl.DateTimeFormat("en", { month: "short", day: "numeric" });
+
+/** What a rule says about its finding: until when it is snoozed, or why it is ignored. */
+export function ruleLabel(
+  rule: Pick<FindingRule, "mode" | "until" | "untilVersion" | "reason">,
+): string {
+  if (rule.mode === "ignore") return rule.reason ? `Ignored: ${rule.reason}` : "Ignored";
+  if (rule.untilVersion !== undefined)
+    return `Snoozed until a version newer than ${rule.untilVersion}`;
+  // A date that cannot be read says only that the finding is snoozed; it never fails the page.
+  const until = Date.parse(rule.until ?? "");
+  return Number.isNaN(until) ? "Snoozed" : `Snoozed until ${ruleDate.format(until)}`;
+}
+
+/** How many findings a snooze or ignore rule hides now. */
+export const suppressedCount = (snapshot: Pick<MonitoringSnapshot, "findings">) =>
+  snapshot.findings.filter((finding) => finding.ruleId !== undefined).length;
+
+/** What the Background service page says about notifications waiting to be delivered, and whether a summary is pending. */
+export function deliveryStatus(
+  snapshot: Pick<
+    MonitoringSnapshot,
+    "notifications" | "notificationsWaiting" | "notificationSummary" | "settings"
+  >,
+): { text: string; pending: boolean } {
+  const { notificationSummary: summary, settings } = snapshot;
+  // The coordinator counts the events that can still become a summary; an older one reports them all.
+  const waiting =
+    snapshot.notificationsWaiting ??
+    snapshot.notifications.filter((item) => !item.deliveredAt).length;
+  if (summary)
+    return {
+      text: `${plural(summary.updateCount, "update")} and ${plural(summary.advisoryCount, "advisory finding")} are ready to review.${summary.quiet ? " The desktop notification waits until quiet hours end." : ""}`,
+      pending: true,
+    };
+  if (waiting > 0)
+    return {
+      text: settings.digestAt
+        ? `New findings are waiting for the daily digest at ${settings.digestAt}.`
+        : "New findings are being combined into the next summary.",
+      pending: true,
+    };
+  return { text: "No new findings are waiting.", pending: false };
+}
+
+export type SnoozeChoice = {
+  label: string;
+  body: { mode: "snooze"; days: 7 | 30 | 90 } | { mode: "snooze"; untilNewerVersion: true };
+};
+
+/** The snoozes a finding offers: 7, 30, or 90 days, and for an update with a SemVer candidate, until a newer version. */
+export function snoozeChoices(finding: Pick<Finding, "kind" | "availableVersion">): SnoozeChoice[] {
+  return [
+    ...([7, 30, 90] as const).map((days) => ({
+      label: `Snooze ${days} days`,
+      body: { mode: "snooze" as const, days },
+    })),
+    ...(finding.kind === "update" && parseSemver(finding.availableVersion)
+      ? [
+          {
+            label: `Snooze until a version newer than ${finding.availableVersion}`,
+            body: { mode: "snooze" as const, untilNewerVersion: true as const },
+          },
+        ]
+      : []),
+  ];
+}
+
+/** Incomplete checks can be snoozed but never ignored, so a gap always comes back. */
+export const canIgnore = (finding: Pick<Finding, "kind">) => finding.kind !== "coverage";
 
 export function filterInstallations(
   installations: readonly Installation[],
@@ -783,6 +1050,7 @@ export function scanStage(scan: Pick<ActiveScan, "stage" | "completed" | "total"
     "advisory-details": "Reading advisory details",
     "native-versions": "Checking updates with the package manager",
     versions: "Checking available versions",
+    "release-facts": "Checking release age, license, and provenance",
     saving: "Saving scan evidence",
   };
   const known =
@@ -797,7 +1065,7 @@ export function scanStage(scan: Pick<ActiveScan, "stage" | "completed" | "total"
     label: labels[scan.stage],
     ...(known ? { value: scan.completed!, max: scan.total! } : {}),
     count: known
-      ? `${scan.completed}/${scan.total}${scan.stage === "advisories" || scan.stage === "versions" || scan.stage === "native-versions" ? " packages" : scan.stage === "advisory-details" ? " advisories" : ""}`
+      ? `${scan.completed}/${scan.total}${scan.stage === "advisories" || scan.stage === "versions" || scan.stage === "native-versions" || scan.stage === "release-facts" ? " packages" : scan.stage === "advisory-details" ? " advisories" : ""}`
       : "",
   };
 }

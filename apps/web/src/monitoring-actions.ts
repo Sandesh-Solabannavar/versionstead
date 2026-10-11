@@ -13,6 +13,8 @@ export const actionKeys = {
   projectMode: (projectId: string) => `project:mode:${projectId}`,
   scan: (target: string, projectId?: string) =>
     projectId ? `scan:${target}:${projectId}` : `scan:${target}`,
+  cancelScan: "scan:cancel",
+  findingRule: (findingId: string) => `finding-rule:${findingId}`,
   setting: (field: string) => `setting:${field}`,
   preference: (field: string) => `preference:${field}`,
   provider: (kind: string) => `provider:${kind}`,

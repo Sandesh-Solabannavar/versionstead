@@ -36,4 +36,10 @@ contextBridge.exposeInMainWorld("versionstead", {
     ipcRenderer.invoke("versionstead:global-tool-update-command", input),
   globalToolUpdateStatus: (): Promise<unknown> =>
     ipcRenderer.invoke("versionstead:global-tool-update-status"),
+  updateAllGlobalTools: (input: unknown): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:global-tool-update-all", input),
+  stopGlobalToolUpdates: (): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:global-tool-update-stop"),
+  globalToolUpdateBatch: (): Promise<unknown> =>
+    ipcRenderer.invoke("versionstead:global-tool-update-batch"),
 });

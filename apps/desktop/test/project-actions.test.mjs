@@ -37,8 +37,8 @@ async function fixture(t, timeout, grace) {
   };
   return { runner, project, path };
 }
-async function waitRun(runner, id) {
-  for (let i = 0; i < 200; i++) {
+async function waitRun(runner, id, rounds = 200) {
+  for (let i = 0; i < rounds; i++) {
     const run = runner.read(id);
     if (run.status !== "running") return run;
     await delay(25);
@@ -114,9 +114,12 @@ test(
     const deletedAction = await runner.start(project, "test");
     await runner.reconcile([{ ...project, actions: [] }]);
     assert.equal(runner.read(deletedAction.id).status, "stopped");
-    project.actions[0].command = "[Console]::Write('x' * 70000)";
-    const large = await runner.start(project, "test");
-    const limited = await waitRun(runner, large.id);
+    // Its own roomy deadline: under load PowerShell can take longer than 700 ms to start and print,
+    // and the runtime limit would then win over the output bound.
+    const roomy = await fixture(t, 30_000);
+    roomy.project.actions[0].command = "[Console]::Write('x' * 70000)";
+    const large = await roomy.runner.start(roomy.project, "test");
+    const limited = await waitRun(roomy.runner, large.id, 1200);
     assert(limited.output.length <= 65536);
     assert.match(limited.error, /64 KiB/);
     project.actions[0].command = "Start-Sleep -Seconds 30";
@@ -231,9 +234,11 @@ test(
     const deletedAction = await runner.start(project, "test");
     await runner.reconcile([{ ...project, actions: [] }]);
     assert.equal(runner.read(deletedAction.id).status, "stopped");
-    project.actions[0].command = "yes | head -c 70000";
-    const large = await runner.start(project, "test");
-    const limited = await waitRun(runner, large.id);
+    // Its own roomy deadline, so a slow start under load cannot hit the runtime limit first.
+    const roomy = await fixture(t, 30_000, 200);
+    roomy.project.actions[0].command = "yes | head -c 70000";
+    const large = await roomy.runner.start(roomy.project, "test");
+    const limited = await waitRun(roomy.runner, large.id, 1200);
     assert(limited.output.length <= 65536);
     assert.match(limited.error, /64 KiB/);
     project.actions[0].command = "sleep 30";

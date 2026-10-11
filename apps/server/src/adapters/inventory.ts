@@ -12,7 +12,12 @@ import {
   type Installation,
 } from "@versionstead/contracts/monitoring";
 import { identity, InputError, object, packageName, readSelectedFile, string } from "./projects.ts";
-import { publicPackageVersions, type SourceCache } from "./lookups.ts";
+import {
+  publicPackageVersions,
+  readSignals,
+  type PackageSignals,
+  type SourceCache,
+} from "./lookups.ts";
 
 import { decodeBunConfiguration } from "./bun-config.ts";
 import {
@@ -49,6 +54,8 @@ export type InventoryResult = {
   inventoryChecks: "complete" | "partial" | "failed";
   updateChecks: "complete" | "partial" | "failed" | "unsupported";
   checkedRoots: string[];
+  // Installation id to what npm's metadata says; an id is present only if it was read in this scan.
+  signals?: Map<string, PackageSignals>;
 };
 
 async function canonicalRoot(value: string) {
@@ -97,6 +104,9 @@ export async function validateGlobalToolSources(
       (source.version !== null && (!semver.valid(source.version) || source.version.length > 100)) ||
       (source.checkedAt !== null && !Number.isFinite(Date.parse(source.checkedAt))) ||
       (source.error !== null && source.error.length > 300) ||
+      (source.nodeVersion !== undefined &&
+        source.nodeVersion !== null &&
+        (source.manager !== "npm" || semver.valid(source.nodeVersion) !== source.nodeVersion)) ||
       source.blockedScopes.length > 100 ||
       source.blockedScopes.some((scope) => !/^@[a-z0-9][a-z0-9._-]*$/i.test(scope)) ||
       (source.status === "detected" && (!source.version || !source.root)) ||
@@ -365,14 +375,35 @@ async function bunSource(directories?: readonly string[]): Promise<GlobalToolSou
   return source;
 }
 
+/**
+ * The version of the Node.js first on the owner's PATH, from one bounded probe in an empty directory.
+ * inspectNode only checks an x.y.z prefix, so the probe's answer is normalized with semver (build metadata
+ * dropped) and anything that is not semver is unknown. What is recorded therefore always passes the source
+ * boundary, and an odd Node.js cannot fail the npm and Bun discovery beside it.
+ */
+export async function pathNodeVersion(
+  directories?: readonly string[],
+  inspect: typeof inspectNode = inspectNode,
+) {
+  const candidate = await executable(
+    process.platform === "win32" ? "node.exe" : "node",
+    directories,
+  );
+  return candidate ? semver.valid((await inspect(candidate))?.version) : null;
+}
+
 export async function discoverGlobalToolSources(
   signal?: AbortSignal,
   previous: readonly GlobalToolSource[] = [],
   directories?: readonly string[],
 ): Promise<GlobalToolSource[]> {
-  const sources = await Promise.all([npmSource(signal, directories), bunSource(directories)]);
+  const [npm, bun, nodeVersion] = await Promise.all([
+    npmSource(signal, directories),
+    bunSource(directories),
+    pathNodeVersion(directories),
+  ]);
   if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");
-  return validateGlobalToolSources(sources, previous);
+  return validateGlobalToolSources([{ ...npm, nodeVersion }, bun], previous);
 }
 
 async function emptyGlobalRoot(root: string) {
@@ -460,6 +491,7 @@ export async function inspectGlobalSources(
     installations: [],
     managers: [],
     checkedRoots: [],
+    signals: new Map(),
     coverage: [
       "Top-level global npm/Bun packages only; installed manifests are read without executing tools or lifecycle scripts",
     ],
@@ -582,7 +614,7 @@ export async function inspectGlobalSources(
         if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");
         const name = names[next++]!;
         try {
-          const { latest, versions, checkedAt } = await publicPackageVersions(
+          const { latest, versions, details, checkedAt } = await publicPackageVersions(
             name,
             fetcher,
             deadline,
@@ -595,6 +627,7 @@ export async function inspectGlobalSources(
             item.updateStatus = item.availableVersion ? "available" : "current";
             // Shared metadata keeps the time the registry confirmed it, not the time of this scan.
             item.updateCheckedAt = new Date(checkedAt).toISOString();
+            result.signals!.set(item.id, readSignals(details, item.version, item.availableVersion));
           }
         } catch {
           if (signal?.aborted) throw new InputError("The global tool scan was interrupted.");

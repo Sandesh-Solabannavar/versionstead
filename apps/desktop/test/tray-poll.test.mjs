@@ -12,7 +12,7 @@ import { startServer } from "../../server/dist/server.js";
 const temporary = await mkdtemp(join(tmpdir(), "versionstead-tray-poll-"));
 const dataDir = join(temporary, "desktop");
 process.env.VERSIONSTEAD_DATA_DIR = dataDir;
-const { pollCoordinator, snapshotHeaders } = await import("../dist/coordinator.js");
+const { pollCoordinator, snapshotHeaders, summaryToShow } = await import("../dist/coordinator.js");
 after(() => rm(temporary, { recursive: true, force: true }));
 
 const status = "/api/status";
@@ -183,8 +183,31 @@ test("the notification summary is read from progress on every poll, even when th
   assert.deepEqual(reads(), [status, progress]);
   assert.deepEqual(second.notificationSummary, summary("summary-2"));
 
+  // Quiet hours reach the notifier with the summary, and an older coordinator sends no flag.
+  current = { ...summary("summary-3"), quiet: true };
+  assert.deepEqual((await pollCoordinator(second)).notificationSummary, current);
+
   current = null;
   assert.equal((await pollCoordinator(second)).notificationSummary, null);
+});
+
+test("quiet hours hold a native notification until they end, and nothing else is held", () => {
+  const never = () => false;
+  const first = summary("summary-1");
+  assert.equal(summaryToShow(null, never), null, "no summary, nothing to show");
+  assert.equal(summaryToShow(first, never), first, "an older coordinator sends no flag");
+  const open = { ...first, quiet: false };
+  assert.equal(summaryToShow(open, never), open);
+  const held = { ...first, quiet: true };
+  assert.equal(summaryToShow(held, never), null, "held while quiet hours last");
+  // The same summary is shown once the flag drops, which is when the next poll finds it.
+  assert.equal(summaryToShow({ ...held, quiet: false }, never)?.id, held.id);
+  assert.equal(
+    summaryToShow(open, (id) => id === first.id),
+    null,
+    "a summary is shown once",
+  );
+  assert.equal(summaryToShow(summary("summary-2"), (id) => id === first.id)?.id, "summary-2");
 });
 
 test("a revision that moved while the snapshot did not keeps the cached copy", async (t) => {

@@ -513,10 +513,14 @@ test("two HTTPS coordinators pair once, retain remote evidence offline, and revo
     undefined,
     credentials,
   );
+  const declared = [];
   let client = await ApplicationService.create(
     clientCore,
     undefined,
-    undefined,
+    (origin, fingerprint, path, options) => {
+      if (path === "/evidence") declared.push(options.features);
+      return peerRequest(origin, fingerprint, path, options);
+    },
     undefined,
     credentials,
   );
@@ -557,6 +561,11 @@ test("two HTTPS coordinators pair once, retain remote evidence offline, and revo
       hostCore.snapshot().history.length >= 2 && hostCore.snapshot().scanProgress.active === null,
   );
   await client.refreshComputer(remote.id);
+  assert.deepEqual(
+    [...new Set(declared)],
+    ["settings-repositories-connections-v10"],
+    "A current client declares its marker on every evidence request, so the host sends it the full evidence",
+  );
   const received = evidence();
   assert(received.projects[0].dependencies.length);
   await client.close();
@@ -684,7 +693,7 @@ test("shared evidence leaves out the feature marker, so a PC on the previous bui
     }),
   );
   const local = core.snapshot();
-  assert.equal(local.features, "settings-repositories-connections-v9");
+  assert.equal(local.features, "settings-repositories-connections-v10");
   assert.throws(() => previousBuild(local), "The marker alone would make that PC refuse it");
   const shared = sharedEvidence(local);
   assert(!("features" in shared), "No receiving PC reads a remote's marker");

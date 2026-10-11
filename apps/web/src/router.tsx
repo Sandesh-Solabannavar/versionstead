@@ -28,14 +28,16 @@ import {
   useLocation,
   useNavigate,
 } from "@tanstack/react-router";
-import { Attention, Projects, Service, ThisPc } from "./pages";
+import { AddProjectDialog } from "./add-project";
+import { CommandPalette } from "./command-palette";
+import { Attention, ExportDialog, Projects, Service, ThisPc } from "./pages";
 import { MonitoringProvider, useMonitoring } from "./monitoring";
 import { AppearanceProvider, useAppearance } from "./theme";
 import { ApplicationProvider, useApplication } from "./application";
 import { latestEvidence } from "./computer-evidence";
 import { searchSettings, settingsSections } from "./settings-navigation";
 import { WorkspaceChromeProvider, useWorkspaceChrome } from "./workspace-chrome";
-import { commands, defaultBindings, isMac, keyChord } from "./keybindings";
+import { commands, defaultBindings, hasCommandModifier, isMac, keyChord } from "./keybindings";
 import { defaultAppearance, readThemeHalves } from "./appearance";
 import {
   decodeAcceptedResponse,
@@ -171,7 +173,7 @@ function ConnectionNotice() {
     snapshot &&
     (!snapshot.scanProgress ||
       snapshot.inventory.collector !== "npm-bun-global-v1" ||
-      snapshot.features !== "settings-repositories-connections-v9") &&
+      snapshot.features !== "settings-repositories-connections-v10") &&
     snapshot.runtime.startedAt !== dismissedBuild
   )
     // Nothing is held back by this banner (the PC scan controls say so themselves), so it can be
@@ -444,20 +446,28 @@ function Shortcuts() {
   const { snapshot, connection, pending, refresh, mutate } = useMonitoring();
   const { refresh: refreshApplication } = useApplication();
   const navigate = useNavigate();
+  // The command palette, or the dialog one of its actions opened.
+  const [overlay, setOverlay] = useState<"palette" | "add-project" | "export" | null>(null);
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat || event.isComposing || hasOpenModal()) return;
+      const chord = keyChord(event, isMac());
+      const command = commands.find((c) => chord && bindings[c.id] === chord)?.id;
+      if (!command) return;
+      // Typing fields keep their keys, except the palette's shortcut when it holds Ctrl, Alt, or Command.
       if (
         event.target instanceof HTMLElement &&
         event.target.closest(
           'input,textarea,select,[contenteditable="true"],[role="textbox"],[role="combobox"]',
-        )
+        ) &&
+        !(command === "palette" && hasCommandModifier(bindings.palette))
       )
         return;
-      const chord = keyChord(event, isMac());
-      const command = commands.find((c) => chord && bindings[c.id] === chord)?.id;
-      if (!command) return;
       event.preventDefault();
+      if (command === "palette") {
+        setOverlay("palette");
+        return;
+      }
       const destinations = {
         settings: "/settings/general",
         attention: "/",
@@ -518,6 +528,16 @@ function Shortcuts() {
     navigate,
     focusSettingsSearch,
   ]);
+  const close = () => setOverlay(null);
+  if (overlay === "palette") return <CommandPalette close={close} open={setOverlay} />;
+  if (overlay === "add-project")
+    return (
+      <AddProjectDialog
+        close={close}
+        added={(id) => void navigate({ to: "/projects", search: { project: id } })}
+      />
+    );
+  if (overlay === "export") return <ExportDialog initialScope={{ kind: "all" }} close={close} />;
   return null;
 }
 
@@ -819,10 +839,27 @@ const attentionRoute = createRoute({
   validateSearch: attentionSearch,
   component: Attention,
 });
-const pcRoute = createRoute({ getParentRoute: () => rootRoute, path: "/pc", component: ThisPc });
+const pcRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/pc",
+  // A link to one installation (the command palette) opens its evidence sheet.
+  validateSearch: (search: Record<string, unknown>): { item?: string } =>
+    typeof search.item === "string" && search.item.length <= 500 ? { item: search.item } : {},
+  component: ThisPc,
+});
 const projectsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/projects",
+  // A link to one project, or one of its dependencies, shows it and opens the evidence sheet.
+  validateSearch: (search: Record<string, unknown>): { project?: string; dependency?: string } =>
+    typeof search.project === "string" && search.project.length <= 100
+      ? {
+          project: search.project,
+          ...(typeof search.dependency === "string" && search.dependency.length <= 500
+            ? { dependency: search.dependency }
+            : {}),
+        }
+      : {},
   component: Projects,
 });
 const serviceRoute = createRoute({

@@ -2,10 +2,12 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { Check, Copy, Ellipsis, ExternalLink, X } from "lucide-react";
 import type { Finding, MonitoringSnapshot, ScanEvidence } from "@versionstead/contracts/monitoring";
@@ -15,8 +17,16 @@ import {
   scanDuration,
   scanStage,
   severityPresentation,
+  supportStateLabel,
 } from "./monitoring-view";
 import { failureRouter } from "./monitoring-actions";
+import {
+  candidateDeprecationText,
+  installScriptText,
+  licenseText,
+  provenanceText,
+  releaseAge,
+} from "./release-signals";
 import { updateBadge } from "./versions";
 import {
   Button as ShadcnButton,
@@ -155,7 +165,7 @@ function subscribeToClock(listener: () => void) {
     clock.listeners.delete(listener);
   };
 }
-function useNow() {
+export function useNow() {
   return useSyncExternalStore(subscribeToClock, () => clock.now);
 }
 
@@ -210,11 +220,24 @@ export function UpdateKindBadge({
   ) : null;
 }
 
-/** An update is one state with one name; an advisory is toned by its severity. */
+/** An update is one state with one name, marked when it adds an install script or is younger than the release cooldown; an advisory is toned by its severity; a lifecycle finding is named by its support state and toned by its severity; a kind from a newer Versionstead is named generically and toned by its severity. */
 export function FindingBadge({
   finding,
+  cooldownDays,
 }: {
-  finding: Pick<Finding, "kind" | "severity" | "installedVersion" | "availableVersion">;
+  finding: Pick<
+    Finding,
+    | "kind"
+    | "severity"
+    | "installedVersion"
+    | "availableVersion"
+    | "packageName"
+    | "lastSeenAt"
+    | "effectiveDate"
+    | "installScript"
+    | "publishedAt"
+  >;
+  cooldownDays: number;
 }) {
   const advisory = severityPresentation(finding.severity);
   return (
@@ -223,6 +246,10 @@ export function FindingBadge({
         <Badge tone="warning">Incomplete check</Badge>
       ) : finding.kind === "advisory" ? (
         <Badge tone={advisory.tone}>{advisory.label}</Badge>
+      ) : finding.kind === "lifecycle" ? (
+        <Badge tone={advisory.tone}>{supportStateLabel(finding)}</Badge>
+      ) : finding.kind === "other" ? (
+        <Badge tone={advisory.tone}>Other finding</Badge>
       ) : (
         <>
           <Badge tone="info">Update available</Badge>
@@ -230,9 +257,64 @@ export function FindingBadge({
             installed={finding.installedVersion}
             candidate={finding.availableVersion}
           />
+          {finding.installScript === true && <Badge tone="warning">Adds an install script</Badge>}
+          <ReleaseAgeBadge publishedAt={finding.publishedAt} cooldownDays={cooldownDays} />
         </>
       )}
     </div>
+  );
+}
+
+/** "Released 6 hours ago — wait until Oct 11", or "Release age unknown", while the cooldown is on. */
+export function ReleaseAgeBadge({
+  publishedAt,
+  cooldownDays,
+}: {
+  publishedAt: string | undefined;
+  cooldownDays: number;
+}) {
+  const now = useNow();
+  const age = releaseAge(publishedAt, cooldownDays, now);
+  return age ? (
+    <Badge tone={age.kind === "too-new" ? "warning" : "neutral"}>{age.label}</Badge>
+  ) : null;
+}
+
+/** An update's release evidence as rows of a details list; missing facts read unknown, never as a negative. */
+export function ReleaseFacts({
+  finding,
+  cooldownDays,
+}: {
+  finding: Pick<
+    Finding,
+    "installScript" | "candidateDeprecated" | "publishedAt" | "license" | "provenance"
+  >;
+  cooldownDays: number;
+}) {
+  const now = useNow();
+  const age = releaseAge(finding.publishedAt, cooldownDays, now);
+  return (
+    <>
+      <dt>Install script</dt>
+      <dd>{installScriptText(finding.installScript)}</dd>
+      <dt>Candidate deprecation</dt>
+      <dd>{candidateDeprecationText(finding.candidateDeprecated)}</dd>
+      <dt>Released</dt>
+      <dd>
+        {finding.publishedAt ? (
+          <>
+            {timestamp(finding.publishedAt)}
+            {age?.kind === "too-new" ? ` · wait until ${age.untilLabel}` : ""}
+          </>
+        ) : (
+          "Release age unknown"
+        )}
+      </dd>
+      <dt>License</dt>
+      <dd>{licenseText(finding.license)}</dd>
+      <dt>Provenance</dt>
+      <dd>{provenanceText(finding.provenance)}</dd>
+    </>
   );
 }
 
@@ -263,14 +345,43 @@ export function useFailure(open = true) {
   return [error, router.deliver, clear] as const;
 }
 
-/** Copies text and says so; a blocked clipboard is reported rather than ignored. */
-export async function copyText(text: string, done: string): Promise<boolean> {
+/**
+ * A status line a modal dialog keeps mounted, to say what its own actions did. A toast sits outside
+ * the dialog, where it is inert and unannounced, and a live region announces a change in its text,
+ * not a region that arrives with it. `say` replaces the text, and says it again if it is the same.
+ */
+export function useStatusLine() {
+  const [status, setStatus] = useState({ text: "", count: 0 });
+  const say = useCallback(
+    (text: string) => setStatus((previous) => ({ text, count: previous.count + 1 })),
+    [],
+  );
+  const line = (
+    <p role="status" className="muted small min-h-5">
+      <span key={status.count}>{status.text}</span>
+    </p>
+  );
+  return [line, say] as const;
+}
+
+/**
+ * Copies text and says so; a blocked clipboard is reported rather than ignored. Inside a modal
+ * dialog pass its `say` (from `useStatusLine`), which replaces the toast.
+ */
+export async function copyText(
+  text: string,
+  done: string,
+  say?: (message: string) => void,
+): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
-    toast.add({ id: "action-feedback", title: done, type: "success" });
+    if (say) say(done);
+    else toast.add({ id: "action-feedback", title: done, type: "success" });
     return true;
   } catch {
-    reportError("The clipboard is not available, so nothing was copied.");
+    const failed = "The clipboard is not available, so nothing was copied.";
+    if (say) say(failed);
+    else reportError(failed);
     return false;
   }
 }
@@ -280,10 +391,13 @@ export function CommandBlock({
   command,
   label,
   className,
+  say,
 }: {
   command: string;
   label: string;
   className?: string;
+  /** The enclosing modal dialog's status line, which replaces the copy toast. */
+  say?: (message: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -299,7 +413,7 @@ export function CommandBlock({
         variant="ghost"
         aria-label={label}
         onClick={() => {
-          void copyText(command, "Command copied.").then(setCopied);
+          void copyText(command, "Command copied.", say).then(setCopied);
         }}
       >
         {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
@@ -308,11 +422,29 @@ export function CommandBlock({
   );
 }
 
+/**
+ * A control that is removed while it has focus (an action removes its row; a scan ends) hands focus to
+ * the page, not to the document.
+ * ponytail: the content region, not the neighbouring row; focus that row's menu if keyboard triage needs it.
+ */
+export function useFocusPageOnUnmount(control: RefObject<HTMLElement | null>) {
+  useLayoutEffect(() => {
+    const element = control.current;
+    return () => {
+      if (element && element === document.activeElement)
+        queueMicrotask(() => document.getElementById("content")?.focus({ preventScroll: true }));
+    };
+  }, [control]);
+}
+
 /** A row's overflow menu; its items mount only while it is open, so closed rows stay cheap. */
 export function RowActions({ label, children }: { label: string; children: ReactNode }) {
+  const trigger = useRef<HTMLButtonElement>(null);
+  // An action can remove its own row, as snoozing a finding does.
+  useFocusPageOnUnmount(trigger);
   return (
     <Menu>
-      <MenuTrigger render={<Button size="icon" variant="ghost" aria-label={label} />}>
+      <MenuTrigger ref={trigger} render={<Button size="icon" variant="ghost" aria-label={label} />}>
         <Ellipsis aria-hidden className="size-4" />
       </MenuTrigger>
       <MenuPopup className="max-h-[min(20rem,var(--available-height))] overflow-y-auto">
@@ -432,11 +564,14 @@ export function ScanProgress({
   connected,
   kind,
   targetId,
+  cancel,
 }: {
   snapshot: MonitoringSnapshot | null;
   connected: boolean;
   kind?: "pc" | "project";
   targetId?: string;
+  /** Stops the scan shown here; offered beside a running scan only. */
+  cancel?: ReactNode;
 }) {
   if (!snapshot) return null;
   const matches = (target: { kind: "pc" | "project"; targetId: string }) =>
@@ -471,7 +606,8 @@ export function ScanProgress({
   } else if (last) {
     status = (
       <>
-        <strong>{last.targetLabel}</strong> · {scanOutcomes[last.status] ?? "Unavailable"}
+        <strong>{last.targetLabel}</strong> ·{" "}
+        {last.cancelled ? "Cancelled by you" : (scanOutcomes[last.status] ?? "Unavailable")}
         {!connected ? " · Last received evidence" : ""}
       </>
     );
@@ -490,7 +626,8 @@ export function ScanProgress({
     >
       <div className="scan-status-head">
         <p role="status">{status}</p>
-        {trailing && <span className="muted small">{trailing}</span>}
+        {trailing && <span className="muted small ms-auto">{trailing}</span>}
+        {scan && stage && cancel}
       </div>
       {scan && stage && (
         <>
@@ -591,9 +728,16 @@ export function Dialog({
   dismissible?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
-  const [trigger] = useState(() =>
-    document.activeElement instanceof HTMLElement ? document.activeElement : null,
-  );
+  const body = useRef<HTMLDivElement>(null);
+  const [trigger] = useState(() => {
+    const active = document.activeElement;
+    // A menu item is gone once its menu closes, so a dialog it opens returns focus to the menu's button.
+    const menuButton = active?.closest('[role="menu"]')?.getAttribute("aria-labelledby");
+    return (
+      (menuButton ? document.getElementById(menuButton) : null) ??
+      (active instanceof HTMLElement ? active : null)
+    );
+  });
   const titleId = useId();
   const descriptionId = useId();
   useEffect(() => {
@@ -621,22 +765,30 @@ export function Dialog({
       >
         <SheetPopup
           className="detail-dialog"
+          // The sheet's scrolling body, not its first control, which can be Update now: a second Enter
+          // after the one that opened the sheet (a palette option, a table row) must not start an update,
+          // and PageDown, the arrows and Space must scroll the sheet.
+          initialFocus={body}
           finalFocus={() => (trigger?.isConnected ? trigger : document.getElementById("content"))}
         >
           <SheetHeader className="dialog-head">
             <SheetTitle>{title}</SheetTitle>
           </SheetHeader>
-          <div className="dialog-body min-h-0 overflow-y-auto">{children}</div>
+          <div ref={body} tabIndex={-1} className="dialog-body min-h-0 overflow-y-auto">
+            {children}
+          </div>
         </SheetPopup>
       </Sheet>
     );
   }
+  // A modal dialog is drawn on top of the page but inherits from where it sits in it: inside a table
+  // cell it would otherwise never wrap its text.
   return (
     <dialog
       ref={ref}
       aria-labelledby={titleId}
       aria-describedby={description ? descriptionId : undefined}
-      className={cn("form-dialog", className)}
+      className={cn("form-dialog whitespace-normal", className)}
       onCancel={(e) => {
         if (!dismissible) e.preventDefault();
         else onClose();
@@ -659,7 +811,7 @@ export function Dialog({
           <div>
             <h2 id={titleId}>{title}</h2>
             {description && (
-              <p id={descriptionId} className="muted small">
+              <p id={descriptionId} className="muted small wrap-anywhere">
                 {description}
               </p>
             )}

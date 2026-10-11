@@ -330,7 +330,7 @@ switch ($Action) {
     Register-ScheduledTask -TaskName $taskName -Action $scheduledAction -Trigger $trigger -Principal $principal -Settings $settings -Description "Versionstead read-only monitoring for $OwnerSid" -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
     Verify-Coordinator $roots $sourcesJson
-    Write-Output 'Boot host registered under LocalService with saved owner npm/Bun sources. Explicit ProjectRoots are monitored as watch-only unless already selected. Verify boot-before-login and sign-out before relying on unattended monitoring.'
+    Write-Output 'Boot host registered under LocalService with saved owner npm/Bun sources. Explicit ProjectRoots are monitored as watch-only unless already selected, and a watch-only project sends no notification unless Notify about watch-only projects is on in Settings. Verify boot-before-login and sign-out before relying on unattended monitoring.'
   }
   'Start' {
     if ($null -eq $task) { throw 'Install the boot host first.' }

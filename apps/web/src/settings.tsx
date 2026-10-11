@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "@tanstack/react-router";
 import { type ProviderKind } from "@versionstead/contracts/application";
 import { decodeLoginItemState } from "@versionstead/contracts/desktop";
-import { decodeMonitoringSettings } from "@versionstead/contracts/monitoring";
+import {
+  decodeMonitoringSettings,
+  isHourMinute,
+  type MonitoringSettings,
+} from "@versionstead/contracts/monitoring";
 import { useApplication } from "./application";
 import { useMonitoring } from "./monitoring";
 import { actionKeys } from "./monitoring-actions";
@@ -32,6 +36,7 @@ import { RefreshIcon } from "./components/ui/refresh-icon";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "./components/ui/tooltip";
 import {
   commands,
+  commandModifiers,
   defaultBindings,
   bindingConflict,
   formatShortcut,
@@ -79,6 +84,25 @@ function scanIntervals(current: number) {
       label: value < 60 ? `${value} minutes` : `${value / 60} ${value === 60 ? "hour" : "hours"}`,
     }));
 }
+
+function cooldownChoices(current: number) {
+  return [...new Set([0, 1, 2, 3, 7, 14, current])]
+    .sort((a, b) => a - b)
+    .map((days) => ({
+      value: String(days),
+      label: days === 0 ? "Off" : `${days} ${days === 1 ? "day" : "days"}`,
+    }));
+}
+
+// Typed against the contract, so a value the coordinator would reject cannot be offered.
+const notificationScopes: readonly {
+  value: NonNullable<MonitoringSettings["notificationScope"]>;
+  label: string;
+}[] = [
+  { value: "all", label: "All updates and advisories" },
+  { value: "advisories", label: "Advisories only" },
+  { value: "high-advisories", label: "High, critical and unrated advisories" },
+];
 
 /** Desktop only: the OS entry that opens the tray app hidden at login, read back from the OS. */
 function LoginItemRow() {
@@ -138,7 +162,7 @@ function GeneralSettings() {
   if (!snapshot || !app) return null;
   // Each control waits only for its own save, so changing one never holds back another.
   const unavailable = (key: string) => connection !== "connected" || pending.has(key);
-  const update = (field: string, value: boolean | number) => {
+  const update = (field: string, value: unknown) => {
     void mutate(
       "/api/settings",
       { [field]: value },
@@ -153,6 +177,14 @@ function GeneralSettings() {
       key: actionKeys.preference(field),
     });
   };
+  const cooldown = snapshot.settings.releaseCooldownDays ?? 3;
+  const quiet = snapshot.settings.quietHours ?? null;
+  const digestAt = snapshot.settings.digestAt ?? null;
+  // A time field is read-only, not disabled, while it saves, so Tab from one into the next keeps focus.
+  const timeField = (key: string) => ({
+    disabled: connection !== "connected",
+    readOnly: pending.has(key),
+  });
 
   return (
     <>
@@ -206,6 +238,31 @@ function GeneralSettings() {
           />
         </SettingRow>
       </SettingGroup>
+      <SettingGroup title="Package releases">
+        <SettingRow
+          label="Release cooldown"
+          description="An update candidate released more recently than this is marked, and Update now asks before installing it. A release with no known date reads Release age unknown and is not held back. Off removes the age check."
+        >
+          <Choice
+            label="Release cooldown"
+            value={String(cooldown)}
+            items={cooldownChoices(cooldown)}
+            disabled={unavailable(actionKeys.setting("releaseCooldownDays"))}
+            onChange={(value) => update("releaseCooldownDays", Number(value))}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Use deps.dev for release age, license and provenance"
+          description="Sends the package name and version of each public npm update candidate to deps.dev. Off leaves release age, license, and provenance unknown. A change applies from the next scan."
+        >
+          <Switch
+            aria-label="Use deps.dev for release age, license and provenance"
+            checked={snapshot.settings.useDepsDev ?? true}
+            disabled={unavailable(actionKeys.setting("useDepsDev"))}
+            onCheckedChange={(value) => update("useDepsDev", value)}
+          />
+        </SettingRow>
+      </SettingGroup>
       <SettingGroup title="Notifications & updates">
         <SettingRow
           label="Notify about new findings"
@@ -217,6 +274,112 @@ function GeneralSettings() {
             disabled={unavailable(actionKeys.setting("notifyNewFindings"))}
             onCheckedChange={(value) => update("notifyNewFindings", value)}
           />
+        </SettingRow>
+        <SettingRow
+          label="Notify about"
+          description="Which new findings produce a notification; this applies only while Notify about new findings is on. Every finding stays in Needs attention either way. High, critical and unrated includes advisories with no severity rating, since a missing rating is not evidence of safety."
+        >
+          <Choice
+            label="Notify about"
+            value={snapshot.settings.notificationScope ?? "all"}
+            items={notificationScopes}
+            disabled={unavailable(actionKeys.setting("notificationScope"))}
+            onChange={(value) => update("notificationScope", value)}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Notify about watch-only projects"
+          description="Watch-only projects stay in Needs attention; turn this on to be notified about their new findings too. This applies only while Notify about new findings is on."
+        >
+          <Switch
+            aria-label="Notify about watch-only projects"
+            checked={snapshot.settings.notifyWatchOnly ?? false}
+            disabled={unavailable(actionKeys.setting("notifyWatchOnly"))}
+            onCheckedChange={(value) => update("notifyWatchOnly", value)}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Quiet hours"
+          description="Native notifications wait until quiet hours end; summaries inside Versionstead still appear. The window may cross midnight, and its start and end must differ."
+        >
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {quiet && (
+              <>
+                <Input
+                  key={`start-${quiet.start}`}
+                  type="time"
+                  className="w-28 shrink-0"
+                  aria-label="Quiet hours start"
+                  defaultValue={quiet.start}
+                  {...timeField(actionKeys.setting("quietHours"))}
+                  onBlur={(event) => {
+                    const start = event.currentTarget.value;
+                    // A value that cannot be saved is not left showing as if it were.
+                    if (!isHourMinute(start) || start === quiet.end)
+                      event.currentTarget.value = quiet.start;
+                    else if (start !== quiet.start) update("quietHours", { ...quiet, start });
+                  }}
+                />
+                <span className="muted small">to</span>
+                <Input
+                  key={`end-${quiet.end}`}
+                  type="time"
+                  className="w-28 shrink-0"
+                  aria-label="Quiet hours end"
+                  defaultValue={quiet.end}
+                  {...timeField(actionKeys.setting("quietHours"))}
+                  onBlur={(event) => {
+                    const end = event.currentTarget.value;
+                    if (!isHourMinute(end) || end === quiet.start)
+                      event.currentTarget.value = quiet.end;
+                    else if (end !== quiet.end) update("quietHours", { ...quiet, end });
+                  }}
+                />
+              </>
+            )}
+            <Switch
+              aria-label="Quiet hours"
+              checked={quiet !== null}
+              disabled={unavailable(actionKeys.setting("quietHours"))}
+              onCheckedChange={(value) =>
+                update("quietHours", value ? { start: "22:00", end: "07:00" } : null)
+              }
+            />
+          </div>
+        </SettingRow>
+        <SettingRow
+          label="Notification delivery"
+          description="After each scan cycle, or one daily digest of everything new since the last one."
+        >
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {digestAt !== null && (
+              <Input
+                key={digestAt}
+                type="time"
+                className="w-28 shrink-0"
+                aria-label="Daily digest time"
+                defaultValue={digestAt}
+                {...timeField(actionKeys.setting("digestAt"))}
+                onBlur={(event) => {
+                  const value = event.currentTarget.value;
+                  if (!isHourMinute(value)) event.currentTarget.value = digestAt;
+                  else if (value !== digestAt) update("digestAt", value);
+                }}
+              />
+            )}
+            <Choice
+              label="Notification delivery"
+              value={digestAt === null ? "cycle" : "digest"}
+              items={[
+                { value: "cycle", label: "After each scan cycle" },
+                { value: "digest", label: "Daily digest" },
+              ]}
+              disabled={unavailable(actionKeys.setting("digestAt"))}
+              onChange={(value) =>
+                update("digestAt", value === "digest" ? (digestAt ?? "18:00") : null)
+              }
+            />
+          </div>
         </SettingRow>
         <SettingRow
           label="Check for Versionstead releases"
@@ -289,6 +452,7 @@ function KeybindingsSettings() {
       <Button onClick={() => setResetting(true)}>Reset all shortcuts</Button>
       <p className="muted">
         Shortcuts are saved on this device and ignored while typing in a field or using a dialog.
+        The command palette shortcut also works in a field when it uses {commandModifiers(mac)}.
       </p>
       {resetting && (
         <ConfirmDialog
@@ -957,7 +1121,8 @@ export function ComputerPage() {
             <h2>Needs attention</h2>
             {attentionGroups(snapshot).length === 0 ? (
               <p className="muted">
-                No findings in the received evidence. Review timestamps and coverage below.
+                No findings need attention in the received evidence. Review timestamps and coverage
+                below.
               </p>
             ) : (
               attentionGroups(snapshot).map((group) => (
@@ -967,6 +1132,7 @@ export function ComputerPage() {
                     <span className="muted">
                       {plural(group.counts.updates, "update available", "updates available")} ·{" "}
                       {plural(group.counts.advisories, "advisory", "advisories")} ·{" "}
+                      {plural(group.counts.lifecycle, "lifecycle finding")} ·{" "}
                       <EvidenceBadge status={group.evidence.status} />
                     </span>
                   </summary>
@@ -977,7 +1143,10 @@ export function ComputerPage() {
                         <strong>{finding.name}</strong>
                         <p className="muted">{finding.description}</p>
                       </div>
-                      <FindingBadge finding={finding} />
+                      <FindingBadge
+                        finding={finding}
+                        cooldownDays={snapshot.settings.releaseCooldownDays ?? 3}
+                      />
                     </div>
                   ))}
                 </details>

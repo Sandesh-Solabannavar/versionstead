@@ -1,3 +1,5 @@
+// readBindings gives a clashing chord to the earlier command, so a command added later never takes a
+// chord an owner already saved for another one: the palette stays last and its default yields.
 export const commands = [
   { id: "settings", label: "Open settings", binding: "mod+," },
   { id: "attention", label: "Needs attention", binding: "mod+1" },
@@ -8,6 +10,7 @@ export const commands = [
   { id: "refresh", label: "Refresh evidence", binding: "mod+shift+r" },
   { id: "pause", label: "Pause or resume scheduled scans", binding: "mod+shift+p" },
   { id: "search", label: "Focus page search", binding: "/" },
+  { id: "palette", label: "Open command palette", binding: "mod+k" },
 ] as const;
 export type Command = (typeof commands)[number]["id"];
 export type Bindings = Record<Command, string>;

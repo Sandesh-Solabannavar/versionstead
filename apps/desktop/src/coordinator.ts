@@ -244,6 +244,18 @@ export async function pollCoordinator(
   }
 }
 
+/**
+ * The summary to show as a native notification now, or null when there is none, `shown` says it was
+ * shown already, or quiet hours hold it until they end. The in-app summary never waits for them, and a
+ * coordinator that sends no `quiet` flag never holds one.
+ */
+export function summaryToShow(
+  summary: NotificationSummary | null,
+  shown: (id: string) => boolean,
+): NotificationSummary | null {
+  return summary && !summary.quiet && !shown(summary.id) ? summary : null;
+}
+
 export async function nodeExecutable() {
   const configured = process.env.VERSIONSTEAD_NODE_EXECUTABLE;
   if (configured && !isAbsolute(configured))
@@ -338,7 +350,7 @@ async function connectCoordinator(restart: boolean) {
     const session = existing.runtime.host === "session" && existing.runtime.mode === "interactive";
     const current =
       existing.snapshot.scanProgress &&
-      existing.snapshot.features === "settings-repositories-connections-v9" &&
+      existing.snapshot.features === "settings-repositories-connections-v10" &&
       existing.snapshot.inventory.collector === "npm-bun-global-v1";
     if (!restart && (current || !session)) return existing;
     if (!session) throw new Error(backgroundRestartMessage());

@@ -143,7 +143,15 @@ export async function inspectRepository(
       name.split("/").some((p) => p === ".." || p === "" || p === ".") ||
       !(
         /(^|\/)package\.json$/.test(name) ||
-        ["package-lock.json", "pnpm-lock.yaml", "bun.lock", "bunfig.toml", ".npmrc"].includes(name)
+        [
+          "package-lock.json",
+          "pnpm-lock.yaml",
+          "bun.lock",
+          "bunfig.toml",
+          ".npmrc",
+          ".nvmrc",
+          ".node-version",
+        ].includes(name)
       )
     )
       throw new InputError("A repository input path is unsupported.");
